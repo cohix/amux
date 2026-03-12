@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Bash(cargo:*)",
+      "Bash(git:*)",
+      "Bash(docker build:*)",
+      "Bash(docker images:*)",
+      "Bash(docker ps:*)"
+    ],
+    "deny": [
+      "Bash(docker run:*)",
+      "Bash(rm -rf:*)"
+    ]
+  }
+}

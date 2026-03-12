@@ -1,0 +1,431 @@
+use crate::tui::state::{App, Dialog, ExecutionPhase, Focus};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
+use strsim::levenshtein;
+
+/// Describes what the event loop should do after processing a key press.
+pub enum Action {
+    None,
+    /// User submitted a valid command string.
+    Submit(String),
+    /// Quit has been confirmed.
+    QuitConfirmed,
+    /// Mount scope dialog: user chose this path.
+    MountScopeChosen(PathBuf),
+    /// Agent auth dialog: user accepted.
+    AuthAccepted,
+    /// Agent auth dialog: user declined.
+    AuthDeclined,
+    /// Forward these raw bytes to the PTY.
+    ForwardToPty(Vec<u8>),
+}
+
+/// Dispatch a key press to the correct handler based on application state.
+pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+    // Modal dialogs intercept all input.
+    match &app.dialog.clone() {
+        Dialog::QuitConfirm => return handle_quit_confirm(app, key),
+        Dialog::MountScope { git_root, cwd } => {
+            return handle_mount_scope(app, key, git_root.clone(), cwd.clone())
+        }
+        Dialog::AgentAuth { .. } => return handle_agent_auth(app, key),
+        Dialog::None => {}
+    }
+
+    match app.focus {
+        Focus::ExecutionWindow => handle_window_key(app, key),
+        Focus::CommandBox => handle_input_key(app, key),
+    }
+}
+
+// --- Execution window key handling ---
+
+fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
+    match &app.phase {
+        ExecutionPhase::Running { .. } => {
+            if key.code == KeyCode::Esc {
+                app.focus = Focus::CommandBox;
+                return Action::None;
+            }
+            // Forward all other keys to the PTY.
+            if let Some(bytes) = key_to_bytes(&key) {
+                return Action::ForwardToPty(bytes);
+            }
+        }
+        ExecutionPhase::Done { .. } | ExecutionPhase::Error { .. } => {
+            match key.code {
+                KeyCode::Up => {
+                    // Cap at total lines so we don't scroll past the beginning.
+                    let max = app.output_lines.len();
+                    if app.scroll_offset < max {
+                        app.scroll_offset = app.scroll_offset.saturating_add(1);
+                    }
+                }
+                KeyCode::Down => {
+                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                }
+                KeyCode::Char('b') => {
+                    // Jump to the beginning (oldest output).
+                    app.scroll_offset = app.output_lines.len();
+                }
+                KeyCode::Char('e') => {
+                    // Jump to the end (newest output).
+                    app.scroll_offset = 0;
+                }
+                KeyCode::Esc => {
+                    app.focus = Focus::CommandBox;
+                }
+                _ => {
+                    // Any other key refocuses the command box.
+                    app.focus = Focus::CommandBox;
+                }
+            }
+        }
+        ExecutionPhase::Idle => {
+            app.focus = Focus::CommandBox;
+        }
+    }
+    Action::None
+}
+
+// --- Command input box key handling ---
+
+fn handle_input_key(app: &mut App, key: KeyEvent) -> Action {
+    // Ctrl+C or 'q' with empty input → quit confirm.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.dialog = Dialog::QuitConfirm;
+        return Action::None;
+    }
+    if key.code == KeyCode::Char('q') && app.input.is_empty() {
+        app.dialog = Dialog::QuitConfirm;
+        return Action::None;
+    }
+
+    // Shift+Enter → insert newline.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.input.insert(app.cursor_col, '\n');
+        app.cursor_col += 1;
+        app.suggestions = autocomplete_suggestions(&app.input);
+        return Action::None;
+    }
+
+    // Enter → submit command.
+    if key.code == KeyCode::Enter {
+        let cmd = app.input.trim().to_string();
+        app.input.clear();
+        app.cursor_col = 0;
+        app.suggestions.clear();
+        app.input_error = None;
+        return Action::Submit(cmd);
+    }
+
+    // Arrow keys: move cursor or refocus window.
+    match key.code {
+        KeyCode::Left => {
+            app.cursor_col = app.cursor_col.saturating_sub(1);
+            return Action::None;
+        }
+        KeyCode::Right => {
+            if app.cursor_col < app.input.len() {
+                app.cursor_col += 1;
+            }
+            return Action::None;
+        }
+        KeyCode::Up => {
+            // If the window has content, click into it for scrolling.
+            if !app.output_lines.is_empty() {
+                app.focus = Focus::ExecutionWindow;
+            }
+            return Action::None;
+        }
+        _ => {}
+    }
+
+    // Backspace.
+    if key.code == KeyCode::Backspace && app.cursor_col > 0 {
+        app.cursor_col -= 1;
+        app.input.remove(app.cursor_col);
+        app.suggestions = autocomplete_suggestions(&app.input);
+        app.input_error = None;
+        return Action::None;
+    }
+
+    // Delete.
+    if key.code == KeyCode::Delete && app.cursor_col < app.input.len() {
+        app.input.remove(app.cursor_col);
+        app.suggestions = autocomplete_suggestions(&app.input);
+        return Action::None;
+    }
+
+    // Regular character.
+    if let KeyCode::Char(c) = key.code {
+        app.input.insert(app.cursor_col, c);
+        app.cursor_col += 1;
+        app.suggestions = autocomplete_suggestions(&app.input);
+        app.input_error = None;
+    }
+
+    Action::None
+}
+
+// --- Dialog handlers ---
+
+fn handle_quit_confirm(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.dialog = Dialog::None;
+            return Action::QuitConfirmed;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.dialog = Dialog::None;
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+fn handle_mount_scope(
+    app: &mut App,
+    key: KeyEvent,
+    git_root: PathBuf,
+    cwd: PathBuf,
+) -> Action {
+    match key.code {
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.dialog = Dialog::None;
+            return Action::MountScopeChosen(git_root);
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Enter => {
+            app.dialog = Dialog::None;
+            return Action::MountScopeChosen(cwd);
+        }
+        KeyCode::Esc => {
+            app.dialog = Dialog::None;
+            app.input_error = Some("Command cancelled.".into());
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+fn handle_agent_auth(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.dialog = Dialog::None;
+            return Action::AuthAccepted;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.dialog = Dialog::None;
+            return Action::AuthDeclined;
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+// --- Autocomplete ---
+
+const SUBCOMMANDS: &[&str] = &["init", "ready", "implement"];
+
+/// Return suggestions for the current input string.
+pub fn autocomplete_suggestions(input: &str) -> Vec<String> {
+    if input.trim().is_empty() {
+        return SUBCOMMANDS.iter().map(|s| s.to_string()).collect();
+    }
+
+    // Split on the FIRST space to separate command from arguments.
+    // Use the raw input (not trimmed) so a trailing space signals "show flags".
+    let tokens: Vec<&str> = input.splitn(2, ' ').collect();
+    let cmd = tokens[0].trim();
+
+    // If there is content after the first space (even empty), the user has
+    // committed to a subcommand — show its flag suggestions.
+    if tokens.len() == 2 {
+        return flag_suggestions_for(cmd, tokens[1]);
+    }
+
+    // Otherwise, suggest subcommands that start with the typed prefix.
+    SUBCOMMANDS
+        .iter()
+        .filter(|s| s.starts_with(cmd))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn flag_suggestions_for(cmd: &str, _typed: &str) -> Vec<String> {
+    match cmd {
+        "init" => vec![
+            "init --agent=claude".into(),
+            "init --agent=codex".into(),
+            "init --agent=opencode".into(),
+        ],
+        "implement" => vec!["implement <work-item-number>".into()],
+        _ => vec![],
+    }
+}
+
+/// Return the subcommand name most similar to `input` (for typo correction).
+pub fn closest_subcommand(input: &str) -> Option<String> {
+    let word = input.trim().split_whitespace().next()?;
+    // Already an exact match.
+    if SUBCOMMANDS.contains(&word) {
+        return None;
+    }
+    SUBCOMMANDS
+        .iter()
+        .map(|&s| (s, levenshtein(word, s)))
+        .filter(|(_, d)| *d <= 4) // only suggest if "close enough"
+        .min_by_key(|(_, d)| *d)
+        .map(|(s, _)| s.to_string())
+}
+
+/// Convert a crossterm key event to the raw bytes that a terminal would send.
+pub fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+letter → ASCII control code.
+                let n = (c as u8).to_ascii_lowercase();
+                if n >= b'a' && n <= b'z' {
+                    return Some(vec![n - b'a' + 1]);
+                }
+            }
+            let mut buf = [0u8; 4];
+            Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+        }
+        KeyCode::Enter => Some(b"\r".to_vec()),
+        KeyCode::Backspace => Some(b"\x7f".to_vec()),
+        KeyCode::Tab => Some(b"\t".to_vec()),
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => Some(format!("\x1b[{}~", n).into_bytes()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_empty_input_returns_all() {
+        let suggestions = autocomplete_suggestions("");
+        assert!(suggestions.contains(&"init".to_string()));
+        assert!(suggestions.contains(&"ready".to_string()));
+        assert!(suggestions.contains(&"implement".to_string()));
+    }
+
+    #[test]
+    fn suggestions_prefix_filters_correctly() {
+        let suggestions = autocomplete_suggestions("im");
+        assert_eq!(suggestions, vec!["implement"]);
+    }
+
+    #[test]
+    fn suggestions_prefix_init() {
+        let suggestions = autocomplete_suggestions("in");
+        assert_eq!(suggestions, vec!["init"]);
+    }
+
+    #[test]
+    fn suggestions_full_command_with_space_shows_flags() {
+        let suggestions = autocomplete_suggestions("init ");
+        assert!(suggestions.iter().any(|s| s.contains("--agent")));
+    }
+
+    #[test]
+    fn closest_subcommand_corrects_typo() {
+        assert_eq!(closest_subcommand("implemnt"), Some("implement".into()));
+        assert_eq!(closest_subcommand("redy"), Some("ready".into()));
+        assert_eq!(closest_subcommand("int"), Some("init".into()));
+    }
+
+    #[test]
+    fn closest_subcommand_exact_returns_none() {
+        assert_eq!(closest_subcommand("ready"), None);
+    }
+
+    #[test]
+    fn closest_subcommand_gibberish_returns_none() {
+        // "xyzxyzxyz" is too far from any subcommand.
+        assert_eq!(closest_subcommand("xyzxyzxyz"), None);
+    }
+
+    #[test]
+    fn key_to_bytes_regular_char() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+        assert_eq!(key_to_bytes(&key), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn key_to_bytes_enter_is_cr() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(key_to_bytes(&key), Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn key_to_bytes_arrow_up() {
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(key_to_bytes(&key), Some(b"\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn key_to_bytes_ctrl_c() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(&key), Some(vec![3]));
+    }
+
+    #[test]
+    fn arrow_up_scrolls_in_done_state_with_window_focused() {
+        let mut app = App::new();
+        for i in 0..50 {
+            app.output_lines.push(format!("line {}", i));
+        }
+        app.phase = ExecutionPhase::Done { command: "ready".into() };
+        app.focus = Focus::ExecutionWindow;
+        app.scroll_offset = 0;
+
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.scroll_offset, 1, "Up should increment scroll_offset");
+        assert_eq!(app.focus, Focus::ExecutionWindow, "Focus should stay on window");
+
+        // Press Down to go back.
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.scroll_offset, 0, "Down should decrement scroll_offset");
+    }
+
+    #[test]
+    fn arrow_up_from_command_box_focuses_window_then_scrolls() {
+        let mut app = App::new();
+        for i in 0..50 {
+            app.output_lines.push(format!("line {}", i));
+        }
+        app.phase = ExecutionPhase::Done { command: "ready".into() };
+        app.focus = Focus::CommandBox;
+        app.scroll_offset = 0;
+
+        // First Up: should move focus to ExecutionWindow but NOT scroll.
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        handle_key(&mut app, key);
+        assert_eq!(app.focus, Focus::ExecutionWindow);
+        assert_eq!(app.scroll_offset, 0, "First Up only focuses, doesn't scroll");
+
+        // Second Up: now that we're in ExecutionWindow, should scroll.
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        handle_key(&mut app, key);
+        assert_eq!(app.focus, Focus::ExecutionWindow);
+        assert_eq!(app.scroll_offset, 1, "Second Up should scroll");
+    }
+}
