@@ -39,9 +39,8 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
     let border_color = app.window_border_color();
     let border_style = Style::default().fg(border_color);
 
-    // Calculate how many lines fit in the window (subtract borders).
+    // Calculate how many visual rows fit in the window (subtract borders).
     let inner_height = area.height.saturating_sub(2) as usize;
-    let total = app.output_lines.len();
 
     let phase_label = match &app.phase {
         ExecutionPhase::Idle => " aspec ".to_string(),
@@ -58,6 +57,8 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style);
+
+    let inner_width = area.width.saturating_sub(2) as usize; // exclude borders
 
     let lines: Vec<Line> = if app.output_lines.is_empty() {
         if matches!(app.phase, ExecutionPhase::Idle) {
@@ -76,21 +77,35 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
             vec![]
         }
     } else {
-        // Manual slicing: compute exactly which lines are visible.
-        // scroll_offset=0 → show the newest (bottom) lines.
-        // scroll_offset=N → show N lines further toward the top.
-        let max_scroll = total.saturating_sub(inner_height);
-        let effective_offset = app.scroll_offset.min(max_scroll);
-        let start = max_scroll.saturating_sub(effective_offset);
-        let end = total.min(start + inner_height);
-        app.output_lines[start..end]
+        app.output_lines
             .iter()
             .map(|l| Line::from(l.as_str()))
             .collect()
     };
 
-    let para = Paragraph::new(lines).block(block);
+    // Calculate how many visual rows the content takes, using display width
+    // (via Line::width()) instead of byte length.  Byte length overcounts for
+    // multi-byte UTF-8 (box-drawing, emoji, CJK) and causes the scroll to
+    // overshoot, making the viewport show blank space ("disappearing text").
+    let total_visual: usize = if inner_width == 0 {
+        lines.len()
+    } else {
+        lines
+            .iter()
+            .map(|l| {
+                let w = l.width();
+                if w == 0 { 1 } else { (w + inner_width - 1) / inner_width }
+            })
+            .sum()
+    };
+    let max_scroll = total_visual.saturating_sub(inner_height);
+    let effective_offset = app.scroll_offset.min(max_scroll);
+    let scroll_y = max_scroll.saturating_sub(effective_offset);
 
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y as u16, 0));
     frame.render_widget(para, area);
 }
 
@@ -250,6 +265,18 @@ fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
                 git_root.display()
             ),
         ),
+        Dialog::NewKindSelect => (
+            " New Work Item — Type ",
+            "  Select work item type:\n\n  1) Feature\n  2) Bug\n  3) Task\n\n  [1/2/3 or Esc to cancel]  ".to_string(),
+        ),
+        Dialog::NewTitleInput { kind, title } => (
+            " New Work Item — Title ",
+            format!(
+                "  Type: {}\n\n  Enter title: {}\n\n  [Enter to confirm, Esc to cancel]  ",
+                kind.as_str(),
+                title
+            ),
+        ),
         Dialog::None => return,
     };
 
@@ -367,4 +394,33 @@ mod tests {
             view_top
         );
     }
+
+    #[test]
+    fn unicode_lines_do_not_cause_scroll_overshoot() {
+        let mut app = App::new();
+        // Box-drawing chars: "─" is 3 bytes but 1 display column.
+        // With byte-based width, a 20-char line of "─" = 60 bytes, which looks
+        // like it needs 2 rows in a 40-col terminal. But display width is 20,
+        // so it actually fits in 1 row. If the scroll calculation uses bytes,
+        // it overshoots and the bottom lines disappear.
+        for i in 0..10 {
+            app.output_lines
+                .push(format!("──── step {} ────", i));
+        }
+        app.phase = ExecutionPhase::Done {
+            command: "ready".into(),
+        };
+        app.focus = Focus::ExecutionWindow;
+        app.scroll_offset = 0;
+
+        // 40 wide, 15 tall → inner = 8 rows. 10 lines of ~16 display cols each.
+        // All 10 fit in 10 visual rows; bottom 8 should be visible.
+        let view = render_exec_window_lines(&app, 40, 15);
+        assert!(
+            view.iter().any(|l| l.contains("step 9")),
+            "Newest line must be visible with Unicode content. Got: {:?}",
+            view
+        );
+    }
+
 }

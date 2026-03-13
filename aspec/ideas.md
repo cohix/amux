@@ -1,0 +1,5 @@
+- ability to detect languages being used, automatically mount build/package caches to speed things up
+- any time a container is running, add "running in container {name}" to the top right of the TUI.
+- any time an agent is running in interactive mode, add a notice to the top of the TUI window to remind that you need to ctrl+c to exit
+- display container processes within sub-windows that support full-screen TUIs?? then add the container name etc on the inner window.
+	- once container quits, show a summary of what happened (container name, how long it ran, etc) in the sub-window, and have the user press enter to close the sub-window and continue whatever else was happening.

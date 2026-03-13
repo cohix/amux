@@ -1,4 +1,4 @@
-use crate::commands::auth::prompt_auth_command_mode;
+use crate::commands::auth::resolve_auth;
 use crate::commands::init::find_git_root;
 use crate::commands::output::OutputSink;
 use crate::config::load_repo_config;
@@ -6,24 +6,33 @@ use crate::docker;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
+/// Parse a work item string like "0001" or "1" into a u32.
+pub fn parse_work_item(s: &str) -> Result<u32> {
+    s.parse::<u32>()
+        .with_context(|| format!("Invalid work item number: '{}'. Expected a number like 0001.", s))
+}
+
 /// Command-mode entry point.
-pub async fn run(work_item: u32) -> Result<()> {
+pub async fn run(work_item_str: &str, auth_from_env: bool, non_interactive: bool) -> Result<()> {
+    let work_item = parse_work_item(work_item_str)?;
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
-    let cred_path = prompt_auth_command_mode(&git_root, agent_name(&git_root)?)?;
-    run_with_sink(work_item, &OutputSink::Stdout, Some(mount_path), cred_path).await
+    let env_vars = resolve_auth(&git_root, agent_name(&git_root)?, auth_from_env)?;
+    run_with_sink(work_item, &OutputSink::Stdout, Some(mount_path), env_vars, non_interactive).await
 }
 
 /// Core logic shared between command mode and TUI mode.
 ///
 /// `mount_override`: when `Some`, skip the interactive stdin prompt and use this path.
 ///                   when `None`, prompt via stdin (command mode only).
-/// `cred_path`: when `Some`, add an extra bind-mount for agent credentials.
+/// `env_vars`: agent credential env vars to pass into the container.
+/// `non_interactive`: when true, launch agent in print/non-interactive mode.
 pub async fn run_with_sink(
     work_item: u32,
     out: &OutputSink,
     mount_override: Option<PathBuf>,
-    cred_path: Option<PathBuf>,
+    env_vars: Vec<(String, String)>,
+    non_interactive: bool,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let config = load_repo_config(&git_root)?;
@@ -43,12 +52,47 @@ pub async fn run_with_sink(
         None => confirm_mount_scope_stdin(&git_root)?,
     };
 
-    let image_tag = "aspec-dev:latest";
-    let entrypoint = agent_entrypoint(&agent, &work_item_path, &git_root);
+    let image_tag = crate::docker::project_image_tag(&git_root);
+    let entrypoint = if non_interactive {
+        agent_entrypoint_non_interactive(&agent, work_item)
+    } else {
+        agent_entrypoint(&agent, work_item)
+    };
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
 
-    docker::run_container(image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, cred_path)
+    // Show the full Docker CLI command being run (with masked env values).
+    let config_dir = docker::claude_config_dir();
+    let display_args = docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, config_dir.as_deref());
+    out.println(format!("$ {}", docker::format_run_cmd(&display_args)));
+
+    if !non_interactive {
+        crate::commands::ready::print_interactive_notice(out, &agent);
+    } else {
+        out.println("Tip: remove --non-interactive to interact with the agent directly.");
+    }
+
+    if non_interactive {
+        let (_cmd, output) = docker::run_container_captured(
+            &image_tag,
+            mount_path.to_str().unwrap(),
+            &entrypoint_refs,
+            &env_vars,
+            config_dir.as_deref(),
+        )
         .context("Container exited with an error")?;
+        for line in output.lines() {
+            out.println(line);
+        }
+    } else {
+        docker::run_container(
+            &image_tag,
+            mount_path.to_str().unwrap(),
+            &entrypoint_refs,
+            &env_vars,
+            config_dir.as_deref(),
+        )
+        .context("Container exited with an error")?;
+    }
 
     Ok(())
 }
@@ -107,31 +151,64 @@ pub fn confirm_mount_scope_stdin(git_root: &PathBuf) -> Result<PathBuf> {
     }
 }
 
-pub fn agent_entrypoint(agent: &str, work_item_path: &PathBuf, git_root: &PathBuf) -> Vec<String> {
-    let relative = work_item_path
-        .strip_prefix(git_root)
-        .unwrap_or(work_item_path);
-    let container_path = PathBuf::from("/workspace").join(relative);
-    let work_item_str = container_path.to_string_lossy().to_string();
+/// The prompt given to the code agent when implementing a work item.
+const IMPLEMENT_PROMPT_TEMPLATE: &str = "Implement work item {work_item}. Iterate until the build \
+    succeeds. Implement tests as described in the work item and the project aspec. Iterate until \
+    tests are comprehensive and pass. Write documentation as described in the project aspec. \
+    Ensure final build and test success.";
+
+/// Build the prompt string for the given work item number.
+pub fn implement_prompt(work_item: u32) -> String {
+    IMPLEMENT_PROMPT_TEMPLATE.replace("{work_item}", &format!("{:04}", work_item))
+}
+
+pub fn agent_entrypoint(agent: &str, work_item: u32) -> Vec<String> {
+    let prompt = implement_prompt(work_item);
 
     match agent {
         "claude" => vec![
             "claude".to_string(),
-            "--print".to_string(),
-            format!("Implement the work item described in {}", work_item_str),
+            prompt,
         ],
         "codex" => vec![
             "codex".to_string(),
-            format!("Implement the work item described in {}", work_item_str),
+            prompt,
         ],
         "opencode" => vec![
             "opencode".to_string(),
             "run".to_string(),
-            format!("Implement the work item described in {}", work_item_str),
+            prompt,
         ],
         _ => vec![
             agent.to_string(),
-            format!("Implement the work item described in {}", work_item_str),
+            prompt,
+        ],
+    }
+}
+
+/// Build the entrypoint command for the implement agent in non-interactive (print) mode.
+pub fn agent_entrypoint_non_interactive(agent: &str, work_item: u32) -> Vec<String> {
+    let prompt = implement_prompt(work_item);
+
+    match agent {
+        "claude" => vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            prompt,
+        ],
+        "codex" => vec![
+            "codex".to_string(),
+            "--quiet".to_string(),
+            prompt,
+        ],
+        "opencode" => vec![
+            "opencode".to_string(),
+            "run".to_string(),
+            prompt,
+        ],
+        _ => vec![
+            agent.to_string(),
+            prompt,
         ],
     }
 }
@@ -165,10 +242,71 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_claude() {
-        let root = PathBuf::from("/repo");
-        let work_item = PathBuf::from("/repo/aspec/work-items/0001-test.md");
-        let args = agent_entrypoint("claude", &work_item, &root);
+        let args = agent_entrypoint("claude", 1);
+        assert_eq!(args.len(), 2);
         assert_eq!(args[0], "claude");
-        assert!(args[2].contains("/workspace/aspec/work-items/0001-test.md"));
+        assert!(args[1].contains("work item 0001"));
+    }
+
+    #[test]
+    fn agent_entrypoint_codex() {
+        let args = agent_entrypoint("codex", 2);
+        assert_eq!(args[0], "codex");
+        assert!(args[1].contains("work item 0002"));
+    }
+
+    #[test]
+    fn agent_entrypoint_opencode() {
+        let args = agent_entrypoint("opencode", 3);
+        assert_eq!(args[0], "opencode");
+        assert_eq!(args[1], "run");
+        assert!(args[2].contains("work item 0003"));
+    }
+
+    #[test]
+    fn implement_prompt_includes_work_item_number() {
+        let prompt = implement_prompt(42);
+        assert!(prompt.contains("work item 0042"));
+        assert!(prompt.contains("Iterate until the build succeeds"));
+        assert!(prompt.contains("Ensure final build and test success"));
+    }
+
+    #[test]
+    fn parse_work_item_valid_inputs() {
+        assert_eq!(parse_work_item("1").unwrap(), 1);
+        assert_eq!(parse_work_item("0001").unwrap(), 1);
+        assert_eq!(parse_work_item("42").unwrap(), 42);
+        assert_eq!(parse_work_item("0042").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_work_item_invalid_inputs() {
+        assert!(parse_work_item("abc").is_err());
+        assert!(parse_work_item("").is_err());
+        assert!(parse_work_item("-1").is_err());
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_claude() {
+        let args = agent_entrypoint_non_interactive("claude", 1);
+        assert_eq!(args[0], "claude");
+        assert_eq!(args[1], "-p");
+        assert!(args[2].contains("work item 0001"));
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_codex() {
+        let args = agent_entrypoint_non_interactive("codex", 2);
+        assert_eq!(args[0], "codex");
+        assert_eq!(args[1], "--quiet");
+        assert!(args[2].contains("work item 0002"));
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_opencode() {
+        let args = agent_entrypoint_non_interactive("opencode", 3);
+        assert_eq!(args[0], "opencode");
+        assert_eq!(args[1], "run");
+        assert!(args[2].contains("work item 0003"));
     }
 }

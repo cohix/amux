@@ -50,13 +50,15 @@ pub fn find_git_root() -> Option<std::path::PathBuf> {
     }
 }
 
-fn write_dockerfile(git_root: &Path, agent: &Agent) -> Result<()> {
+/// Write Dockerfile.dev to the git root using the template for the given agent.
+/// Public so other commands (e.g. ready) can initialize a missing Dockerfile.dev.
+pub fn write_dockerfile(git_root: &Path, agent: &Agent) -> Result<()> {
     let path = git_root.join("Dockerfile.dev");
     let content = dockerfile_for_agent(agent);
     std::fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn dockerfile_for_agent(agent: &Agent) -> String {
+pub fn dockerfile_for_agent(agent: &Agent) -> String {
     match agent {
         Agent::Claude => include_str!("../../templates/Dockerfile.claude").to_string(),
         Agent::Codex => include_str!("../../templates/Dockerfile.codex").to_string(),

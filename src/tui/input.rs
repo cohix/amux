@@ -1,3 +1,4 @@
+use crate::commands::new::WorkItemKind;
 use crate::tui::state::{App, Dialog, ExecutionPhase, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
@@ -18,6 +19,11 @@ pub enum Action {
     AuthDeclined,
     /// Forward these raw bytes to the PTY.
     ForwardToPty(Vec<u8>),
+    /// New work item: kind and title have been collected.
+    NewWorkItem {
+        kind: WorkItemKind,
+        title: String,
+    },
 }
 
 /// Dispatch a key press to the correct handler based on application state.
@@ -29,6 +35,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             return handle_mount_scope(app, key, git_root.clone(), cwd.clone())
         }
         Dialog::AgentAuth { .. } => return handle_agent_auth(app, key),
+        Dialog::NewKindSelect => return handle_new_kind_select(app, key),
+        Dialog::NewTitleInput { kind, title } => {
+            return handle_new_title_input(app, key, kind.clone(), title.clone())
+        }
         Dialog::None => {}
     }
 
@@ -223,9 +233,73 @@ fn handle_agent_auth(app: &mut App, key: KeyEvent) -> Action {
     Action::None
 }
 
+fn handle_new_kind_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('1') | KeyCode::Char('f') | KeyCode::Char('F') => {
+            app.dialog = Dialog::NewTitleInput {
+                kind: WorkItemKind::Feature,
+                title: String::new(),
+            };
+        }
+        KeyCode::Char('2') | KeyCode::Char('b') | KeyCode::Char('B') => {
+            app.dialog = Dialog::NewTitleInput {
+                kind: WorkItemKind::Bug,
+                title: String::new(),
+            };
+        }
+        KeyCode::Char('3') | KeyCode::Char('t') | KeyCode::Char('T') => {
+            app.dialog = Dialog::NewTitleInput {
+                kind: WorkItemKind::Task,
+                title: String::new(),
+            };
+        }
+        KeyCode::Esc => {
+            app.dialog = Dialog::None;
+            app.input_error = Some("Command cancelled.".into());
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+fn handle_new_title_input(
+    app: &mut App,
+    key: KeyEvent,
+    kind: WorkItemKind,
+    mut title: String,
+) -> Action {
+    match key.code {
+        KeyCode::Enter => {
+            let trimmed = title.trim().to_string();
+            if trimmed.is_empty() {
+                return Action::None;
+            }
+            app.dialog = Dialog::None;
+            return Action::NewWorkItem {
+                kind,
+                title: trimmed,
+            };
+        }
+        KeyCode::Esc => {
+            app.dialog = Dialog::None;
+            app.input_error = Some("Command cancelled.".into());
+        }
+        KeyCode::Backspace => {
+            title.pop();
+            app.dialog = Dialog::NewTitleInput { kind, title };
+        }
+        KeyCode::Char(c) => {
+            title.push(c);
+            app.dialog = Dialog::NewTitleInput { kind, title };
+        }
+        _ => {}
+    }
+    Action::None
+}
+
 // --- Autocomplete ---
 
-const SUBCOMMANDS: &[&str] = &["init", "ready", "implement"];
+const SUBCOMMANDS: &[&str] = &["init", "ready", "implement", "new"];
 
 /// Return suggestions for the current input string.
 pub fn autocomplete_suggestions(input: &str) -> Vec<String> {
@@ -259,7 +333,18 @@ fn flag_suggestions_for(cmd: &str, _typed: &str) -> Vec<String> {
             "init --agent=codex".into(),
             "init --agent=opencode".into(),
         ],
-        "implement" => vec!["implement <work-item-number>".into()],
+        "ready" => vec![
+            "ready --refresh".into(),
+            "ready --non-interactive".into(),
+            "ready --refresh --non-interactive".into(),
+        ],
+        "implement" => vec![
+            "implement <NNNN>  e.g. implement 0001".into(),
+            "implement <NNNN> --non-interactive".into(),
+        ],
+        "new" => vec![
+            "new  (creates a new work item from template)".into(),
+        ],
         _ => vec![],
     }
 }

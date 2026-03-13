@@ -5,6 +5,7 @@ use tokio::sync::mpsc::UnboundedSender;
 ///
 /// This abstraction lets every command function work identically in both execution
 /// contexts without duplicating logic.
+#[derive(Clone)]
 pub enum OutputSink {
     Stdout,
     Channel(UnboundedSender<String>),

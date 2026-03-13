@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod implement;
 pub mod init;
+pub mod new;
 pub mod output;
 pub mod ready;
 
@@ -10,7 +11,16 @@ use anyhow::Result;
 pub async fn run(command: Command) -> Result<()> {
     match command {
         Command::Init { agent } => init::run(agent).await,
-        Command::Ready => ready::run().await,
-        Command::Implement { work_item } => implement::run(work_item).await,
+        Command::Ready {
+            auth_from_env,
+            refresh,
+            non_interactive,
+        } => ready::run(auth_from_env, refresh, non_interactive).await,
+        Command::Implement {
+            work_item,
+            auth_from_env,
+            non_interactive,
+        } => implement::run(&work_item, auth_from_env, non_interactive).await,
+        Command::New => new::run().await,
     }
 }
