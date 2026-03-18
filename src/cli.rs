@@ -56,6 +56,10 @@ pub enum Command {
         /// Run the agent in non-interactive (print) mode instead of interactive mode.
         #[arg(long)]
         non_interactive: bool,
+
+        /// Run the agent in plan mode (read-only, no file modifications).
+        #[arg(long)]
+        plan: bool,
     },
 
     /// Start a freeform chat session with the configured agent in a container.
@@ -63,6 +67,10 @@ pub enum Command {
         /// Run the agent in non-interactive (print) mode instead of interactive mode.
         #[arg(long)]
         non_interactive: bool,
+
+        /// Run the agent in plan mode (read-only, no file modifications).
+        #[arg(long)]
+        plan: bool,
     },
 
     /// Create a new work item from the template.
@@ -253,7 +261,7 @@ mod tests {
     fn chat_defaults_interactive() {
         let cli = parse(&["aspec", "chat"]);
         match cli.command.unwrap() {
-            Command::Chat { non_interactive } => assert!(!non_interactive),
+            Command::Chat { non_interactive, .. } => assert!(!non_interactive),
             _ => panic!("expected chat"),
         }
     }
@@ -262,8 +270,75 @@ mod tests {
     fn chat_non_interactive_flag() {
         let cli = parse(&["aspec", "chat", "--non-interactive"]);
         match cli.command.unwrap() {
-            Command::Chat { non_interactive } => assert!(non_interactive),
+            Command::Chat { non_interactive, .. } => assert!(non_interactive),
             _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_plan_flag() {
+        let cli = parse(&["aspec", "chat", "--plan"]);
+        match cli.command.unwrap() {
+            Command::Chat { plan, non_interactive } => {
+                assert!(plan);
+                assert!(!non_interactive);
+            }
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_defaults_no_plan() {
+        let cli = parse(&["aspec", "chat"]);
+        match cli.command.unwrap() {
+            Command::Chat { plan, .. } => assert!(!plan),
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_plan_and_non_interactive() {
+        let cli = parse(&["aspec", "chat", "--plan", "--non-interactive"]);
+        match cli.command.unwrap() {
+            Command::Chat { plan, non_interactive } => {
+                assert!(plan);
+                assert!(non_interactive);
+            }
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn implement_plan_flag() {
+        let cli = parse(&["aspec", "implement", "0001", "--plan"]);
+        match cli.command.unwrap() {
+            Command::Implement { plan, work_item, non_interactive } => {
+                assert!(plan);
+                assert_eq!(work_item, "0001");
+                assert!(!non_interactive);
+            }
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_defaults_no_plan() {
+        let cli = parse(&["aspec", "implement", "0001"]);
+        match cli.command.unwrap() {
+            Command::Implement { plan, .. } => assert!(!plan),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_plan_and_non_interactive() {
+        let cli = parse(&["aspec", "implement", "0001", "--plan", "--non-interactive"]);
+        match cli.command.unwrap() {
+            Command::Implement { plan, non_interactive, .. } => {
+                assert!(plan);
+                assert!(non_interactive);
+            }
+            _ => panic!("expected implement"),
         }
     }
 

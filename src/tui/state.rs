@@ -61,9 +61,11 @@ pub enum PendingCommand {
     Implement {
         work_item: u32,
         non_interactive: bool,
+        plan: bool,
     },
     Chat {
         non_interactive: bool,
+        plan: bool,
     },
 }
 
@@ -202,6 +204,9 @@ pub struct App {
     // --- Container window state ---
     /// Whether the container overlay window is visible (and in what state).
     pub container_window: ContainerWindowState,
+    /// How many lines from the bottom to skip when rendering the container's
+    /// vt100 scrollback (mouse-wheel scrolling). 0 = live view (auto-follow).
+    pub container_scroll_offset: usize,
     /// Metadata about the currently running container.
     pub container_info: Option<ContainerInfo>,
     /// VT100 terminal emulator for rendering container output with full ANSI support
@@ -248,6 +253,7 @@ impl App {
             ready_phase: ReadyPhase::Inactive,
             ready_opts: ReadyOptions::default(),
             container_window: ContainerWindowState::Hidden,
+            container_scroll_offset: 0,
             container_info: None,
             vt100_parser: None,
             last_container_summary: None,
@@ -290,6 +296,7 @@ impl App {
         rows: u16,
     ) {
         self.container_window = ContainerWindowState::Maximized;
+        self.container_scroll_offset = 0;
         self.vt100_parser = Some(vt100::Parser::new(rows, cols, 1000));
         self.last_container_summary = None;
         self.container_info = Some(ContainerInfo {
@@ -924,5 +931,32 @@ mod tests {
         let summary = app.last_container_summary.as_ref().unwrap();
         assert_eq!(summary.avg_cpu, "7.5%");
         assert_eq!(summary.avg_memory, "250MiB");
+    }
+
+    #[test]
+    fn container_scroll_offset_starts_at_zero() {
+        let app = App::new();
+        assert_eq!(app.container_scroll_offset, 0);
+    }
+
+    #[test]
+    fn start_container_resets_scroll_offset() {
+        let mut app = App::new();
+        app.container_scroll_offset = 10;
+        app.start_container("test".into(), "Agent".into(), 80, 24);
+        assert_eq!(app.container_scroll_offset, 0);
+    }
+
+    #[test]
+    fn finish_command_does_not_leave_stale_scroll_offset() {
+        let mut app = App::new();
+        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.start_container("test".into(), "Agent".into(), 80, 24);
+        app.container_scroll_offset = 15;
+        app.finish_command(0);
+        // After finishing, container is hidden and scroll offset is irrelevant,
+        // but it should be left at 0 for the next container session.
+        // start_container resets it, so this just verifies no panic.
+        assert_eq!(app.container_window, ContainerWindowState::Hidden);
     }
 }

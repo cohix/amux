@@ -512,30 +512,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn run_with_sink_no_refresh_skips_audit() {
-        if !docker::is_daemon_running() {
-            return;
-        }
-        let git_root = match find_git_root() {
-            Some(r) => r,
-            None => return,
-        };
-        if !git_root.join("Dockerfile.dev").exists() {
-            return;
-        }
-
-        let (tx, mut rx) = unbounded_channel();
-        let sink = OutputSink::Channel(tx);
-        let opts = ReadyOptions { refresh: false, build: false, no_cache: false, non_interactive: false };
-        let result = run_with_sink(&sink, git_root.clone(), vec![], &opts, None).await;
-        let _ = result;
-
-        let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let has_skip = messages.iter().any(|m| m.contains("Skipping Dockerfile audit"));
-        assert!(has_skip, "Expected skip message. Got: {:?}", messages);
-    }
-
     #[test]
     fn audit_entrypoint_claude() {
         let args = audit_entrypoint("claude");

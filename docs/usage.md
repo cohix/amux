@@ -41,7 +41,9 @@ aspec ready --refresh
 aspec ready --build
 aspec ready --build --no-cache
 aspec implement 0001
+aspec implement 0001 --plan
 aspec chat
+aspec chat --plan
 aspec new
 ```
 
@@ -164,7 +166,7 @@ aspec ready --refresh --no-cache           # audit + rebuild without cache
 
 ---
 
-### `aspec implement <NNNN> [--non-interactive]`
+### `aspec implement <NNNN> [--non-interactive] [--plan]`
 
 Launches the dev container to implement a work item.
 
@@ -186,6 +188,7 @@ The work item number is a 4-digit identifier (e.g. `0001`). Both `0001` and
 | Flag | Description |
 |------|-------------|
 | `--non-interactive` | Run the agent in print/non-interactive mode |
+| `--plan` | Run the agent in plan mode (read-only, no file modifications) |
 
 **Interactive Mode (default)**
 
@@ -217,9 +220,23 @@ When `--non-interactive` is passed, the agent runs in print/batch mode:
 
 The agent's output is captured and displayed. No user interaction is required.
 
+**Plan Mode (`--plan`)**
+
+When `--plan` is passed, the agent runs in read-only plan mode — it can analyse
+code and suggest changes, but cannot modify files. How plan mode is activated
+depends on the agent:
+
+| Agent | Plan mode flag |
+|-------|----------------|
+| Claude | `--plan` |
+| Codex | `--approval-mode plan` |
+| Opencode | Not supported (flag is silently ignored) |
+
+`--plan` can be combined with `--non-interactive`.
+
 ---
 
-### `aspec chat [--non-interactive]`
+### `aspec chat [--non-interactive] [--plan]`
 
 Starts a freeform chat session with the configured agent in a container.
 
@@ -229,6 +246,7 @@ the agent with no pre-configured prompt — giving you a clean interactive sessi
 ```sh
 aspec chat                      # start interactive chat
 aspec chat --non-interactive    # start in non-interactive mode
+aspec chat --plan               # start in plan mode (read-only)
 ```
 
 - Prompts to confirm the Docker mount scope (Git root vs CWD) if needed
@@ -240,6 +258,7 @@ aspec chat --non-interactive    # start in non-interactive mode
 | Flag | Description |
 |------|-------------|
 | `--non-interactive` | Run the agent in print/non-interactive mode |
+| `--plan` | Run the agent in plan mode (read-only, no file modifications) |
 
 **Interactive Mode (default)**
 
@@ -256,6 +275,11 @@ passthrough, just like `implement`.
 When `--non-interactive` is passed, the agent launches in print/batch mode
 (Claude uses `-p`, Codex uses `--quiet`). Since there is no initial prompt,
 the agent reads from stdin in non-interactive mode.
+
+**Plan Mode (`--plan`)**
+
+Same as `implement --plan` — see the [implement](#aspec-implement-nnnn---non-interactive---plan)
+section for details on how each agent's plan mode is activated.
 
 **Shared Implementation**
 
@@ -338,8 +362,8 @@ The TUI has two types of windows:
 
 Whenever `aspec` launches a Docker container to run a coding agent (via
 `implement` or `ready --refresh`), a **container window** appears overlaying
-the bottom 90% of the outer window. This window is dedicated to the
-interactive agent session.
+95% of the outer window's width and height, centered. This window is dedicated
+to the interactive agent session.
 
 **Visual indicators:**
 
@@ -354,9 +378,12 @@ Docker daemon every 5 seconds and displayed in the title bar.
 
 - All keyboard input is forwarded to the running container process
 - Arrow keys, Ctrl+C, Ctrl+O, and all other shortcuts work natively
-- Mouse scroll wheel scrolls the container output
+- **Mouse scroll wheel** scrolls through the container's terminal scrollback
+  history, allowing you to review recent output from the agent. A centered
+  yellow indicator ("scrollback (N lines up)") appears in the title bar when
+  scrolled up. Scroll back to the bottom to return to the live view.
 - Press **Esc** to minimize the container window
-- A status hint shows: "Press Esc to minimize the container window"
+- A status hint shows: "Esc minimize  ·  scroll ↕ history"
 
 **When the container window is minimized:**
 
@@ -453,10 +480,10 @@ ready --
   ready --refresh  ·  ready --build  ·  ready --no-cache  ·  ready --build --no-cache  ·  ready --non-interactive  ·  ready --refresh --non-interactive
 
 implement --
-  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive
+  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive  ·  implement <NNNN> --plan
 
 chat --
-  chat  (start a freeform agent session)  ·  chat --non-interactive
+  chat  (start a freeform agent session)  ·  chat --non-interactive  ·  chat --plan
 ```
 
 ### Unknown Commands

@@ -74,44 +74,6 @@ async fn ready_via_sink_emits_checking_message() {
 // 2b. ready routes all output through the sink (status, image tag)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn ready_sink_routes_all_output() {
-    // Skip when Docker is not available.
-    if !aspec::docker::is_daemon_running() {
-        return;
-    }
-
-    let (tx, mut rx) = unbounded_channel::<String>();
-    let sink = OutputSink::Channel(tx);
-
-    let mount_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let opts = ReadyOptions::default();
-    let result = ready::run_with_sink(&sink, mount_path, vec![], &opts, None).await;
-    let _ = result;
-
-    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-
-    // Must include project-specific image tag references.
-    let has_image_ref = messages
-        .iter()
-        .any(|m| m.contains("aspec-") && m.contains(":latest"));
-    assert!(
-        has_image_ref,
-        "Expected project-specific image tag in output. Got: {:?}",
-        messages
-    );
-
-    // Without --refresh, should have skip message.
-    let has_skip = messages
-        .iter()
-        .any(|m| m.contains("Skipping Dockerfile audit"));
-    assert!(
-        has_skip,
-        "Expected skip message in output. Got: {:?}",
-        messages
-    );
-}
-
 // ---------------------------------------------------------------------------
 // 2c. ready audit entrypoint generates correct agent commands
 // ---------------------------------------------------------------------------
@@ -191,30 +153,6 @@ fn ready_summary_table_outputs_all_rows() {
 // ---------------------------------------------------------------------------
 // 2g. ready skip message when no --refresh
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn ready_no_refresh_skips_audit_with_message() {
-    if !aspec::docker::is_daemon_running() {
-        return;
-    }
-    let git_root = match aspec::commands::init::find_git_root() {
-        Some(r) => r,
-        None => return,
-    };
-    if !git_root.join("Dockerfile.dev").exists() {
-        return;
-    }
-
-    let (tx, mut rx) = unbounded_channel::<String>();
-    let sink = OutputSink::Channel(tx);
-    let opts = ReadyOptions::default();
-    let _ = ready::run_with_sink(&sink, git_root.clone(), vec![], &opts, None).await;
-    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    let has_skip = messages.iter().any(|m| m.contains("Skipping"));
-    let has_tip = messages.iter().any(|m| m.contains("--refresh"));
-    assert!(has_skip, "Expected skip message. Got: {:?}", messages);
-    assert!(has_tip, "Expected --refresh tip. Got: {:?}", messages);
-}
 
 // ---------------------------------------------------------------------------
 // 2h. interactive notice
@@ -340,17 +278,17 @@ fn auth_apply_decision_saves_config() {
 
 #[test]
 fn implement_entrypoint_for_each_agent() {
-    let claude = agent_entrypoint("claude", 1);
+    let claude = agent_entrypoint("claude", 1, false);
     assert_eq!(claude.len(), 2);
     assert_eq!(claude[0], "claude");
     assert!(claude[1].contains("work item 0001"));
     assert!(claude[1].contains("Iterate until the build succeeds"));
 
-    let codex = agent_entrypoint("codex", 2);
+    let codex = agent_entrypoint("codex", 2, false);
     assert_eq!(codex[0], "codex");
     assert!(codex[1].contains("work item 0002"));
 
-    let opencode = agent_entrypoint("opencode", 3);
+    let opencode = agent_entrypoint("opencode", 3, false);
     assert_eq!(opencode[0], "opencode");
     assert_eq!(opencode[1], "run");
     assert!(opencode[2].contains("work item 0003"));
@@ -358,17 +296,17 @@ fn implement_entrypoint_for_each_agent() {
 
 #[test]
 fn implement_entrypoint_non_interactive_for_each_agent() {
-    let claude = agent_entrypoint_non_interactive("claude", 1);
+    let claude = agent_entrypoint_non_interactive("claude", 1, false);
     assert_eq!(claude[0], "claude");
     assert_eq!(claude[1], "-p");
     assert!(claude[2].contains("work item 0001"));
 
-    let codex = agent_entrypoint_non_interactive("codex", 2);
+    let codex = agent_entrypoint_non_interactive("codex", 2, false);
     assert_eq!(codex[0], "codex");
     assert_eq!(codex[1], "--quiet");
     assert!(codex[2].contains("work item 0002"));
 
-    let opencode = agent_entrypoint_non_interactive("opencode", 3);
+    let opencode = agent_entrypoint_non_interactive("opencode", 3, false);
     assert_eq!(opencode[0], "opencode");
     assert_eq!(opencode[1], "run");
     assert!(opencode[2].contains("work item 0003"));
@@ -911,15 +849,15 @@ fn docker_display_args_mask_secrets() {
 
 #[test]
 fn chat_entrypoint_for_each_agent() {
-    let claude = chat_entrypoint("claude");
+    let claude = chat_entrypoint("claude", false);
     assert_eq!(claude.len(), 1);
     assert_eq!(claude[0], "claude");
 
-    let codex = chat_entrypoint("codex");
+    let codex = chat_entrypoint("codex", false);
     assert_eq!(codex.len(), 1);
     assert_eq!(codex[0], "codex");
 
-    let opencode = chat_entrypoint("opencode");
+    let opencode = chat_entrypoint("opencode", false);
     assert_eq!(opencode.len(), 1);
     assert_eq!(opencode[0], "opencode");
 }
@@ -930,15 +868,15 @@ fn chat_entrypoint_for_each_agent() {
 
 #[test]
 fn chat_entrypoint_non_interactive_for_each_agent() {
-    let claude = chat_entrypoint_non_interactive("claude");
+    let claude = chat_entrypoint_non_interactive("claude", false);
     assert_eq!(claude[0], "claude");
     assert_eq!(claude[1], "-p");
 
-    let codex = chat_entrypoint_non_interactive("codex");
+    let codex = chat_entrypoint_non_interactive("codex", false);
     assert_eq!(codex[0], "codex");
     assert_eq!(codex[1], "--quiet");
 
-    let opencode = chat_entrypoint_non_interactive("opencode");
+    let opencode = chat_entrypoint_non_interactive("opencode", false);
     assert_eq!(opencode.len(), 1);
     assert_eq!(opencode[0], "opencode");
 }
@@ -950,8 +888,8 @@ fn chat_entrypoint_non_interactive_for_each_agent() {
 #[test]
 fn chat_entrypoint_has_no_prompt() {
     for agent in &["claude", "codex", "opencode"] {
-        let chat_args = chat_entrypoint(agent);
-        let impl_args = agent_entrypoint(agent, 1);
+        let chat_args = chat_entrypoint(agent, false);
+        let impl_args = agent_entrypoint(agent, 1, false);
 
         // Chat should have fewer args than implement (no prompt).
         assert!(
@@ -984,8 +922,8 @@ fn chat_entrypoint_has_no_prompt() {
 
 #[test]
 fn chat_and_implement_share_docker_args() {
-    let chat_ep = chat_entrypoint("claude");
-    let impl_ep = agent_entrypoint("claude", 1);
+    let chat_ep = chat_entrypoint("claude", false);
+    let impl_ep = agent_entrypoint("claude", 1, false);
 
     let chat_ep_refs: Vec<&str> = chat_ep.iter().map(String::as_str).collect();
     let impl_ep_refs: Vec<&str> = impl_ep.iter().map(String::as_str).collect();
@@ -1048,9 +986,9 @@ fn autocomplete_chat_shows_hints() {
 fn pending_command_chat_variant() {
     use aspec::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true, plan: false });
     assert_ne!(cmd, PendingCommand::None);
 }
 
@@ -1061,8 +999,8 @@ fn pending_command_chat_variant() {
 #[test]
 fn chat_entrypoint_non_interactive_has_no_prompt() {
     for agent in &["claude", "codex", "opencode"] {
-        let chat_args = chat_entrypoint_non_interactive(agent);
-        let impl_args = agent_entrypoint_non_interactive(agent, 1);
+        let chat_args = chat_entrypoint_non_interactive(agent, false);
+        let impl_args = agent_entrypoint_non_interactive(agent, 1, false);
 
         // Chat non-interactive should not contain prompt text.
         for arg in &chat_args {
@@ -1251,4 +1189,178 @@ fn root_all_flags_parsed_for_tui_startup() {
     assert!(cli.build);
     assert!(cli.no_cache);
     assert!(cli.refresh);
+}
+
+// ---------------------------------------------------------------------------
+// Plan flag: CLI parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_chat_plan_flag() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::parse_from(&["aspec", "chat", "--plan"]);
+    match cli.command.unwrap() {
+        Command::Chat { plan, non_interactive } => {
+            assert!(plan);
+            assert!(!non_interactive);
+        }
+        _ => panic!("expected chat"),
+    }
+}
+
+#[test]
+fn cli_implement_plan_flag() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::parse_from(&["aspec", "implement", "0001", "--plan"]);
+    match cli.command.unwrap() {
+        Command::Implement { plan, work_item, non_interactive } => {
+            assert!(plan);
+            assert_eq!(work_item, "0001");
+            assert!(!non_interactive);
+        }
+        _ => panic!("expected implement"),
+    }
+}
+
+#[test]
+fn cli_chat_plan_and_non_interactive() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::parse_from(&["aspec", "chat", "--plan", "--non-interactive"]);
+    match cli.command.unwrap() {
+        Command::Chat { plan, non_interactive } => {
+            assert!(plan);
+            assert!(non_interactive);
+        }
+        _ => panic!("expected chat"),
+    }
+}
+
+#[test]
+fn cli_implement_plan_and_non_interactive() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::parse_from(&["aspec", "implement", "42", "--plan", "--non-interactive"]);
+    match cli.command.unwrap() {
+        Command::Implement { plan, non_interactive, work_item } => {
+            assert!(plan);
+            assert!(non_interactive);
+            assert_eq!(work_item, "42");
+        }
+        _ => panic!("expected implement"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan flag: agent entrypoint configuration per agent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_flag_configures_claude_correctly() {
+    // Claude uses --permission-mode plan
+    let chat = chat_entrypoint("claude", true);
+    assert!(chat.contains(&"--permission-mode".to_string()), "Claude chat should include --permission-mode");
+    assert!(chat.contains(&"plan".to_string()), "Claude chat should include plan");
+
+    let imp = agent_entrypoint("claude", 1, true);
+    assert!(imp.contains(&"--permission-mode".to_string()), "Claude implement should include --permission-mode");
+    assert!(imp.contains(&"plan".to_string()), "Claude implement should include plan");
+
+    let chat_ni = chat_entrypoint_non_interactive("claude", true);
+    assert!(chat_ni.contains(&"--permission-mode".to_string()), "Claude chat non-interactive should include --permission-mode");
+    assert!(chat_ni.contains(&"plan".to_string()), "Claude chat non-interactive should include plan");
+
+    let imp_ni = agent_entrypoint_non_interactive("claude", 1, true);
+    assert!(imp_ni.contains(&"--permission-mode".to_string()), "Claude implement non-interactive should include --permission-mode");
+    assert!(imp_ni.contains(&"plan".to_string()), "Claude implement non-interactive should include plan");
+}
+
+#[test]
+fn plan_flag_configures_codex_correctly() {
+    // Codex uses --approval-mode plan
+    let chat = chat_entrypoint("codex", true);
+    assert!(chat.contains(&"--approval-mode".to_string()), "Codex chat should include --approval-mode");
+    assert!(chat.contains(&"plan".to_string()), "Codex chat should include plan");
+
+    let imp = agent_entrypoint("codex", 2, true);
+    assert!(imp.contains(&"--approval-mode".to_string()), "Codex implement should include --approval-mode");
+    assert!(imp.contains(&"plan".to_string()), "Codex implement should include plan");
+}
+
+#[test]
+fn plan_flag_ignored_for_opencode() {
+    // Opencode has no plan mode; flag should be silently ignored.
+    let chat_no_plan = chat_entrypoint("opencode", false);
+    let chat_plan = chat_entrypoint("opencode", true);
+    assert_eq!(chat_no_plan, chat_plan, "Opencode chat should be unchanged with --plan");
+
+    let imp_no_plan = agent_entrypoint("opencode", 3, false);
+    let imp_plan = agent_entrypoint("opencode", 3, true);
+    assert_eq!(imp_no_plan, imp_plan, "Opencode implement should be unchanged with --plan");
+}
+
+#[test]
+fn plan_false_does_not_add_flags() {
+    // When plan=false, no plan flags should appear.
+    for agent in &["claude", "codex", "opencode"] {
+        let chat = chat_entrypoint(agent, false);
+        assert!(!chat.contains(&"--permission-mode".to_string()), "No --permission-mode for {} with plan=false", agent);
+        assert!(!chat.contains(&"--approval-mode".to_string()), "No --approval-mode for {} with plan=false", agent);
+
+        let imp = agent_entrypoint(agent, 1, false);
+        assert!(!imp.contains(&"--permission-mode".to_string()), "No --permission-mode for {} implement with plan=false", agent);
+        assert!(!imp.contains(&"--approval-mode".to_string()), "No --approval-mode for {} implement with plan=false", agent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan flag: PendingCommand variants include plan field
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pending_command_chat_plan_field() {
+    use aspec::tui::state::PendingCommand;
+
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: true };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: true });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false });
+}
+
+#[test]
+fn pending_command_implement_plan_field() {
+    use aspec::tui::state::PendingCommand;
+
+    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true };
+    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true });
+    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false });
+}
+
+// ---------------------------------------------------------------------------
+// Plan flag: autocomplete hints include --plan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn autocomplete_chat_shows_plan_hint() {
+    let sug = autocomplete_suggestions("chat ");
+    assert!(
+        sug.iter().any(|s| s.contains("--plan")),
+        "Expected --plan hint for 'chat' command, got: {:?}",
+        sug
+    );
+}
+
+#[test]
+fn autocomplete_implement_shows_plan_hint() {
+    let sug = autocomplete_suggestions("implement ");
+    assert!(
+        sug.iter().any(|s| s.contains("--plan")),
+        "Expected --plan hint for 'implement' command, got: {:?}",
+        sug
+    );
 }

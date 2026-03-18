@@ -23,8 +23,9 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Implement {
             work_item,
             non_interactive,
-        } => implement::run(&work_item, non_interactive).await,
-        Command::Chat { non_interactive } => chat::run(non_interactive).await,
+            plan,
+        } => implement::run(&work_item, non_interactive, plan).await,
+        Command::Chat { non_interactive, plan } => chat::run(non_interactive, plan).await,
         Command::New => new::run().await,
     }
 }

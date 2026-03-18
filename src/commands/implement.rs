@@ -14,7 +14,7 @@ pub fn parse_work_item(s: &str) -> Result<u32> {
 }
 
 /// Command-mode entry point.
-pub async fn run(work_item_str: &str, non_interactive: bool) -> Result<()> {
+pub async fn run(work_item_str: &str, non_interactive: bool, plan: bool) -> Result<()> {
     let work_item = parse_work_item(work_item_str)?;
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
@@ -24,9 +24,9 @@ pub async fn run(work_item_str: &str, non_interactive: bool) -> Result<()> {
     let host_settings = docker::HostSettings::prepare(agent);
 
     let entrypoint = if non_interactive {
-        agent_entrypoint_non_interactive(agent, work_item)
+        agent_entrypoint_non_interactive(agent, work_item, plan)
     } else {
-        agent_entrypoint(agent, work_item)
+        agent_entrypoint(agent, work_item, plan)
     };
 
     let work_item_path = find_work_item(&git_root, work_item)?;
@@ -55,12 +55,14 @@ pub async fn run(work_item_str: &str, non_interactive: bool) -> Result<()> {
 ///                   when `None`, prompt via stdin (command mode only).
 /// `env_vars`: agent credential env vars to pass into the container.
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
+/// `plan`: when true, launch agent in plan (read-only) mode.
 pub async fn run_with_sink(
     work_item: u32,
     out: &OutputSink,
     mount_override: Option<PathBuf>,
     env_vars: Vec<(String, String)>,
     non_interactive: bool,
+    plan: bool,
     host_settings: Option<&docker::HostSettings>,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
@@ -69,9 +71,9 @@ pub async fn run_with_sink(
     let work_item_path = find_work_item(&git_root, work_item)?;
 
     let entrypoint = if non_interactive {
-        agent_entrypoint_non_interactive(&agent, work_item)
+        agent_entrypoint_non_interactive(&agent, work_item, plan)
     } else {
-        agent_entrypoint(&agent, work_item)
+        agent_entrypoint(&agent, work_item, plan)
     };
 
     let status = format!(
@@ -158,10 +160,10 @@ pub fn implement_prompt(work_item: u32) -> String {
     IMPLEMENT_PROMPT_TEMPLATE.replace("{work_item}", &format!("{:04}", work_item))
 }
 
-pub fn agent_entrypoint(agent: &str, work_item: u32) -> Vec<String> {
+pub fn agent_entrypoint(agent: &str, work_item: u32, plan: bool) -> Vec<String> {
     let prompt = implement_prompt(work_item);
 
-    match agent {
+    let mut args = match agent {
         "claude" => vec![
             "claude".to_string(),
             prompt,
@@ -179,14 +181,16 @@ pub fn agent_entrypoint(agent: &str, work_item: u32) -> Vec<String> {
             agent.to_string(),
             prompt,
         ],
-    }
+    };
+    append_plan_flags(&mut args, agent, plan);
+    args
 }
 
 /// Build the entrypoint command for the implement agent in non-interactive (print) mode.
-pub fn agent_entrypoint_non_interactive(agent: &str, work_item: u32) -> Vec<String> {
+pub fn agent_entrypoint_non_interactive(agent: &str, work_item: u32, plan: bool) -> Vec<String> {
     let prompt = implement_prompt(work_item);
 
-    match agent {
+    let mut args = match agent {
         "claude" => vec![
             "claude".to_string(),
             "-p".to_string(),
@@ -206,6 +210,31 @@ pub fn agent_entrypoint_non_interactive(agent: &str, work_item: u32) -> Vec<Stri
             agent.to_string(),
             prompt,
         ],
+    };
+    append_plan_flags(&mut args, agent, plan);
+    args
+}
+
+/// Append agent-specific plan mode flags to the argument list.
+///
+/// - Claude: `--permission-mode plan`
+/// - Codex: `--approval-mode plan`
+/// - Opencode: no plan mode available (flag is silently ignored)
+fn append_plan_flags(args: &mut Vec<String>, agent: &str, plan: bool) {
+    if !plan {
+        return;
+    }
+    match agent {
+        "claude" => {
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        }
+        "codex" => {
+            args.push("--approval-mode".to_string());
+            args.push("plan".to_string());
+        }
+        // Opencode and unknown agents have no plan mode.
+        _ => {}
     }
 }
 
@@ -238,7 +267,7 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_claude() {
-        let args = agent_entrypoint("claude", 1);
+        let args = agent_entrypoint("claude", 1, false);
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "claude");
         assert!(args[1].contains("work item 0001"));
@@ -246,14 +275,14 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_codex() {
-        let args = agent_entrypoint("codex", 2);
+        let args = agent_entrypoint("codex", 2, false);
         assert_eq!(args[0], "codex");
         assert!(args[1].contains("work item 0002"));
     }
 
     #[test]
     fn agent_entrypoint_opencode() {
-        let args = agent_entrypoint("opencode", 3);
+        let args = agent_entrypoint("opencode", 3, false);
         assert_eq!(args[0], "opencode");
         assert_eq!(args[1], "run");
         assert!(args[2].contains("work item 0003"));
@@ -284,7 +313,7 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_non_interactive_claude() {
-        let args = agent_entrypoint_non_interactive("claude", 1);
+        let args = agent_entrypoint_non_interactive("claude", 1, false);
         assert_eq!(args[0], "claude");
         assert_eq!(args[1], "-p");
         assert!(args[2].contains("work item 0001"));
@@ -292,7 +321,7 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_non_interactive_codex() {
-        let args = agent_entrypoint_non_interactive("codex", 2);
+        let args = agent_entrypoint_non_interactive("codex", 2, false);
         assert_eq!(args[0], "codex");
         assert_eq!(args[1], "--quiet");
         assert!(args[2].contains("work item 0002"));
@@ -300,9 +329,70 @@ mod tests {
 
     #[test]
     fn agent_entrypoint_non_interactive_opencode() {
-        let args = agent_entrypoint_non_interactive("opencode", 3);
+        let args = agent_entrypoint_non_interactive("opencode", 3, false);
         assert_eq!(args[0], "opencode");
         assert_eq!(args[1], "run");
         assert!(args[2].contains("work item 0003"));
+    }
+
+    // --- Plan mode tests ---
+
+    #[test]
+    fn agent_entrypoint_plan_claude() {
+        let args = agent_entrypoint("claude", 1, true);
+        assert_eq!(args[0], "claude");
+        assert!(args[1].contains("work item 0001"));
+        assert_eq!(args[2], "--permission-mode");
+        assert_eq!(args[3], "plan");
+    }
+
+    #[test]
+    fn agent_entrypoint_plan_codex() {
+        let args = agent_entrypoint("codex", 2, true);
+        assert_eq!(args[0], "codex");
+        assert!(args[1].contains("work item 0002"));
+        assert_eq!(args[2], "--approval-mode");
+        assert_eq!(args[3], "plan");
+    }
+
+    #[test]
+    fn agent_entrypoint_plan_opencode() {
+        // Opencode has no plan mode; flag is silently ignored.
+        let args = agent_entrypoint("opencode", 3, true);
+        assert_eq!(args.len(), 3); // opencode, run, prompt — no extra flags
+        assert_eq!(args[0], "opencode");
+        assert_eq!(args[1], "run");
+    }
+
+    #[test]
+    fn agent_entrypoint_plan_unknown_agent() {
+        let args = agent_entrypoint("custom", 1, true);
+        assert_eq!(args.len(), 2); // agent, prompt — no extra flags
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_plan_claude() {
+        let args = agent_entrypoint_non_interactive("claude", 1, true);
+        assert_eq!(args[0], "claude");
+        assert_eq!(args[1], "-p");
+        assert!(args[2].contains("work item 0001"));
+        assert_eq!(args[3], "--permission-mode");
+        assert_eq!(args[4], "plan");
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_plan_codex() {
+        let args = agent_entrypoint_non_interactive("codex", 2, true);
+        assert_eq!(args[0], "codex");
+        assert_eq!(args[1], "--quiet");
+        assert!(args[2].contains("work item 0002"));
+        assert_eq!(args[3], "--approval-mode");
+        assert_eq!(args[4], "plan");
+    }
+
+    #[test]
+    fn agent_entrypoint_non_interactive_plan_opencode() {
+        let args = agent_entrypoint_non_interactive("opencode", 3, true);
+        assert_eq!(args.len(), 3); // opencode, run, prompt — no extra flags
     }
 }

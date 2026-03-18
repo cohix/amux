@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 /// Top-level render function: draws the full TUI for one frame.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Determine if we need a minimized container bar or a summary bar.
@@ -80,10 +80,9 @@ pub fn calculate_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u
     // Match the outer layout: exec window takes all vertical space minus fixed rows.
     // Fixed rows: status bar (1) + command box (3) + suggestions (1) = 5
     let exec_height = term_rows.saturating_sub(5);
-    // Container window: 90% of exec area height, at least 5 rows.
-    let container_height = (exec_height * 90 / 100).max(5);
-    // Container area has 1-column margin on each side of the exec area.
-    let container_width = term_cols.saturating_sub(2);
+    // Container window: 95% of exec area width and height, centered.
+    let container_height = (exec_height * 95 / 100).max(5);
+    let container_width = (term_cols * 95 / 100).max(10);
     // Inner area excludes borders (1 row/col on each side).
     let inner_rows = container_height.saturating_sub(2);
     let inner_cols = container_width.saturating_sub(2);
@@ -166,14 +165,16 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
 
 // --- Container window (overlay on top of outer window) ---
 
-fn draw_container_window(frame: &mut Frame, app: &App, outer_area: Rect) {
-    // Container window takes 90% of the outer window, anchored to bottom.
-    let container_height = (outer_area.height * 90 / 100).max(5);
-    let buffer_top = outer_area.height.saturating_sub(container_height);
+fn draw_container_window(frame: &mut Frame, app: &mut App, outer_area: Rect) {
+    // Container window takes 95% of the outer window's width and height, centered.
+    let container_height = (outer_area.height * 95 / 100).max(5);
+    let container_width = (outer_area.width * 95 / 100).max(10);
+    let offset_x = (outer_area.width.saturating_sub(container_width)) / 2;
+    let offset_y = (outer_area.height.saturating_sub(container_height)) / 2;
     let container_area = Rect {
-        x: outer_area.x + 1,
-        y: outer_area.y + buffer_top,
-        width: outer_area.width.saturating_sub(2),
+        x: outer_area.x + offset_x,
+        y: outer_area.y + offset_y,
+        width: container_width,
         height: container_height,
     };
 
@@ -190,19 +191,42 @@ fn draw_container_window(frame: &mut Frame, app: &App, outer_area: Rect) {
 
     let right_title = build_stats_title(app);
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
         .title(Line::from(right_title).alignment(Alignment::Right))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
 
+    // Show scroll indicator when viewing scrollback.
+    if app.container_scroll_offset > 0 {
+        let scroll_hint = format!(" \u{2191} scrollback ({} lines up) ", app.container_scroll_offset);
+        block = block.title(
+            Line::from(Span::styled(scroll_hint, Style::default().fg(Color::Yellow)))
+                .alignment(Alignment::Center),
+        );
+    }
+
     let inner = block.inner(container_area);
     frame.render_widget(block, container_area);
 
     // Render the vt100 terminal emulator screen into the inner area.
-    if let Some(ref parser) = app.vt100_parser {
-        render_vt100_screen(frame, parser.screen(), inner);
+    if let Some(ref mut parser) = app.vt100_parser {
+        if app.container_scroll_offset > 0 {
+            // set_scrollback() supports offsets up to the screen row count.
+            // Cap to the screen row count to avoid overflow in the vt100 grid.
+            let max_safe = parser.screen().size().0 as usize;
+            let offset = app.container_scroll_offset.min(max_safe);
+            if offset > 0 {
+                parser.set_scrollback(offset);
+                render_vt100_screen_no_cursor(frame, parser.screen(), inner);
+                parser.set_scrollback(0);
+            } else {
+                render_vt100_screen(frame, parser.screen(), inner);
+            }
+        } else {
+            render_vt100_screen(frame, parser.screen(), inner);
+        }
     }
 }
 
@@ -258,6 +282,52 @@ fn render_vt100_screen(frame: &mut Frame, screen: &vt100::Screen, area: Rect) {
         let cy = area.y + cursor_row;
         if cx < area.x + area.width && cy < area.y + area.height {
             frame.set_cursor_position((cx, cy));
+        }
+    }
+}
+
+/// Render a vt100 screen into a ratatui buffer area without showing the cursor.
+/// Used when viewing scrollback history.
+fn render_vt100_screen_no_cursor(frame: &mut Frame, screen: &vt100::Screen, area: Rect) {
+    let buf = frame.buffer_mut();
+    let rows = area.height as usize;
+    let cols = area.width as usize;
+    let screen_rows = screen.size().0 as usize;
+    let screen_cols = screen.size().1 as usize;
+
+    for row in 0..rows.min(screen_rows) {
+        let mut col = 0;
+        while col < cols.min(screen_cols) {
+            let cell = screen.cell(row as u16, col as u16);
+            let x = area.x + col as u16;
+            let y = area.y + row as u16;
+
+            if let Some(cell) = cell {
+                let contents = cell.contents();
+                let mut style = Style::default();
+                style = style.fg(convert_vt100_color(cell.fgcolor()));
+                style = style.bg(convert_vt100_color(cell.bgcolor()));
+                if cell.bold() {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.italic() {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if cell.underline() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if cell.inverse() {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+
+                if contents.is_empty() {
+                    buf[(x, y)].set_symbol(" ").set_style(style);
+                } else {
+                    buf[(x, y)].set_symbol(&contents).set_style(style);
+                }
+            }
+
+            col += 1;
         }
     }
 }
@@ -376,10 +446,10 @@ fn build_stats_title(app: &App) -> String {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let spans: Vec<Span> = match (&app.phase, &app.focus, &app.container_window) {
-        // Container maximized + window focused: Esc to minimize.
+        // Container maximized + window focused: Esc to minimize, scroll for history.
         (ExecutionPhase::Running { .. }, Focus::ExecutionWindow, ContainerWindowState::Maximized) => {
             vec![Span::styled(
-                " Press Esc to minimize the container window ",
+                " Esc minimize  ·  scroll ↕ history ",
                 Style::default().fg(Color::Yellow),
             )]
         }
@@ -596,7 +666,7 @@ mod tests {
 
     /// Helper: render the app into a TestBackend and return the text content
     /// of the execution window's inner area (excluding borders).
-    fn render_exec_window_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+    fn render_exec_window_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -639,7 +709,7 @@ mod tests {
 
         // scroll_offset=0 → should show the LAST 8 lines (lines 12-19).
         app.scroll_offset = 0;
-        let view0 = render_exec_window_lines(&app, 40, 15);
+        let view0 = render_exec_window_lines(&mut app, 40, 15);
         assert!(
             view0.iter().any(|l| l.contains("line 19")),
             "scroll_offset=0 should show line 19 (newest). Got: {:?}",
@@ -653,7 +723,7 @@ mod tests {
 
         // scroll_offset=5 → should show earlier content.
         app.scroll_offset = 5;
-        let view5 = render_exec_window_lines(&app, 40, 15);
+        let view5 = render_exec_window_lines(&mut app, 40, 15);
         assert!(
             view5.iter().any(|l| l.contains("line 7")),
             "scroll_offset=5 should show line 7. Got: {:?}",
@@ -668,7 +738,7 @@ mod tests {
 
         // scroll_offset=max → should show the FIRST lines.
         app.scroll_offset = 20;
-        let view_top = render_exec_window_lines(&app, 40, 15);
+        let view_top = render_exec_window_lines(&mut app, 40, 15);
         assert!(
             view_top.iter().any(|l| l.contains("line 0")),
             "scroll_offset=max should show line 0 (oldest). Got: {:?}",
@@ -691,7 +761,7 @@ mod tests {
         app.scroll_offset = 0;
 
         // 40 wide, 15 tall → inner = 8 rows. 10 lines of ~16 display cols each.
-        let view = render_exec_window_lines(&app, 40, 15);
+        let view = render_exec_window_lines(&mut app, 40, 15);
         assert!(
             view.iter().any(|l| l.contains("step 9")),
             "Newest line must be visible with Unicode content. Got: {:?}",
@@ -715,7 +785,7 @@ mod tests {
         // Render with enough space to include the summary bar.
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
         // Collect all text from the buffer to verify summary content appears.
@@ -752,7 +822,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 25);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
         let mut all_text = String::new();
@@ -784,7 +854,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
         let mut all_text = String::new();
@@ -804,11 +874,186 @@ mod tests {
     fn calculate_container_inner_size_reasonable_values() {
         let (cols, rows) = calculate_container_inner_size(80, 25);
         // exec_height = 25 - 5 = 20
-        // container_height = 20 * 90 / 100 = 18
-        // container_width = 80 - 2 = 78
-        // inner_rows = 18 - 2 = 16
-        // inner_cols = 78 - 2 = 76
-        assert_eq!(cols, 76);
-        assert_eq!(rows, 16);
+        // container_height = 20 * 95 / 100 = 19
+        // container_width = 80 * 95 / 100 = 76
+        // inner_rows = 19 - 2 = 17
+        // inner_cols = 76 - 2 = 74
+        assert_eq!(cols, 74);
+        assert_eq!(rows, 17);
+    }
+
+    #[test]
+    fn container_window_is_95_percent_and_centered() {
+        // Verify the container window occupies 95% of outer area and is centered.
+        let mut app = App::new();
+        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.focus = Focus::ExecutionWindow;
+        let (inner_cols, inner_rows) = calculate_container_inner_size(100, 30);
+        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // exec_height = 30 - 5 = 25
+        // container_height = 25 * 95 / 100 = 23
+        // container_width = 100 * 95 / 100 = 95
+        // offset_x = (100 - 95) / 2 = 2
+        // offset_y = (25 - 23) / 2 = 1
+        // Container border should be at (2, 1) with green border.
+        // Verify the container window is rendered in the centered area by checking
+        // that the border characters appear at the expected position.
+        let corner = buf[(2, 1)].symbol().to_string();
+        assert!(
+            corner == "╭" || corner == "│" || corner == "─",
+            "Container border character should appear at centered position. Got: '{}'",
+            corner
+        );
+    }
+
+    #[test]
+    fn vt100_set_scrollback_basic() {
+        // Verify basic vt100 set_scrollback behavior.
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        for i in 0..20 {
+            parser.process(format!("line {}\r\n", i).as_bytes());
+        }
+        // After 20 lines in a 5-row screen, 15 lines should be in scrollback.
+        // scrollback() returns the current position (0 when normal view).
+        assert_eq!(parser.screen().scrollback(), 0);
+
+        parser.set_scrollback(5);
+        assert_eq!(parser.screen().scrollback(), 5);
+        // cell(0,0) should access scrollback content.
+        let cell = parser.screen().cell(0, 0);
+        assert!(cell.is_some(), "cell(0,0) should be valid with scrollback=5");
+
+        parser.set_scrollback(0);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn container_scrollback_renders_older_content() {
+        let mut app = App::new();
+        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.focus = Focus::ExecutionWindow;
+        let (inner_cols, inner_rows) = calculate_container_inner_size(80, 25);
+        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+
+        // Feed enough data to create scrollback: write many lines to push
+        // content into the scrollback buffer.
+        if let Some(ref mut parser) = app.vt100_parser {
+            for i in 0..50 {
+                parser.process(format!("scrollback line {}\r\n", i).as_bytes());
+            }
+        }
+
+        // At offset 0, the latest lines should be visible.
+        app.container_scroll_offset = 0;
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text_at_0 = String::new();
+        for row in 0..25 {
+            for col in 0..80 {
+                text_at_0.push_str(buf[(col, row)].symbol());
+            }
+        }
+        assert!(
+            text_at_0.contains("scrollback line 49"),
+            "At offset 0 the latest line should be visible"
+        );
+
+        // Scroll up by a safe amount (capped at screen rows = inner_rows).
+        // With inner_rows = 17 and 50 lines written, scrollback has 33 lines.
+        // Max safe offset is inner_rows (17) due to vt100 set_scrollback limits.
+        let max_safe = inner_rows as usize;
+        app.container_scroll_offset = max_safe;
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text_scrolled = String::new();
+        for row in 0..25 {
+            for col in 0..80 {
+                text_scrolled.push_str(buf[(col, row)].symbol());
+            }
+        }
+        // When scrolled max_safe lines up, the most recent line should not be visible.
+        assert!(
+            !text_scrolled.contains("scrollback line 49"),
+            "At max scroll the latest line should NOT be visible"
+        );
+        // Should show earlier content from scrollback.
+        assert!(
+            text_scrolled.contains("scrollback line"),
+            "Should show scrollback content when scrolled up"
+        );
+    }
+
+    #[test]
+    fn container_scroll_indicator_shown_when_scrolled() {
+        let mut app = App::new();
+        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.focus = Focus::ExecutionWindow;
+        let (inner_cols, inner_rows) = calculate_container_inner_size(80, 25);
+        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+
+        // Feed data to create scrollback.
+        if let Some(ref mut parser) = app.vt100_parser {
+            for i in 0..50 {
+                parser.process(format!("line {}\r\n", i).as_bytes());
+            }
+        }
+
+        // Use a scroll offset within the safe range (≤ screen rows).
+        let (_, inner_rows) = calculate_container_inner_size(80, 25);
+        app.container_scroll_offset = (inner_rows as usize).min(10);
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut all_text = String::new();
+        for row in 0..25 {
+            for col in 0..80 {
+                all_text.push_str(buf[(col, row)].symbol());
+            }
+        }
+        assert!(
+            all_text.contains("scrollback"),
+            "Scroll indicator should appear when scrolled up. Got buffer text."
+        );
+    }
+
+    #[test]
+    fn outer_window_scroll_unaffected_by_container_changes() {
+        // Verify that the outer execution window scrolling still works correctly
+        // even when container-related state is present.
+        let mut app = App::new();
+        for i in 0..20 {
+            app.output_lines.push(format!("outer line {}", i));
+        }
+        app.phase = ExecutionPhase::Done { command: "ready".into() };
+        app.focus = Focus::ExecutionWindow;
+        // Container is hidden (default) — this should not affect outer scrolling.
+        app.container_scroll_offset = 5; // stale value, should be irrelevant
+
+        app.scroll_offset = 0;
+        let view_bottom = render_exec_window_lines(&mut app, 40, 15);
+        assert!(
+            view_bottom.iter().any(|l| l.contains("outer line 19")),
+            "Outer window should show newest line at offset 0. Got: {:?}",
+            view_bottom
+        );
+
+        app.scroll_offset = 10;
+        let view_scrolled = render_exec_window_lines(&mut app, 40, 15);
+        assert!(
+            !view_scrolled.iter().any(|l| l.contains("outer line 19")),
+            "Outer window should not show newest line at offset 10. Got: {:?}",
+            view_scrolled
+        );
     }
 }

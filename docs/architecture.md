@@ -147,8 +147,8 @@ None ──[q / Ctrl+C]───────────────────
 ```
 
 Dialogs intercept all key events until dismissed. A `PendingCommand` enum
-(`Ready { refresh, non_interactive }`, `Implement { work_item, non_interactive }`,
-or `Chat { non_interactive }`)
+(`Ready { refresh, non_interactive }`, `Implement { work_item, non_interactive, plan }`,
+or `Chat { non_interactive, plan }`)
 and the mount path are preserved in `App` fields while a dialog is active, so
 the correct command resumes after the dialog is dismissed.
 
@@ -233,6 +233,17 @@ Uses `agent_entrypoint_non_interactive()` which adds print-mode flags:
 Output is captured via `docker::run_container_captured()` and displayed.
 A tip suggests removing `--non-interactive` for direct interaction.
 
+### Plan Mode (`--plan`)
+
+When `--plan` is passed, the agent is initialized in read-only plan mode.
+Plan flags are appended after the regular entrypoint arguments via
+`append_plan_flags()`:
+- Claude: `--plan`
+- Codex: `--approval-mode plan`
+- Opencode: no plan mode (flag is silently ignored)
+
+`--plan` can be combined with `--non-interactive`.
+
 Host agent settings are mounted read-only into the container via
 `docker::HostSettings::prepare()`, which copies sanitized versions of
 `~/.claude.json` (with `oauthAccount` stripped) and `~/.claude/settings.json`
@@ -272,11 +283,11 @@ The only differences between `chat` and `implement` are:
 
 ### Chat Entrypoints
 
-| Agent | Interactive | Non-Interactive |
-|-------|-----------|-----------------|
-| `claude` | `["claude"]` | `["claude", "-p"]` |
-| `codex` | `["codex"]` | `["codex", "--quiet"]` |
-| `opencode` | `["opencode"]` | `["opencode"]` |
+| Agent | Interactive | Non-Interactive | Plan (appended) |
+|-------|-----------|-----------------|-----------------|
+| `claude` | `["claude"]` | `["claude", "-p"]` | `["--plan"]` |
+| `codex` | `["codex"]` | `["codex", "--quiet"]` | `["--approval-mode", "plan"]` |
+| `opencode` | `["opencode"]` | `["opencode"]` | (none) |
 
 ---
 
@@ -441,8 +452,8 @@ and `Minimized`. The state transitions are:
 
 ### Layout
 
-When **maximized**, the container window covers 90% of the outer execution
-window area, anchored to the bottom. It has a green border with:
+When **maximized**, the container window covers 95% of the outer execution
+window's width and height, centered. It has a green border with:
 - Left title: `🔒 {agent} (containerized)` (e.g. `🔒 Claude Code (containerized)`)
 - Right title: `{container_name} | CPU {cpu}% | Mem {mem}MB | {runtime}`
 
@@ -451,6 +462,25 @@ execution window and the command box, showing agent name and live stats.
 
 After the container **exits**, a summary bar with dashed border shows:
 `{agent} exited | avg CPU {cpu}% | peak mem {mem}MB | runtime {duration}`
+
+### Container Scrollback
+
+When the container window is maximized, the mouse scroll wheel allows the user
+to scroll through the vt100 terminal's scrollback buffer, viewing recent output
+that has scrolled off the screen. This is implemented using the vt100 crate's
+`set_scrollback()` API:
+
+- **Scroll up**: increases `container_scroll_offset`, which calls
+  `parser.set_scrollback(offset)` to shift the view into scrollback
+- **Scroll down**: decreases the offset; at 0 the live screen is shown
+- **Indicator**: a centered yellow title ("↑ scrollback (N lines up)") appears
+  on the container border when scrolled
+
+The maximum scroll depth is capped at the screen row count due to a limitation
+in the vt100 crate's `set_scrollback()` implementation (its internal
+`visible_rows()` iterator underflows when offset > rows_len). The cursor is
+hidden when viewing scrollback. Scrollback state resets to 0 when a new
+container starts.
 
 ### PTY Output Routing
 

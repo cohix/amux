@@ -388,10 +388,12 @@ fn flag_suggestions_for(cmd: &str, _typed: &str) -> Vec<String> {
         "implement" => vec![
             "implement <NNNN>  e.g. implement 0001".into(),
             "implement <NNNN> --non-interactive".into(),
+            "implement <NNNN> --plan".into(),
         ],
         "chat" => vec![
             "chat  (start a freeform agent session)".into(),
             "chat --non-interactive".into(),
+            "chat --plan".into(),
         ],
         "new" => vec![
             "new  (creates a new work item from template)".into(),

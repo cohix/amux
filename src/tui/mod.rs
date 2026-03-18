@@ -76,7 +76,7 @@ where
     execute_command(&mut app, &startup_cmd).await;
 
     loop {
-        terminal.draw(|f| render::draw(f, &app))?;
+        terminal.draw(|f| render::draw(f, &mut app))?;
 
         // Poll for crossterm events with a short timeout to keep the UI responsive.
         if event::poll(Duration::from_millis(16))? {
@@ -88,9 +88,16 @@ where
                 Event::Mouse(mouse) => {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
-                            // When the container is maximized, scrolling is handled by the
-                            // application inside the container (via the vt100 emulator).
-                            if app.container_window != ContainerWindowState::Maximized {
+                            if app.container_window == ContainerWindowState::Maximized {
+                                // Scroll up through the container's vt100 scrollback.
+                                // Cap at the screen row count due to a vt100 crate
+                                // limitation in set_scrollback's internal row arithmetic.
+                                let max_scroll = app.vt100_parser.as_ref()
+                                    .map(|p| p.screen().size().0 as usize)
+                                    .unwrap_or(0);
+                                app.container_scroll_offset =
+                                    (app.container_scroll_offset + 3).min(max_scroll);
+                            } else {
                                 let max = app.output_lines.len();
                                 if app.scroll_offset < max {
                                     app.scroll_offset = app.scroll_offset.saturating_add(3);
@@ -98,7 +105,11 @@ where
                             }
                         }
                         MouseEventKind::ScrollDown => {
-                            if app.container_window != ContainerWindowState::Maximized {
+                            if app.container_window == ContainerWindowState::Maximized {
+                                // Scroll down towards the live view.
+                                app.container_scroll_offset =
+                                    app.container_scroll_offset.saturating_sub(3);
+                            } else {
                                 app.scroll_offset = app.scroll_offset.saturating_sub(3);
                             }
                         }
@@ -206,9 +217,18 @@ fn parse_ready_flags(parts: &[&str]) -> (bool, bool, bool, bool) {
     (refresh, build, no_cache, non_interactive)
 }
 
-/// Parse flags from implement command parts, returning non_interactive.
-fn parse_implement_flags(parts: &[&str]) -> bool {
-    parts.iter().any(|p| *p == "--non-interactive")
+/// Parse flags from implement command parts, returning (non_interactive, plan).
+fn parse_implement_flags(parts: &[&str]) -> (bool, bool) {
+    let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
+    let plan = parts.iter().any(|p| *p == "--plan");
+    (non_interactive, plan)
+}
+
+/// Parse flags from chat command parts, returning (non_interactive, plan).
+fn parse_chat_flags(parts: &[&str]) -> (bool, bool) {
+    let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
+    let plan = parts.iter().any(|p| *p == "--plan");
+    (non_interactive, plan)
 }
 
 /// Parse and dispatch a command string entered by the user.
@@ -240,7 +260,7 @@ async fn execute_command(app: &mut App, cmd: &str) {
         }
 
         "implement" => {
-            let non_interactive = parse_implement_flags(&parts);
+            let (non_interactive, plan) = parse_implement_flags(&parts);
             // Filter out flags to find the work item number.
             let work_item: u32 = match parts.iter()
                 .skip(1)
@@ -250,17 +270,17 @@ async fn execute_command(app: &mut App, cmd: &str) {
                 Some(n) => n,
                 None => {
                     app.input_error =
-                        Some("Usage: implement <work-item-number> [--non-interactive]".into());
+                        Some("Usage: implement <work-item-number> [--non-interactive] [--plan]".into());
                     return;
                 }
             };
-            app.pending_command = PendingCommand::Implement { work_item, non_interactive };
+            app.pending_command = PendingCommand::Implement { work_item, non_interactive, plan };
             show_pre_command_dialogs(app).await;
         }
 
         "chat" => {
-            let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
-            app.pending_command = PendingCommand::Chat { non_interactive };
+            let (non_interactive, plan) = parse_chat_flags(&parts);
+            app.pending_command = PendingCommand::Chat { non_interactive, plan };
             show_pre_command_dialogs(app).await;
         }
 
@@ -314,11 +334,11 @@ async fn launch_pending_command(app: &mut App) {
             app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive };
             launch_ready(app).await;
         }
-        PendingCommand::Implement { work_item, non_interactive } => {
-            launch_implement(app, work_item, non_interactive).await;
+        PendingCommand::Implement { work_item, non_interactive, plan } => {
+            launch_implement(app, work_item, non_interactive, plan).await;
         }
-        PendingCommand::Chat { non_interactive } => {
-            launch_chat(app, non_interactive).await;
+        PendingCommand::Chat { non_interactive, plan } => {
+            launch_chat(app, non_interactive, plan).await;
         }
         PendingCommand::None => {}
     }
@@ -562,7 +582,7 @@ fn launch_ready_post_audit(app: &mut App) {
 }
 
 /// Actually spawn the docker container for `implement` via PTY.
-async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool) {
+async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool) {
     let git_root = match find_git_root() {
         Some(r) => r,
         None => {
@@ -589,9 +609,9 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool) 
     app.host_settings = docker::HostSettings::prepare(&agent_name);
 
     let entrypoint = if non_interactive {
-        agent_entrypoint_non_interactive(&agent_name, work_item)
+        agent_entrypoint_non_interactive(&agent_name, work_item, plan)
     } else {
-        agent_entrypoint(&agent_name, work_item)
+        agent_entrypoint(&agent_name, work_item, plan)
     };
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
 
@@ -622,7 +642,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool) 
         let tx = app.output_tx.clone();
         let mount_str = mount_path.to_str().unwrap().to_string();
         spawn_text_command(tx, exit_tx, move |sink| async move {
-            let entrypoint = agent_entrypoint_non_interactive(&agent_name, work_item);
+            let entrypoint = agent_entrypoint_non_interactive(&agent_name, work_item, plan);
             let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
             let (_cmd, output) = docker::run_container_captured(
                 &image_tag,
@@ -675,7 +695,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool) 
 }
 
 /// Actually spawn the docker container for `chat` via PTY.
-async fn launch_chat(app: &mut App, non_interactive: bool) {
+async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool) {
     let git_root = match find_git_root() {
         Some(r) => r,
         None => {
@@ -696,9 +716,9 @@ async fn launch_chat(app: &mut App, non_interactive: bool) {
     app.host_settings = docker::HostSettings::prepare(&agent_name);
 
     let entrypoint = if non_interactive {
-        chat_entrypoint_non_interactive(&agent_name)
+        chat_entrypoint_non_interactive(&agent_name, plan)
     } else {
-        chat_entrypoint(&agent_name)
+        chat_entrypoint(&agent_name, plan)
     };
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
 
@@ -729,7 +749,7 @@ async fn launch_chat(app: &mut App, non_interactive: bool) {
         let tx = app.output_tx.clone();
         let mount_str = mount_path.to_str().unwrap().to_string();
         spawn_text_command(tx, exit_tx, move |sink| async move {
-            let entrypoint = chat_entrypoint_non_interactive(&agent_name);
+            let entrypoint = chat_entrypoint_non_interactive(&agent_name, plan);
             let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
             let (_cmd, output) = docker::run_container_captured(
                 &image_tag,
