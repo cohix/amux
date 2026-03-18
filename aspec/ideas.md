@@ -11,8 +11,8 @@
 - multiple virtualization options: Docker, OpenShell, Apple Containers (global or project config)
 - Ability to create a machine-local "claws" folder where user can define one or more claw-like agents. Aspec uses Claude to configure NanoClaw to do stuff based on the claws defined in this local folder. Global singleton folder, aspec will ask where to create it and use that from then on. Maybe support OpenClaw or NemoClaw eventually.
 - Optional global "skills" folder which can be loaded into agent container automatically. User-personal skills that don't belong in a specific project.
-- bug where Docker Build output doesn't stream in TUI
 - download templates from GH instead of copying from local repo
 - split docs up, add getting started and workflow guide
 - review init command, ensure it downloads aspec from GH, add basics like project name and type
 - make the TUI scrollable
+- add --plan flag to `implement` and `chat` subcommands to initiate agent in plan mode

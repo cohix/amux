@@ -1,19 +1,6 @@
-FROM debian:bookworm-20250317-slim
+FROM debian:bookworm-slim
 
-# Pin Rust toolchain version — must match rust-toolchain.toml and Cargo.toml rust-version
-ENV RUST_VERSION=1.94.0
-ENV RUSTUP_HOME=/usr/local/rustup
-ENV CARGO_HOME=/usr/local/cargo
-ENV PATH="/usr/local/cargo/bin:${PATH}"
-
-# Install system packages required for building and testing the project:
-#   git            - version control (repo interaction)
-#   ca-certificates - TLS root certs for HTTPS fetches
-#   curl           - downloading installers (rustup, claude)
-#   make           - build orchestration (make all / make test / make install)
-#   gcc            - C linker required by cargo/rustc
-#   libc6-dev      - C headers and libs for linking
-#   pkg-config     - locating system libraries during cargo build
+# System packages required for building, testing, and running the project
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
@@ -24,11 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain via rustup, pinned to a specific stable version
+# Install Rust toolchain pinned to the version declared in Cargo.toml (rust-version)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
-    && rustc --version \
-    && cargo --version
+    sh -s -- -y --default-toolchain 1.94.0 --profile minimal \
+    && rustc --version && cargo --version
+
+# Install Docker CLI (pinned version) so the container can interact with the host Docker daemon
+ENV DOCKER_VERSION=27.5.1
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${DOCKER_VERSION}.tgz" \
+    | tar xz --strip-components=1 -C /usr/local/bin docker/docker \
+    && docker --version
 
 # Install Claude Code via official standalone installer
 RUN curl -fsSL https://claude.ai/install.sh | bash \

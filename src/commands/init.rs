@@ -1,4 +1,5 @@
 use crate::cli::Agent;
+use crate::commands::download;
 use crate::commands::output::OutputSink;
 use crate::config::{save_repo_config, RepoConfig};
 use anyhow::{Context, Result};
@@ -28,7 +29,31 @@ pub async fn run_with_sink(agent: Agent, out: &OutputSink) -> Result<()> {
         git_root.join("aspec/.aspec-cli.json").display()
     ));
 
-    if write_dockerfile(&git_root, &agent)? {
+    // Download aspec folder from GitHub if it doesn't already exist.
+    let aspec_dir = git_root.join("aspec");
+    if !aspec_dir.exists() {
+        match download::download_aspec_folder(&git_root, out).await {
+            Ok(()) => {}
+            Err(e) => {
+                out.println(format!(
+                    "Warning: failed to download aspec folder from GitHub: {}",
+                    e
+                ));
+                out.println(
+                    "You can manually download it from https://github.com/cohix/aspec"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        out.println(format!(
+            "aspec folder already exists at: {} (not overwritten)",
+            aspec_dir.display()
+        ));
+    }
+
+    // Download and write Dockerfile.dev from GitHub template.
+    if write_dockerfile(&git_root, &agent, out).await? {
         out.println(format!(
             "Dockerfile.dev written to: {}",
             git_root.join("Dockerfile.dev").display()
@@ -56,21 +81,41 @@ pub fn find_git_root() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Write Dockerfile.dev to the git root using the template for the given agent.
+/// Write Dockerfile.dev to the git root using a template downloaded from GitHub.
+/// Falls back to the embedded template if the download fails.
 /// Returns `true` if a new file was created, `false` if an existing file was preserved.
 /// Public so other commands (e.g. ready) can initialize a missing Dockerfile.dev.
-pub fn write_dockerfile(git_root: &Path, agent: &Agent) -> Result<bool> {
+pub async fn write_dockerfile(
+    git_root: &Path,
+    agent: &Agent,
+    out: &OutputSink,
+) -> Result<bool> {
     let path = git_root.join("Dockerfile.dev");
     if path.exists() {
         return Ok(false);
     }
-    let content = dockerfile_for_agent(agent);
+    let content = download_or_fallback_dockerfile(agent, out).await;
     std::fs::write(&path, content)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(true)
 }
 
-pub fn dockerfile_for_agent(agent: &Agent) -> String {
+/// Try to download the Dockerfile template from GitHub; fall back to embedded template.
+async fn download_or_fallback_dockerfile(agent: &Agent, out: &OutputSink) -> String {
+    match download::download_dockerfile_template(agent, out).await {
+        Ok(content) => content,
+        Err(e) => {
+            out.println(format!(
+                "Warning: failed to download Dockerfile template from GitHub: {}. Using bundled template.",
+                e
+            ));
+            dockerfile_for_agent_embedded(agent)
+        }
+    }
+}
+
+/// Embedded Dockerfile templates compiled into the binary (used as fallback).
+pub fn dockerfile_for_agent_embedded(agent: &Agent) -> String {
     match agent {
         Agent::Claude => include_str!("../../templates/Dockerfile.claude").to_string(),
         Agent::Codex => include_str!("../../templates/Dockerfile.codex").to_string(),
@@ -123,23 +168,27 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
-    #[test]
-    fn write_dockerfile_creates_when_missing() {
+    #[tokio::test]
+    async fn write_dockerfile_creates_when_missing() {
         let tmp = TempDir::new().unwrap();
-        let result = write_dockerfile(tmp.path(), &Agent::Claude).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let out = OutputSink::Channel(tx);
+        let result = write_dockerfile(tmp.path(), &Agent::Claude, &out).await.unwrap();
         assert!(result, "should return true when creating a new file");
         assert!(tmp.path().join("Dockerfile.dev").exists());
         let content = std::fs::read_to_string(tmp.path().join("Dockerfile.dev")).unwrap();
         assert!(content.contains("debian:bookworm-slim"));
     }
 
-    #[test]
-    fn write_dockerfile_does_not_overwrite_existing() {
+    #[tokio::test]
+    async fn write_dockerfile_does_not_overwrite_existing() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("Dockerfile.dev");
         std::fs::write(&path, "CUSTOM CONTENT").unwrap();
 
-        let result = write_dockerfile(tmp.path(), &Agent::Claude).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let out = OutputSink::Channel(tx);
+        let result = write_dockerfile(tmp.path(), &Agent::Claude, &out).await.unwrap();
         assert!(!result, "should return false when file already exists");
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -147,9 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_for_agent_uses_debian_slim_base() {
+    fn dockerfile_for_agent_embedded_uses_debian_slim_base() {
         for agent in &[Agent::Claude, Agent::Codex, Agent::Opencode] {
-            let content = dockerfile_for_agent(agent);
+            let content = dockerfile_for_agent_embedded(agent);
             assert!(
                 content.contains("debian:bookworm-slim"),
                 "{:?} template should use debian:bookworm-slim base image",
@@ -159,9 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_for_agent_does_not_use_npm_install() {
+    fn dockerfile_for_agent_embedded_does_not_use_npm_install() {
         for agent in &[Agent::Claude, Agent::Codex, Agent::Opencode] {
-            let content = dockerfile_for_agent(agent);
+            let content = dockerfile_for_agent_embedded(agent);
             assert!(
                 !content.contains("npm install"),
                 "{:?} template should not use npm install",
@@ -173,7 +222,7 @@ mod tests {
     #[test]
     fn dockerfile_templates_install_via_apt_or_direct_download() {
         for agent in &[Agent::Claude, Agent::Codex, Agent::Opencode] {
-            let content = dockerfile_for_agent(agent);
+            let content = dockerfile_for_agent_embedded(agent);
             assert!(
                 content.contains("apt-get") || content.contains("curl"),
                 "{:?} template should install packages via apt-get or direct download",

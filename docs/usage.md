@@ -55,7 +55,13 @@ Initialises the current Git repository for use with `aspec`.
 
 - Detects the Git root directory
 - Writes `aspec/.aspec-cli.json` (repository config)
-- Writes `Dockerfile.dev` from the agent template (only if one does not already exist)
+- Downloads the `aspec/` folder from GitHub (`github.com/cohix/aspec`) if it does
+  not already exist in the Git root. This provides the project specification
+  templates, work item template, and architecture documents.
+- Downloads and writes `Dockerfile.dev` from the agent template hosted on GitHub
+  (`github.com/cohix/aspec-cli`). Falls back to the bundled template if the
+  download fails (e.g. no network). Only writes if one does not already exist.
+- Logs download URLs, file sizes, and destinations for all downloaded content
 
 **Flags**
 
@@ -277,8 +283,9 @@ stdin prompts.
 **Filename generation**: The title is lowercased, spaces are replaced with
 hyphens, and all non-alphanumeric characters (except hyphens) are removed.
 
-**Edge case**: If no template is found in the current Git root, an error message
-is displayed with a link to download the template from GitHub.
+**Edge case**: If no template is found in the current Git root, `aspec` will
+automatically download the `aspec/` folder from GitHub (`github.com/cohix/aspec`)
+to provide the template. If the download also fails, an error message is displayed.
 
 **Example**
 

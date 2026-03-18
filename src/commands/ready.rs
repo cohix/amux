@@ -233,9 +233,9 @@ pub async fn run_pre_audit(
     let dockerfile_was_missing;
     {
         let agent = agent_from_str(&agent_name);
-        if write_dockerfile(&git_root, &agent)? {
+        if write_dockerfile(&git_root, &agent, out).await? {
             out.println(format!(
-                "MISSING — created from template at {}",
+                "MISSING — downloaded and created at {}",
                 dockerfile.display()
             ));
             summary.dockerfile = StepStatus::Ok("created".into());

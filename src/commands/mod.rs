@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod chat;
+pub mod download;
 pub mod implement;
 pub mod init;
 pub mod new;

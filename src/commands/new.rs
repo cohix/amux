@@ -1,3 +1,4 @@
+use crate::commands::download;
 use crate::commands::init::find_git_root;
 use crate::commands::output::OutputSink;
 use anyhow::{bail, Context, Result};
@@ -19,8 +20,20 @@ pub async fn run_with_sink(
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
 
-    // Locate the template.
-    let template_path = find_template(&git_root)?;
+    // Locate or download the template.
+    let template_path = match find_template(&git_root) {
+        Ok(p) => p,
+        Err(_) => {
+            out.println(
+                "Template not found locally, downloading aspec folder from GitHub..."
+                    .to_string(),
+            );
+            download::download_aspec_folder(&git_root, out)
+                .await
+                .context("Failed to download aspec folder for template")?;
+            find_template(&git_root)?
+        }
+    };
     let template_content =
         std::fs::read_to_string(&template_path).context("Failed to read template file")?;
 
