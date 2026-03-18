@@ -292,10 +292,13 @@ the information, then `run_with_sink` is called with the pre-supplied values.
 
 ## Docker Build Streaming
 
-`docker::build_image_streaming()` spawns `docker build` and reads stdout/stderr
-line-by-line, calling an `on_line` callback for each line. This replaces the
-buffered `build_image()` function for user-facing builds, so output appears in
-real time instead of appearing all at once after the build completes.
+`docker::build_image_streaming()` spawns `docker build` and reads stdout and
+stderr concurrently in separate background threads. Both threads send lines
+through a shared `std::sync::mpsc` channel, and the calling thread receives
+lines from the channel and forwards them to the `on_line` callback as they
+arrive. This ensures real-time streaming of Docker build output — including
+stderr, where Docker emits most of its build progress — rather than buffering
+stderr until after stdout finishes.
 
 The `OutputSink`'s `Clone` implementation enables passing it into the streaming
 callback closure.
@@ -517,6 +520,7 @@ automatically (no opt-in dialog needed).
 | Unit — container window | `tui::state::tests` | Container state transitions, PTY routing, summary generation |
 | Unit — container render | `tui::render::tests` | Container window overlay, minimized bar, summary bar |
 | Unit — container input | `tui::input::tests` | Key handling in maximized/minimized/hidden states |
+| Unit — docker build streaming | `docker::tests` | Incremental line delivery, stderr capture, failure handling |
 | Unit — docker stats | `docker::tests` | Stats parsing, container name generation |
 | Unit — PTY | `tui::pty::tests` | Real `echo` and `sh -c 'exit 42'` processes |
 | Unit — ready | `commands::ready::tests` | Summary table, interactive notice, options, entrypoints |

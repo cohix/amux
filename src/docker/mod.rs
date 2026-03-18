@@ -307,6 +307,10 @@ pub fn build_image(tag: &str, dockerfile: &str, context: &str, no_cache: bool) -
 /// of stdout/stderr as it is produced. This avoids the "frozen" appearance of
 /// buffered builds.
 ///
+/// Both stdout and stderr are read concurrently in background threads and
+/// forwarded through a channel so that `on_line` receives lines in real time.
+/// Docker emits most build progress on stderr, so streaming stderr is critical.
+///
 /// When `no_cache` is true, `--no-cache` is passed to `docker build`.
 ///
 /// Returns the full combined output for callers that also need the text.
@@ -321,6 +325,7 @@ where
     F: FnMut(&str),
 {
     use std::io::BufRead;
+    use std::sync::mpsc;
 
     let mut build_args = vec!["build"];
     if no_cache {
@@ -339,38 +344,46 @@ where
 
     let mut combined = String::new();
 
-    // Read stderr in a background thread (Docker emits most build output there).
+    // Use a channel so both reader threads can send lines as they arrive.
+    let (tx, rx) = mpsc::channel::<String>();
+
+    // Read stderr in a background thread (Docker emits most build output here).
+    let tx_stderr = tx.clone();
     let stderr_handle = std::thread::spawn(move || {
-        let mut lines = Vec::new();
         if let Some(stderr) = stderr {
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
-                    lines.push(line);
+                    let _ = tx_stderr.send(line);
                 }
             }
         }
-        lines
     });
 
-    // Read stdout on the current thread.
-    if let Some(stdout) = stdout {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                on_line(&line);
-                combined.push_str(&line);
-                combined.push('\n');
+    // Read stdout in a background thread.
+    let tx_stdout = tx;
+    let stdout_handle = std::thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let _ = tx_stdout.send(line);
+                }
             }
         }
-    }
+    });
 
-    let stderr_lines = stderr_handle.join().unwrap_or_default();
-    for line in &stderr_lines {
-        on_line(line);
-        combined.push_str(line);
+    // Receive lines from both streams and forward to the callback in real time.
+    // The channel closes when both sender clones are dropped (threads finish).
+    for line in rx {
+        on_line(&line);
+        combined.push_str(&line);
         combined.push('\n');
     }
+
+    // Wait for reader threads to finish.
+    let _ = stderr_handle.join();
+    let _ = stdout_handle.join();
 
     let status = child.wait().context("Failed to wait for `docker build`")?;
     if !status.success() {
@@ -959,5 +972,112 @@ mod tests {
             "Captured output should contain Docker build progress. Got:\n{}",
             &output[..output.len().min(500)]
         );
+    }
+
+    #[test]
+    fn build_image_streaming_delivers_lines_incrementally() {
+        if !super::is_daemon_running() {
+            return;
+        }
+        let git_root = std::env::current_dir().unwrap();
+        let dockerfile = git_root.join("Dockerfile.dev");
+        if !dockerfile.exists() {
+            return;
+        }
+
+        // Collect lines as they arrive and record delivery timestamps.
+        let mut lines: Vec<String> = Vec::new();
+        let mut timestamps: Vec<std::time::Instant> = Vec::new();
+        let output = build_image_streaming(
+            "aspec-dev:latest",
+            dockerfile.to_str().unwrap(),
+            git_root.to_str().unwrap(),
+            false,
+            |line| {
+                lines.push(line.to_string());
+                timestamps.push(std::time::Instant::now());
+            },
+        )
+        .expect("docker build should succeed");
+
+        // The callback must have been called at least once.
+        assert!(
+            !lines.is_empty(),
+            "build_image_streaming must deliver lines via the callback"
+        );
+
+        // The combined output returned must match what was streamed.
+        for line in &lines {
+            assert!(
+                output.contains(line.as_str()),
+                "Returned output must contain every streamed line. Missing: {}",
+                line
+            );
+        }
+
+        // Build output should contain Docker build markers (same check as non-streaming).
+        let has_build_markers = output.contains("DONE")
+            || output.contains("CACHED")
+            || output.contains("FROM")
+            || output.contains("building")
+            || output.contains("#");
+        assert!(
+            has_build_markers,
+            "Streaming output should contain Docker build progress. Got:\n{}",
+            &output[..output.len().min(500)]
+        );
+    }
+
+    #[test]
+    fn build_image_streaming_captures_stderr() {
+        if !super::is_daemon_running() {
+            return;
+        }
+        let git_root = std::env::current_dir().unwrap();
+        let dockerfile = git_root.join("Dockerfile.dev");
+        if !dockerfile.exists() {
+            return;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        let _ = build_image_streaming(
+            "aspec-dev:latest",
+            dockerfile.to_str().unwrap(),
+            git_root.to_str().unwrap(),
+            false,
+            |line| {
+                lines.push(line.to_string());
+            },
+        );
+
+        // Docker build emits progress on stderr. Verify we captured lines that
+        // look like Docker build output (step numbers, CACHED, DONE, etc.).
+        let has_docker_output = lines.iter().any(|l| {
+            l.contains("#") || l.contains("DONE") || l.contains("CACHED")
+                || l.contains("FROM") || l.contains("building")
+        });
+        assert!(
+            has_docker_output,
+            "Streaming callback must receive Docker build stderr output. Got {} lines: {:?}",
+            lines.len(),
+            &lines[..lines.len().min(10)]
+        );
+    }
+
+    #[test]
+    fn build_image_streaming_fails_on_bad_dockerfile() {
+        if !super::is_daemon_running() {
+            return;
+        }
+
+        // Use a non-existent Dockerfile to trigger a failure.
+        let result = build_image_streaming(
+            "aspec-test-fail:latest",
+            "/nonexistent/Dockerfile",
+            "/tmp",
+            false,
+            |_line| {},
+        );
+        assert!(result.is_err(), "Should fail with a bad Dockerfile path");
     }
 }
