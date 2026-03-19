@@ -14,6 +14,7 @@ use std::path::PathBuf;
 /// `mount_override`: when `Some`, skip the interactive stdin prompt and use this path.
 /// `env_vars`: agent credential env vars to pass into the container.
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
+/// `allow_docker`: when true, mount the host Docker daemon socket into the container.
 pub async fn run_agent_with_sink(
     entrypoint: Vec<String>,
     status_message: &str,
@@ -22,6 +23,7 @@ pub async fn run_agent_with_sink(
     env_vars: Vec<(String, String)>,
     non_interactive: bool,
     host_settings: Option<&docker::HostSettings>,
+    allow_docker: bool,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let config = load_repo_config(&git_root)?;
@@ -34,6 +36,19 @@ pub async fn run_agent_with_sink(
         None => crate::commands::implement::confirm_mount_scope_stdin(&git_root)?,
     };
 
+    // If --allow-docker, check the socket and print a warning before launching.
+    if allow_docker {
+        let socket_path = docker::check_docker_socket()
+            .context("Cannot mount Docker socket")?;
+        out.println(format!("Docker socket: {} (found)", socket_path.display()));
+        out.println(format!(
+            "WARNING: --allow-docker: mounting host Docker socket into container ({}:{}). \
+             This grants the agent elevated host access.",
+            socket_path.display(),
+            socket_path.display()
+        ));
+    }
+
     let image_tag = docker::project_image_tag(&git_root);
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
 
@@ -44,6 +59,7 @@ pub async fn run_agent_with_sink(
         &entrypoint_refs,
         &env_vars,
         host_settings,
+        allow_docker,
     );
     out.println(format!("$ {}", docker::format_run_cmd(&display_args)));
 
@@ -60,6 +76,7 @@ pub async fn run_agent_with_sink(
             &entrypoint_refs,
             &env_vars,
             host_settings,
+            allow_docker,
         )
         .context("Container exited with an error")?;
         for line in output.lines() {
@@ -72,6 +89,7 @@ pub async fn run_agent_with_sink(
             &entrypoint_refs,
             &env_vars,
             host_settings,
+            allow_docker,
         )
         .context("Container exited with an error")?;
     }
@@ -102,6 +120,7 @@ mod tests {
             vec![],
             false,
             None,
+            false,
         )
         .await;
 

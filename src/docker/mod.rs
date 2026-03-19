@@ -124,6 +124,54 @@ fn copy_dir_filtered(src: &Path, dst: &Path, denylist: &[&str]) -> std::io::Resu
     Ok(())
 }
 
+/// Returns the host Docker daemon socket path for the current platform.
+///
+/// - Linux/macOS: `/var/run/docker.sock`
+/// - Windows: `\\.\pipe\docker_engine`
+pub fn docker_socket_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(r"\\.\pipe\docker_engine")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("/var/run/docker.sock")
+    }
+}
+
+/// Checks that the host Docker daemon socket file exists and is accessible.
+///
+/// Returns the socket path on success, or an error if the socket is not found.
+pub fn check_docker_socket() -> Result<PathBuf> {
+    let path = docker_socket_path();
+    if !path.exists() {
+        bail!(
+            "Docker socket not found at {}. Ensure the Docker daemon is running and accessible.",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Appends the Docker daemon socket mount args to the list.
+///
+/// On Linux/macOS: `-v /var/run/docker.sock:/var/run/docker.sock`
+/// On Windows: `--mount type=npipe,source=\\.\pipe\docker_engine,target=\\.\pipe\docker_engine`
+fn append_docker_socket_mount_args(args: &mut Vec<String>) {
+    let path = docker_socket_path();
+    let path_str = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        args.push("--mount".into());
+        args.push(format!("type=npipe,source={},target={}", path_str, path_str));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        args.push("-v".into());
+        args.push(format!("{}:{}", path_str, path_str));
+    }
+}
+
 /// Appends `-v` bind-mount args for host settings into the container.
 fn append_settings_mounts(args: &mut Vec<String>, settings: &HostSettings) {
     args.push("-v".into());
@@ -419,6 +467,9 @@ pub fn project_image_tag(git_root: &Path) -> String {
 /// Used for non-interactive agent runs (e.g. the Dockerfile audit step) where
 /// output needs to be routed through the OutputSink for TUI display.
 ///
+/// When `allow_docker` is true, the host Docker daemon socket is bind-mounted
+/// into the container so the agent can build and run Docker containers.
+///
 /// Returns `(command_line, output)` — the formatted CLI string and combined output.
 pub fn run_container_captured(
     image: &str,
@@ -426,6 +477,7 @@ pub fn run_container_captured(
     entrypoint: &[&str],
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Result<(String, String)> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -439,11 +491,14 @@ pub fn run_container_captured(
     if let Some(settings) = host_settings {
         append_settings_mounts(&mut args, settings);
     }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
+    }
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
 
     let cmd_line = format_run_cmd(&build_run_args_display(
-        image, host_path, entrypoint, env_vars, host_settings,
+        image, host_path, entrypoint, env_vars, host_settings, allow_docker,
     ));
 
     let output = Command::new("docker")
@@ -481,6 +536,9 @@ pub fn run_container_captured(
 /// what the user has confirmed (aspec/architecture/security.md). Agent credentials
 /// are passed as environment variables, not file mounts.
 ///
+/// When `allow_docker` is true, the host Docker daemon socket is bind-mounted
+/// into the container so the agent can build and run Docker containers.
+///
 /// Returns the formatted CLI command line that was executed.
 pub fn run_container(
     image: &str,
@@ -488,10 +546,11 @@ pub fn run_container(
     entrypoint: &[&str],
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Result<String> {
-    let args = build_run_args(image, host_path, entrypoint, env_vars, host_settings);
+    let args = build_run_args(image, host_path, entrypoint, env_vars, host_settings, allow_docker);
     let cmd_line = format_run_cmd(&build_run_args_display(
-        image, host_path, entrypoint, env_vars, host_settings,
+        image, host_path, entrypoint, env_vars, host_settings, allow_docker,
     ));
 
     let status = Command::new("docker")
@@ -512,12 +571,16 @@ pub fn run_container(
 ///
 /// Uses `-it` so the container has a TTY — suitable for inheriting the host terminal.
 /// For TUI/PTY mode, use `build_run_args_pty` which omits `-it`.
+///
+/// When `allow_docker` is true, the host Docker daemon socket is bind-mounted
+/// into the container.
 pub fn build_run_args(
     image: &str,
     host_path: &str,
     entrypoint: &[&str],
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -532,18 +595,24 @@ pub fn build_run_args(
     if let Some(settings) = host_settings {
         append_settings_mounts(&mut args, settings);
     }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
+    }
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
 }
 
 /// Builds a display-safe version of `docker run` args with env var values masked.
+///
+/// When `allow_docker` is true, the Docker socket mount is included in the display.
 pub fn build_run_args_display(
     image: &str,
     host_path: &str,
     entrypoint: &[&str],
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -557,6 +626,9 @@ pub fn build_run_args_display(
 
     if host_settings.is_some() {
         append_settings_mounts_display(&mut args);
+    }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
     }
     append_env_args_display(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
@@ -573,6 +645,9 @@ pub fn build_run_args_display(
 ///
 /// When `container_name` is Some, `--name <name>` is added so the container can be
 /// queried for stats while running.
+///
+/// When `allow_docker` is true, the host Docker daemon socket is bind-mounted
+/// into the container.
 pub fn build_run_args_pty(
     image: &str,
     host_path: &str,
@@ -580,6 +655,7 @@ pub fn build_run_args_pty(
     env_vars: &[(String, String)],
     container_name: Option<&str>,
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -602,12 +678,17 @@ pub fn build_run_args_pty(
     if let Some(settings) = host_settings {
         append_settings_mounts(&mut args, settings);
     }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
+    }
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
 }
 
 /// Builds a display-safe version of PTY `docker run` args with env var values masked.
+///
+/// When `allow_docker` is true, the Docker socket mount is included in the display.
 pub fn build_run_args_pty_display(
     image: &str,
     host_path: &str,
@@ -615,6 +696,7 @@ pub fn build_run_args_pty_display(
     env_vars: &[(String, String)],
     container_name: Option<&str>,
     host_settings: Option<&HostSettings>,
+    allow_docker: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -636,6 +718,9 @@ pub fn build_run_args_pty_display(
 
     if host_settings.is_some() {
         append_settings_mounts_display(&mut args);
+    }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
     }
     append_env_args_display(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
@@ -666,7 +751,7 @@ mod tests {
     #[test]
     fn run_args_include_mount_and_workdir() {
         let args =
-            build_run_args("aspec-dev:latest", "/repo", &["claude", "--print", "go"], &[], None);
+            build_run_args("aspec-dev:latest", "/repo", &["claude", "--print", "go"], &[], None, false);
         assert!(args.contains(&"-v".to_string()));
         assert!(args.contains(&"/repo:/workspace".to_string()));
         assert!(args.contains(&"-w".to_string()));
@@ -677,35 +762,35 @@ mod tests {
 
     #[test]
     fn run_args_use_rm_and_interactive() {
-        let args = build_run_args("img", "/repo", &[], &[], None);
+        let args = build_run_args("img", "/repo", &[], &[], None, false);
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"-it".to_string()));
     }
 
     #[test]
     fn pty_args_include_interactive_flag() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], None, None);
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false);
         assert!(args.contains(&"-it".to_string()));
         assert!(args.contains(&"--rm".to_string()));
     }
 
     #[test]
     fn pty_args_include_container_name_when_provided() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], Some("aspec-test-123"), None);
+        let args = build_run_args_pty("img", "/repo", &[], &[], Some("aspec-test-123"), None, false);
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"aspec-test-123".to_string()));
     }
 
     #[test]
     fn pty_args_omit_name_when_none() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], None, None);
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false);
         assert!(!args.contains(&"--name".to_string()));
     }
 
     #[test]
     fn env_vars_passed_to_run_args() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-test".into())];
-        let args = build_run_args("img", "/repo", &[], &env, None);
+        let args = build_run_args("img", "/repo", &[], &env, None, false);
         assert!(args.contains(&"-e".to_string()));
         assert!(args.contains(&"ANTHROPIC_API_KEY=sk-test".to_string()));
     }
@@ -716,7 +801,7 @@ mod tests {
             ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
             ("OPENAI_API_KEY".into(), "sk-oai".into()),
         ];
-        let args = build_run_args("img", "/repo", &[], &env, None);
+        let args = build_run_args("img", "/repo", &[], &env, None, false);
         let env_args: Vec<&String> = args
             .iter()
             .filter(|a| a.contains("_API_KEY="))
@@ -732,7 +817,7 @@ mod tests {
             ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
             ("OPENAI_API_KEY".into(), "sk-oai".into()),
         ];
-        let args = build_run_args_pty("img", "/repo", &[], &env, None, None);
+        let args = build_run_args_pty("img", "/repo", &[], &env, None, None, false);
         let env_args: Vec<&String> = args
             .iter()
             .filter(|a| a.contains("_API_KEY="))
@@ -743,7 +828,7 @@ mod tests {
     #[test]
     fn display_args_mask_env_values() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-secret-key".into())];
-        let args = build_run_args_display("img", "/repo", &[], &env, None);
+        let args = build_run_args_display("img", "/repo", &[], &env, None, false);
         assert!(args.contains(&"ANTHROPIC_API_KEY=***".to_string()));
         assert!(!args.iter().any(|a| a.contains("sk-secret-key")));
     }
@@ -751,7 +836,7 @@ mod tests {
     #[test]
     fn pty_display_args_mask_env_values() {
         let env = vec![("OPENAI_API_KEY".into(), "sk-secret".into())];
-        let args = build_run_args_pty_display("img", "/repo", &[], &env, None, None);
+        let args = build_run_args_pty_display("img", "/repo", &[], &env, None, None, false);
         assert!(args.contains(&"OPENAI_API_KEY=***".to_string()));
         assert!(!args.iter().any(|a| a.contains("sk-secret")));
     }
@@ -789,8 +874,8 @@ mod tests {
     #[test]
     fn no_settings_mounts_when_none() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-test".into())];
-        let args = build_run_args("img", "/repo", &[], &env, None);
-        // Without host_settings, only the workspace mount should be present.
+        let args = build_run_args("img", "/repo", &[], &env, None, false);
+        // Without host_settings or allow_docker, only the workspace mount should be present.
         let volume_mounts: Vec<&String> = args.iter()
             .zip(args.iter().skip(1))
             .filter(|(flag, _)| *flag == "-v")
@@ -815,7 +900,7 @@ mod tests {
             claude_dir_path: claude_dir_path.clone(),
         };
 
-        let args = build_run_args("img", "/repo", &["claude", "--print", "hi"], &[], Some(&hs));
+        let args = build_run_args("img", "/repo", &["claude", "--print", "hi"], &[], Some(&hs), false);
 
         // Should have bind mounts for .claude.json and .claude/
         let volume_mounts: Vec<&String> = args.windows(2)
@@ -850,7 +935,7 @@ mod tests {
             claude_dir_path,
         };
 
-        let args = build_run_args_display("img", "/repo", &["claude"], &[], Some(&hs));
+        let args = build_run_args_display("img", "/repo", &["claude"], &[], Some(&hs), false);
         assert!(args.iter().any(|a| a == "<settings>:/root/.claude.json"));
         assert!(args.iter().any(|a| a == "<settings>:/root/.claude"));
         assert!(!args.iter().any(|a| a.contains("secret")));
@@ -933,7 +1018,7 @@ mod tests {
 
     #[test]
     fn format_run_cmd_produces_valid_string() {
-        let args = build_run_args("img", "/repo", &["echo", "hello"], &[], None);
+        let args = build_run_args("img", "/repo", &["echo", "hello"], &[], None, false);
         let cmd = format_run_cmd(&args);
         assert!(cmd.starts_with("docker run"));
         assert!(cmd.contains("/repo:/workspace"));
@@ -955,5 +1040,118 @@ mod tests {
             |_line| {},
         );
         assert!(result.is_err(), "Should fail with a bad Dockerfile path");
+    }
+
+    // --- docker_socket_path and check_docker_socket tests ---
+
+    #[test]
+    fn docker_socket_path_is_nonempty() {
+        let path = docker_socket_path();
+        assert!(!path.as_os_str().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_socket_path_linux() {
+        let path = docker_socket_path();
+        assert_eq!(path.to_str().unwrap(), "/var/run/docker.sock");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn docker_socket_path_macos() {
+        let path = docker_socket_path();
+        assert_eq!(path.to_str().unwrap(), "/var/run/docker.sock");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn docker_socket_path_windows() {
+        let path = docker_socket_path();
+        let s = path.to_string_lossy();
+        assert!(s.contains("docker_engine"), "Windows path should reference docker_engine pipe");
+    }
+
+    #[test]
+    fn check_docker_socket_fails_on_missing_path() {
+        // On a system where Docker is not installed at the default path, this
+        // test verifies the error message. If the socket exists (Docker is running),
+        // we skip the negative assertion.
+        let path = docker_socket_path();
+        if path.exists() {
+            // Socket exists — check_docker_socket should succeed.
+            let result = check_docker_socket();
+            assert!(result.is_ok(), "Socket exists but check_docker_socket failed");
+        } else {
+            // Socket missing — check_docker_socket should return an error.
+            let result = check_docker_socket();
+            assert!(result.is_err(), "Expected error when socket is missing");
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("Docker socket not found"), "Error message should mention socket: {}", msg);
+        }
+    }
+
+    #[test]
+    fn allow_docker_adds_socket_mount_to_run_args() {
+        let args = build_run_args("img", "/repo", &[], &[], None, true);
+        // The docker socket should appear as a volume mount.
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+        let has_socket_mount = args.windows(2)
+            .any(|w| w[0] == "-v" && w[1].contains(&socket_path));
+        #[cfg(not(target_os = "windows"))]
+        assert!(has_socket_mount, "allow_docker should add docker socket volume mount: {:?}", args);
+    }
+
+    #[test]
+    fn no_allow_docker_does_not_add_socket_mount() {
+        let args = build_run_args("img", "/repo", &[], &[], None, false);
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+        let has_socket_mount = args.iter().any(|a| a.contains(&socket_path));
+        assert!(!has_socket_mount, "Without allow_docker, socket should not be mounted: {:?}", args);
+    }
+
+    #[test]
+    fn allow_docker_adds_socket_mount_to_pty_args() {
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, true);
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+        let has_socket = args.iter().any(|a| a.contains(&socket_path));
+        #[cfg(not(target_os = "windows"))]
+        assert!(has_socket, "allow_docker should add socket to pty args: {:?}", args);
+    }
+
+    #[test]
+    fn allow_docker_adds_socket_mount_to_display_args() {
+        let args = build_run_args_display("img", "/repo", &[], &[], None, true);
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+        let has_socket = args.iter().any(|a| a.contains(&socket_path));
+        #[cfg(not(target_os = "windows"))]
+        assert!(has_socket, "allow_docker should add socket to display args: {:?}", args);
+    }
+
+    #[test]
+    fn allow_docker_adds_socket_mount_to_pty_display_args() {
+        let args = build_run_args_pty_display("img", "/repo", &[], &[], None, None, true);
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+        let has_socket = args.iter().any(|a| a.contains(&socket_path));
+        #[cfg(not(target_os = "windows"))]
+        assert!(has_socket, "allow_docker should add socket to pty display args: {:?}", args);
+    }
+
+    #[test]
+    fn allow_docker_socket_mount_appears_after_workspace_mount() {
+        let args = build_run_args("img", "/repo", &[], &[], None, true);
+        let socket_path = docker_socket_path().to_string_lossy().to_string();
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let workspace_pos = args.windows(2)
+                .position(|w| w[0] == "-v" && w[1].contains(":/workspace"));
+            let socket_pos = args.windows(2)
+                .position(|w| w[0] == "-v" && w[1].contains(&socket_path));
+            assert!(workspace_pos.is_some(), "Workspace mount should be present");
+            assert!(socket_pos.is_some(), "Socket mount should be present");
+            assert!(socket_pos.unwrap() > workspace_pos.unwrap(),
+                "Socket mount should appear after workspace mount");
+        }
     }
 }

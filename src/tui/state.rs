@@ -57,15 +57,18 @@ pub enum PendingCommand {
         build: bool,
         no_cache: bool,
         non_interactive: bool,
+        allow_docker: bool,
     },
     Implement {
         work_item: u32,
         non_interactive: bool,
         plan: bool,
+        allow_docker: bool,
     },
     Chat {
         non_interactive: bool,
         plan: bool,
+        allow_docker: bool,
     },
 }
 

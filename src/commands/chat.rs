@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 /// Command-mode entry point for `aspec chat`.
-pub async fn run(non_interactive: bool, plan: bool) -> Result<()> {
+pub async fn run(non_interactive: bool, plan: bool, allow_docker: bool) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
     let credentials = resolve_auth(&git_root, agent_name(&git_root)?)?;
@@ -31,6 +31,7 @@ pub async fn run(non_interactive: bool, plan: bool) -> Result<()> {
         credentials.env_vars.clone(),
         non_interactive,
         host_settings.as_ref(),
+        allow_docker,
     )
     .await
 }
@@ -41,6 +42,7 @@ pub async fn run(non_interactive: bool, plan: bool) -> Result<()> {
 /// `env_vars`: agent credential env vars to pass into the container.
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
 /// `plan`: when true, launch agent in plan (read-only) mode.
+/// `allow_docker`: when true, mount the host Docker daemon socket into the container.
 pub async fn run_with_sink(
     out: &OutputSink,
     mount_override: Option<PathBuf>,
@@ -48,6 +50,7 @@ pub async fn run_with_sink(
     non_interactive: bool,
     plan: bool,
     host_settings: Option<&docker::HostSettings>,
+    allow_docker: bool,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let config = load_repo_config(&git_root)?;
@@ -67,6 +70,7 @@ pub async fn run_with_sink(
         env_vars,
         non_interactive,
         host_settings,
+        allow_docker,
     )
     .await
 }

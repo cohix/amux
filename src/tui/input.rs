@@ -384,16 +384,19 @@ fn flag_suggestions_for(cmd: &str, _typed: &str) -> Vec<String> {
             "ready --build --no-cache".into(),
             "ready --non-interactive".into(),
             "ready --refresh --non-interactive".into(),
+            "ready --refresh --allow-docker".into(),
         ],
         "implement" => vec![
             "implement <NNNN>  e.g. implement 0001".into(),
             "implement <NNNN> --non-interactive".into(),
             "implement <NNNN> --plan".into(),
+            "implement <NNNN> --allow-docker".into(),
         ],
         "chat" => vec![
             "chat  (start a freeform agent session)".into(),
             "chat --non-interactive".into(),
             "chat --plan".into(),
+            "chat --allow-docker".into(),
         ],
         "new" => vec![
             "new  (creates a new work item from template)".into(),

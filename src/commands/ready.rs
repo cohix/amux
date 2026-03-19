@@ -39,6 +39,8 @@ pub struct ReadyOptions {
     pub no_cache: bool,
     /// When true, launch the agent in non-interactive (print) mode.
     pub non_interactive: bool,
+    /// When true, mount the host Docker daemon socket into the audit container.
+    pub allow_docker: bool,
 }
 
 /// Tracks the status of each step for the summary table.
@@ -121,10 +123,10 @@ pub fn print_interactive_notice(out: &OutputSink, agent_name: &str) {
 
 /// Command-mode entry point: prompts for mount scope and auth, then runs ready phases.
 /// The audit phase is only run when `--refresh` is passed.
-pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bool) -> Result<()> {
+pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bool, allow_docker: bool) -> Result<()> {
     // If --refresh is set, ignore --build (refresh always rebuilds after audit).
     let effective_build = if refresh { false } else { build };
-    let opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive };
+    let opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
     let config = load_repo_config(&git_root)?;
@@ -141,6 +143,20 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
         if !opts.non_interactive {
             print_interactive_notice(out, &ctx.agent_name);
         }
+
+        // If --allow-docker, check the socket and print a warning before launching.
+        if opts.allow_docker {
+            let socket_path = docker::check_docker_socket()
+                .context("Cannot mount Docker socket for audit container")?;
+            out.println(format!("Docker socket: {} (found)", socket_path.display()));
+            out.println(format!(
+                "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
+                 This grants the agent elevated host access.",
+                socket_path.display(),
+                socket_path.display()
+            ));
+        }
+
         // Run audit interactively (inherited stdio → user can interact with agent).
         let entrypoint = if opts.non_interactive {
             audit_entrypoint_non_interactive(&ctx.agent_name)
@@ -156,6 +172,7 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
                 &entrypoint_refs,
                 &ctx.env_vars,
                 host_settings.as_ref(),
+                opts.allow_docker,
             )
             .context("Dockerfile audit container failed")?;
             for line in audit_output.lines() {
@@ -168,6 +185,7 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
                 &entrypoint_refs,
                 &ctx.env_vars,
                 host_settings.as_ref(),
+                opts.allow_docker,
             )
             .context("Dockerfile audit container failed")?;
         }
@@ -372,6 +390,19 @@ pub async fn run_with_sink(
     let ctx = run_pre_audit(out, mount_path, env_vars, opts, &mut summary).await?;
 
     if opts.refresh {
+        // If --allow-docker, check the socket and print a warning before launching.
+        if opts.allow_docker {
+            let socket_path = docker::check_docker_socket()
+                .context("Cannot mount Docker socket for audit container")?;
+            out.println(format!("Docker socket: {} (found)", socket_path.display()));
+            out.println(format!(
+                "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
+                 This grants the agent elevated host access.",
+                socket_path.display(),
+                socket_path.display()
+            ));
+        }
+
         let entrypoint = if opts.non_interactive {
             audit_entrypoint_non_interactive(&ctx.agent_name)
         } else {
@@ -385,6 +416,7 @@ pub async fn run_with_sink(
             &entrypoint_refs,
             &ctx.env_vars,
             host_settings,
+            opts.allow_docker,
         )
         .context("Dockerfile audit container failed")?;
         for line in audit_output.lines() {

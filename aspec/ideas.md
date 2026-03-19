@@ -19,7 +19,16 @@
 - automatic skills and subagents from spec
 - multiple tabs within TUI
 	- each tab includes an outer window and container window
-	- each tab lets you choose which project it's attached to (aspec keeps track of where you've used it in global config)
+	- each tab lets you choose which project it's attached to? (aspec keeps track of where you've used it in global config)
 	- ctrl + wasd to move between tabs and command box
 	- typing a new command while a container is running in current tab automatically launches a new tab
 	- detect when agent needs your input, put alarm bell in the tab title and a message ticker below the window
+- convert builtin prompts to skills, create "skills set" by distilling popular skill repos like gstack
+	- skills should be built to persist state within the project like what went well, what didn't etc.
+- extend skills support with a retrospective skill which looks back at the state to self-improve themselves
+- work item queues
+	- can add work item to execute in parallel with current
+	- can add work item to queue so when current group is done the next is triggered
+	- state stored in .aspec folder
+- work item multi-step skills
+	- allow user to define the order that skills should be used, and build a pipeline within a single item

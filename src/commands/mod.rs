@@ -19,13 +19,17 @@ pub async fn run(command: Command) -> Result<()> {
             build,
             no_cache,
             non_interactive,
-        } => ready::run(refresh, build, no_cache, non_interactive).await,
+            allow_docker,
+        } => ready::run(refresh, build, no_cache, non_interactive, allow_docker).await,
         Command::Implement {
             work_item,
             non_interactive,
             plan,
-        } => implement::run(&work_item, non_interactive, plan).await,
-        Command::Chat { non_interactive, plan } => chat::run(non_interactive, plan).await,
+            allow_docker,
+        } => implement::run(&work_item, non_interactive, plan, allow_docker).await,
+        Command::Chat { non_interactive, plan, allow_docker } => {
+            chat::run(non_interactive, plan, allow_docker).await
+        }
         Command::New => new::run().await,
     }
 }

@@ -235,7 +235,7 @@ fn autocomplete_implement_shows_non_interactive_flag() {
 #[test]
 fn agent_env_vars_passed_to_container() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-test".into())];
-    let args = aspec::docker::build_run_args("img", "/repo", &[], &env, None);
+    let args = aspec::docker::build_run_args("img", "/repo", &[], &env, None, false);
     assert!(args.contains(&"-e".to_string()));
     assert!(args.contains(&"ANTHROPIC_API_KEY=sk-test".to_string()));
 }
@@ -243,7 +243,7 @@ fn agent_env_vars_passed_to_container() {
 #[test]
 fn display_args_mask_env_var_values() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-secret".into())];
-    let args = aspec::docker::build_run_args_display("img", "/repo", &[], &env, None);
+    let args = aspec::docker::build_run_args_display("img", "/repo", &[], &env, None, false);
     assert!(
         args.contains(&"ANTHROPIC_API_KEY=***".to_string()),
         "Display args must mask env var values, got: {:?}",
@@ -705,13 +705,13 @@ fn agent_display_names() {
 #[test]
 fn pty_args_container_name() {
     let args = aspec::docker::build_run_args_pty(
-        "img", "/repo", &[], &[], Some("aspec-test-42"), None,
+        "img", "/repo", &[], &[], Some("aspec-test-42"), None, false,
     );
     assert!(args.contains(&"--name".to_string()));
     assert!(args.contains(&"aspec-test-42".to_string()));
 
     let args_no_name = aspec::docker::build_run_args_pty(
-        "img", "/repo", &[], &[], None, None,
+        "img", "/repo", &[], &[], None, None, false,
     );
     assert!(!args_no_name.contains(&"--name".to_string()));
 }
@@ -820,8 +820,8 @@ fn agent_credentials_default_is_empty() {
 #[test]
 fn docker_args_without_settings_has_workspace_mount_only() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-test".into())];
-    let args = aspec::docker::build_run_args("img", "/repo", &[], &env, None);
-    // Without host_settings, only the workspace mount should be present.
+    let args = aspec::docker::build_run_args("img", "/repo", &[], &env, None, false);
+    // Without host_settings or allow_docker, only the workspace mount should be present.
     let volume_mounts: Vec<&String> = args.windows(2)
         .filter(|w| w[0] == "-v")
         .map(|w| &w[1])
@@ -838,7 +838,7 @@ fn docker_args_without_settings_has_workspace_mount_only() {
 #[test]
 fn docker_display_args_mask_secrets() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-secret".into())];
-    let args = aspec::docker::build_run_args_display("img", "/repo", &[], &env, None);
+    let args = aspec::docker::build_run_args_display("img", "/repo", &[], &env, None, false);
     assert!(args.contains(&"ANTHROPIC_API_KEY=***".to_string()), "API key should be masked");
     assert!(!args.iter().any(|a| a.contains("sk-ant-oat01-secret")), "Secret must not appear");
 }
@@ -928,8 +928,8 @@ fn chat_and_implement_share_docker_args() {
     let chat_ep_refs: Vec<&str> = chat_ep.iter().map(String::as_str).collect();
     let impl_ep_refs: Vec<&str> = impl_ep.iter().map(String::as_str).collect();
 
-    let chat_args = aspec::docker::build_run_args("img", "/repo", &chat_ep_refs, &[], None);
-    let impl_args = aspec::docker::build_run_args("img", "/repo", &impl_ep_refs, &[], None);
+    let chat_args = aspec::docker::build_run_args("img", "/repo", &chat_ep_refs, &[], None, false);
+    let impl_args = aspec::docker::build_run_args("img", "/repo", &impl_ep_refs, &[], None, false);
 
     // Both should start with the same Docker flags.
     assert_eq!(chat_args[0], impl_args[0]); // "run"
@@ -986,9 +986,9 @@ fn autocomplete_chat_shows_hints() {
 fn pending_command_chat_variant() {
     use aspec::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false, plan: false };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true, plan: false });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true, plan: false, allow_docker: false });
     assert_ne!(cmd, PendingCommand::None);
 }
 
@@ -1036,12 +1036,14 @@ fn pending_command_ready_build_no_cache_fields() {
         build: true,
         no_cache: true,
         non_interactive: false,
+        allow_docker: false,
     };
     assert_eq!(cmd, PendingCommand::Ready {
         refresh: false,
         build: true,
         no_cache: true,
         non_interactive: false,
+        allow_docker: false,
     });
     // Different build flag should not match
     assert_ne!(cmd, PendingCommand::Ready {
@@ -1049,6 +1051,7 @@ fn pending_command_ready_build_no_cache_fields() {
         build: false,
         no_cache: true,
         non_interactive: false,
+        allow_docker: false,
     });
 }
 
@@ -1114,7 +1117,7 @@ fn cli_ready_all_flags_combined() {
 
     let cli = Cli::parse_from(&["aspec", "ready", "--refresh", "--build", "--no-cache", "--non-interactive"]);
     match cli.command.unwrap() {
-        Command::Ready { refresh, build, no_cache, non_interactive } => {
+        Command::Ready { refresh, build, no_cache, non_interactive, .. } => {
             assert!(refresh);
             assert!(build);
             assert!(no_cache);
@@ -1131,7 +1134,7 @@ fn cli_ready_defaults_all_false() {
 
     let cli = Cli::parse_from(&["aspec", "ready"]);
     match cli.command.unwrap() {
-        Command::Ready { refresh, build, no_cache, non_interactive } => {
+        Command::Ready { refresh, build, no_cache, non_interactive, .. } => {
             assert!(!refresh);
             assert!(!build);
             assert!(!no_cache);
@@ -1202,7 +1205,7 @@ fn cli_chat_plan_flag() {
 
     let cli = Cli::parse_from(&["aspec", "chat", "--plan"]);
     match cli.command.unwrap() {
-        Command::Chat { plan, non_interactive } => {
+        Command::Chat { plan, non_interactive, .. } => {
             assert!(plan);
             assert!(!non_interactive);
         }
@@ -1217,7 +1220,7 @@ fn cli_implement_plan_flag() {
 
     let cli = Cli::parse_from(&["aspec", "implement", "0001", "--plan"]);
     match cli.command.unwrap() {
-        Command::Implement { plan, work_item, non_interactive } => {
+        Command::Implement { plan, work_item, non_interactive, .. } => {
             assert!(plan);
             assert_eq!(work_item, "0001");
             assert!(!non_interactive);
@@ -1233,7 +1236,7 @@ fn cli_chat_plan_and_non_interactive() {
 
     let cli = Cli::parse_from(&["aspec", "chat", "--plan", "--non-interactive"]);
     match cli.command.unwrap() {
-        Command::Chat { plan, non_interactive } => {
+        Command::Chat { plan, non_interactive, .. } => {
             assert!(plan);
             assert!(non_interactive);
         }
@@ -1248,7 +1251,7 @@ fn cli_implement_plan_and_non_interactive() {
 
     let cli = Cli::parse_from(&["aspec", "implement", "42", "--plan", "--non-interactive"]);
     match cli.command.unwrap() {
-        Command::Implement { plan, non_interactive, work_item } => {
+        Command::Implement { plan, non_interactive, work_item, .. } => {
             assert!(plan);
             assert!(non_interactive);
             assert_eq!(work_item, "42");
@@ -1327,18 +1330,18 @@ fn plan_false_does_not_add_flags() {
 fn pending_command_chat_plan_field() {
     use aspec::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false, plan: true };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: true });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
 }
 
 #[test]
 fn pending_command_implement_plan_field() {
     use aspec::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true };
-    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true });
-    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false });
+    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false };
+    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false });
+    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false });
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,6 +1364,263 @@ fn autocomplete_implement_shows_plan_hint() {
     assert!(
         sug.iter().any(|s| s.contains("--plan")),
         "Expected --plan hint for 'implement' command, got: {:?}",
+        sug
+    );
+}
+
+// ---------------------------------------------------------------------------
+// allow-docker flag: CLI parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_implement_allow_docker_flag() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "implement", "0001", "--allow-docker"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Implement { allow_docker, work_item, .. } => {
+            assert!(allow_docker, "Expected allow_docker=true");
+            assert_eq!(work_item, "0001");
+        }
+        _ => panic!("Expected Implement command"),
+    }
+}
+
+#[test]
+fn cli_implement_no_allow_docker_by_default() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "implement", "0001"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Implement { allow_docker, .. } => {
+            assert!(!allow_docker, "Expected allow_docker=false by default");
+        }
+        _ => panic!("Expected Implement command"),
+    }
+}
+
+#[test]
+fn cli_chat_allow_docker_flag() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "chat", "--allow-docker"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Chat { allow_docker, .. } => {
+            assert!(allow_docker, "Expected allow_docker=true");
+        }
+        _ => panic!("Expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_chat_no_allow_docker_by_default() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "chat"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Chat { allow_docker, .. } => {
+            assert!(!allow_docker, "Expected allow_docker=false by default");
+        }
+        _ => panic!("Expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_ready_allow_docker_flag() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "ready", "--allow-docker"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Ready { allow_docker, .. } => {
+            assert!(allow_docker, "Expected allow_docker=true");
+        }
+        _ => panic!("Expected Ready command"),
+    }
+}
+
+#[test]
+fn cli_ready_no_allow_docker_by_default() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "ready"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Ready { allow_docker, .. } => {
+            assert!(!allow_docker, "Expected allow_docker=false by default");
+        }
+        _ => panic!("Expected Ready command"),
+    }
+}
+
+#[test]
+fn cli_implement_allow_docker_with_plan() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "implement", "0042", "--allow-docker", "--plan"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Implement { allow_docker, plan, work_item, .. } => {
+            assert!(allow_docker);
+            assert!(plan);
+            assert_eq!(work_item, "0042");
+        }
+        _ => panic!("Expected Implement command"),
+    }
+}
+
+#[test]
+fn cli_chat_allow_docker_with_plan() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "chat", "--allow-docker", "--plan"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Chat { allow_docker, plan, .. } => {
+            assert!(allow_docker);
+            assert!(plan);
+        }
+        _ => panic!("Expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_ready_allow_docker_with_refresh() {
+    use aspec::cli::{Cli, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["aspec", "ready", "--allow-docker", "--refresh"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Ready { allow_docker, refresh, .. } => {
+            assert!(allow_docker);
+            assert!(refresh);
+        }
+        _ => panic!("Expected Ready command"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// allow-docker flag: PendingCommand variants include allow_docker field
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pending_command_chat_allow_docker_field() {
+    use aspec::tui::state::PendingCommand;
+
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
+}
+
+#[test]
+fn pending_command_implement_allow_docker_field() {
+    use aspec::tui::state::PendingCommand;
+
+    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true };
+    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true });
+    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false });
+}
+
+#[test]
+fn pending_command_ready_allow_docker_field() {
+    use aspec::tui::state::PendingCommand;
+
+    let cmd = PendingCommand::Ready { refresh: false, build: false, no_cache: false, non_interactive: false, allow_docker: true };
+    assert_eq!(cmd, PendingCommand::Ready { refresh: false, build: false, no_cache: false, non_interactive: false, allow_docker: true });
+    assert_ne!(cmd, PendingCommand::Ready { refresh: false, build: false, no_cache: false, non_interactive: false, allow_docker: false });
+}
+
+// ---------------------------------------------------------------------------
+// allow-docker flag: socket mount appears in docker run args
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allow_docker_adds_socket_mount_to_implement_run_args() {
+    use aspec::docker::build_run_args;
+
+    let socket_path = aspec::docker::docker_socket_path();
+    let socket_str = socket_path.to_string_lossy().to_string();
+
+    let args = build_run_args(
+        "test-image",
+        "/workspace",
+        &["entrypoint.sh"],
+        &[],
+        None,
+        true, // allow_docker
+    );
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(&socket_str),
+            "Expected socket path {} in args: {:?}",
+            socket_str,
+            args
+        );
+    }
+}
+
+#[test]
+fn no_allow_docker_omits_socket_mount_from_implement_run_args() {
+    use aspec::docker::build_run_args;
+
+    let socket_path = aspec::docker::docker_socket_path();
+    let socket_str = socket_path.to_string_lossy().to_string();
+
+    let args = build_run_args(
+        "test-image",
+        "/workspace",
+        &["entrypoint.sh"],
+        &[],
+        None,
+        false, // allow_docker
+    );
+
+    let joined = args.join(" ");
+    assert!(
+        !joined.contains(&socket_str),
+        "Did not expect socket path {} in args without allow_docker: {:?}",
+        socket_str,
+        args
+    );
+}
+
+// ---------------------------------------------------------------------------
+// allow-docker flag: autocomplete hints include --allow-docker
+// ---------------------------------------------------------------------------
+
+#[test]
+fn autocomplete_chat_shows_allow_docker_hint() {
+    let sug = autocomplete_suggestions("chat ");
+    assert!(
+        sug.iter().any(|s| s.contains("--allow-docker")),
+        "Expected --allow-docker hint for 'chat' command, got: {:?}",
+        sug
+    );
+}
+
+#[test]
+fn autocomplete_implement_shows_allow_docker_hint() {
+    let sug = autocomplete_suggestions("implement ");
+    assert!(
+        sug.iter().any(|s| s.contains("--allow-docker")),
+        "Expected --allow-docker hint for 'implement' command, got: {:?}",
+        sug
+    );
+}
+
+#[test]
+fn autocomplete_ready_shows_allow_docker_hint() {
+    let sug = autocomplete_suggestions("ready ");
+    assert!(
+        sug.iter().any(|s| s.contains("--allow-docker")),
+        "Expected --allow-docker hint for 'ready' command, got: {:?}",
         sug
     );
 }

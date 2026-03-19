@@ -208,27 +208,30 @@ async fn handle_action(app: &mut App, action: Action) {
     }
 }
 
-/// Parse flags from the command parts, returning (refresh, build, no_cache, non_interactive).
-fn parse_ready_flags(parts: &[&str]) -> (bool, bool, bool, bool) {
+/// Parse flags from the command parts, returning (refresh, build, no_cache, non_interactive, allow_docker).
+fn parse_ready_flags(parts: &[&str]) -> (bool, bool, bool, bool, bool) {
     let refresh = parts.iter().any(|p| *p == "--refresh");
     let build = parts.iter().any(|p| *p == "--build");
     let no_cache = parts.iter().any(|p| *p == "--no-cache");
     let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
-    (refresh, build, no_cache, non_interactive)
+    let allow_docker = parts.iter().any(|p| *p == "--allow-docker");
+    (refresh, build, no_cache, non_interactive, allow_docker)
 }
 
-/// Parse flags from implement command parts, returning (non_interactive, plan).
-fn parse_implement_flags(parts: &[&str]) -> (bool, bool) {
+/// Parse flags from implement command parts, returning (non_interactive, plan, allow_docker).
+fn parse_implement_flags(parts: &[&str]) -> (bool, bool, bool) {
     let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
     let plan = parts.iter().any(|p| *p == "--plan");
-    (non_interactive, plan)
+    let allow_docker = parts.iter().any(|p| *p == "--allow-docker");
+    (non_interactive, plan, allow_docker)
 }
 
-/// Parse flags from chat command parts, returning (non_interactive, plan).
-fn parse_chat_flags(parts: &[&str]) -> (bool, bool) {
+/// Parse flags from chat command parts, returning (non_interactive, plan, allow_docker).
+fn parse_chat_flags(parts: &[&str]) -> (bool, bool, bool) {
     let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
     let plan = parts.iter().any(|p| *p == "--plan");
-    (non_interactive, plan)
+    let allow_docker = parts.iter().any(|p| *p == "--allow-docker");
+    (non_interactive, plan, allow_docker)
 }
 
 /// Parse and dispatch a command string entered by the user.
@@ -251,16 +254,16 @@ async fn execute_command(app: &mut App, cmd: &str) {
         }
 
         "ready" => {
-            let (refresh, build, no_cache, non_interactive) = parse_ready_flags(&parts);
+            let (refresh, build, no_cache, non_interactive, allow_docker) = parse_ready_flags(&parts);
             // If --refresh is set, ignore --build (refresh always rebuilds after audit).
             let effective_build = if refresh { false } else { build };
-            app.pending_command = PendingCommand::Ready { refresh, build: effective_build, no_cache, non_interactive };
-            app.ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive };
+            app.pending_command = PendingCommand::Ready { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
+            app.ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
             show_pre_command_dialogs(app).await;
         }
 
         "implement" => {
-            let (non_interactive, plan) = parse_implement_flags(&parts);
+            let (non_interactive, plan, allow_docker) = parse_implement_flags(&parts);
             // Filter out flags to find the work item number.
             let work_item: u32 = match parts.iter()
                 .skip(1)
@@ -270,17 +273,17 @@ async fn execute_command(app: &mut App, cmd: &str) {
                 Some(n) => n,
                 None => {
                     app.input_error =
-                        Some("Usage: implement <work-item-number> [--non-interactive] [--plan]".into());
+                        Some("Usage: implement <work-item-number> [--non-interactive] [--plan] [--allow-docker]".into());
                     return;
                 }
             };
-            app.pending_command = PendingCommand::Implement { work_item, non_interactive, plan };
+            app.pending_command = PendingCommand::Implement { work_item, non_interactive, plan, allow_docker };
             show_pre_command_dialogs(app).await;
         }
 
         "chat" => {
-            let (non_interactive, plan) = parse_chat_flags(&parts);
-            app.pending_command = PendingCommand::Chat { non_interactive, plan };
+            let (non_interactive, plan, allow_docker) = parse_chat_flags(&parts);
+            app.pending_command = PendingCommand::Chat { non_interactive, plan, allow_docker };
             show_pre_command_dialogs(app).await;
         }
 
@@ -330,15 +333,15 @@ async fn show_pre_command_dialogs(app: &mut App) {
 /// Resume the pending command after all dialogs have been answered.
 async fn launch_pending_command(app: &mut App) {
     match app.pending_command.clone() {
-        PendingCommand::Ready { refresh, build, no_cache, non_interactive } => {
-            app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive };
+        PendingCommand::Ready { refresh, build, no_cache, non_interactive, allow_docker } => {
+            app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker };
             launch_ready(app).await;
         }
-        PendingCommand::Implement { work_item, non_interactive, plan } => {
-            launch_implement(app, work_item, non_interactive, plan).await;
+        PendingCommand::Implement { work_item, non_interactive, plan, allow_docker } => {
+            launch_implement(app, work_item, non_interactive, plan, allow_docker).await;
         }
-        PendingCommand::Chat { non_interactive, plan } => {
-            launch_chat(app, non_interactive, plan).await;
+        PendingCommand::Chat { non_interactive, plan, allow_docker } => {
+            launch_chat(app, non_interactive, plan, allow_docker).await;
         }
         PendingCommand::None => {}
     }
@@ -467,6 +470,28 @@ fn launch_ready_audit(app: &mut App) {
         }
     };
 
+    let allow_docker = app.ready_opts.allow_docker;
+
+    // If --allow-docker, check the socket and print a warning before launching.
+    if allow_docker {
+        match docker::check_docker_socket() {
+            Ok(socket_path) => {
+                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.push_output(format!(
+                    "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
+                     This grants the agent elevated host access.",
+                    socket_path.display(),
+                    socket_path.display()
+                ));
+            }
+            Err(e) => {
+                app.push_output(format!("Error: {}", e));
+                app.finish_command(1);
+                return;
+            }
+        }
+    }
+
     let container_name = docker::generate_container_name();
     let entrypoint = ready::audit_entrypoint(&ctx.agent_name);
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
@@ -478,6 +503,7 @@ fn launch_ready_audit(app: &mut App) {
         &ctx.env_vars,
         Some(&container_name),
         app.host_settings.as_ref(),
+        allow_docker,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
@@ -522,6 +548,28 @@ fn launch_ready_audit_captured(app: &mut App) {
         }
     };
 
+    let allow_docker = app.ready_opts.allow_docker;
+
+    // If --allow-docker, check the socket and print a warning before launching.
+    if allow_docker {
+        match docker::check_docker_socket() {
+            Ok(socket_path) => {
+                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.push_output(format!(
+                    "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
+                     This grants the agent elevated host access.",
+                    socket_path.display(),
+                    socket_path.display()
+                ));
+            }
+            Err(e) => {
+                app.push_output(format!("Error: {}", e));
+                app.finish_command(1);
+                return;
+            }
+        }
+    }
+
     // Move host_settings into the task so the temp dir lives until the container exits.
     let host_settings = app.host_settings.take();
 
@@ -541,6 +589,7 @@ fn launch_ready_audit_captured(app: &mut App) {
             &entrypoint_refs,
             &ctx.env_vars,
             host_settings.as_ref(),
+            allow_docker,
         )?;
         for line in output.lines() {
             sink.println(line);
@@ -582,7 +631,7 @@ fn launch_ready_post_audit(app: &mut App) {
 }
 
 /// Actually spawn the docker container for `implement` via PTY.
-async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool) {
+async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool, allow_docker: bool) {
     let git_root = match find_git_root() {
         Some(r) => r,
         None => {
@@ -622,14 +671,35 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref())
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref(), allow_docker)
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref())
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker)
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
     let command_display = format!("implement {:04}", work_item);
     app.start_command(command_display);
+
+    // If --allow-docker, check the socket and print a warning before launching.
+    if allow_docker {
+        match docker::check_docker_socket() {
+            Ok(socket_path) => {
+                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.push_output(format!(
+                    "WARNING: --allow-docker: mounting host Docker socket into container ({}:{}). \
+                     This grants the agent elevated host access.",
+                    socket_path.display(),
+                    socket_path.display()
+                ));
+            }
+            Err(e) => {
+                app.push_output(format!("Error: {}", e));
+                app.finish_command(1);
+                return;
+            }
+        }
+    }
+
     app.push_output(format!("$ {}", cmd_display));
 
     if non_interactive {
@@ -650,6 +720,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
                 &entrypoint_refs,
                 &env_vars,
                 host_settings.as_ref(),
+                allow_docker,
             )?;
             for line in output.lines() {
                 sink.println(line);
@@ -662,7 +733,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref());
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker);
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.
@@ -695,7 +766,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 }
 
 /// Actually spawn the docker container for `chat` via PTY.
-async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool) {
+async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_docker: bool) {
     let git_root = match find_git_root() {
         Some(r) => r,
         None => {
@@ -729,14 +800,35 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool) {
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref())
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref(), allow_docker)
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref())
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker)
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
     let command_display = "chat".to_string();
     app.start_command(command_display);
+
+    // If --allow-docker, check the socket and print a warning before launching.
+    if allow_docker {
+        match docker::check_docker_socket() {
+            Ok(socket_path) => {
+                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.push_output(format!(
+                    "WARNING: --allow-docker: mounting host Docker socket into container ({}:{}). \
+                     This grants the agent elevated host access.",
+                    socket_path.display(),
+                    socket_path.display()
+                ));
+            }
+            Err(e) => {
+                app.push_output(format!("Error: {}", e));
+                app.finish_command(1);
+                return;
+            }
+        }
+    }
+
     app.push_output(format!("$ {}", cmd_display));
 
     if non_interactive {
@@ -757,6 +849,7 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool) {
                 &entrypoint_refs,
                 &env_vars,
                 host_settings.as_ref(),
+                allow_docker,
             )?;
             for line in output.lines() {
                 sink.println(line);
@@ -769,7 +862,7 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool) {
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref());
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker);
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.

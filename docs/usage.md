@@ -42,8 +42,10 @@ aspec ready --build
 aspec ready --build --no-cache
 aspec implement 0001
 aspec implement 0001 --plan
+aspec implement 0001 --allow-docker
 aspec chat
 aspec chat --plan
+aspec chat --allow-docker
 aspec new
 ```
 
@@ -79,7 +81,7 @@ aspec init --agent=claude
 
 ---
 
-### `aspec ready [--refresh] [--build] [--no-cache] [--non-interactive]`
+### `aspec ready [--refresh] [--build] [--no-cache] [--non-interactive] [--allow-docker]`
 
 Checks that your environment is ready for agentic development.
 
@@ -122,6 +124,7 @@ agent authentication flow as `implement` (see [Agent Auth](#agent-authentication
 | `--build` | Force rebuild the dev container image (ignored if `--refresh` is also set) |
 | `--no-cache` | Pass `--no-cache` to `docker build` for all build operations |
 | `--non-interactive` | Run the agent in print/non-interactive mode |
+| `--allow-docker` | Mount the host Docker daemon socket into the audit container (see [Docker Socket Access](#docker-socket-access)) |
 
 **Flag interactions**
 
@@ -162,11 +165,12 @@ aspec ready --refresh --non-interactive    # audit in non-interactive mode
 aspec ready --build                        # rebuild image from current Dockerfile.dev
 aspec ready --build --no-cache             # full rebuild without Docker cache
 aspec ready --refresh --no-cache           # audit + rebuild without cache
+aspec ready --refresh --allow-docker       # audit with Docker daemon access in container
 ```
 
 ---
 
-### `aspec implement <NNNN> [--non-interactive] [--plan]`
+### `aspec implement <NNNN> [--non-interactive] [--plan] [--allow-docker]`
 
 Launches the dev container to implement a work item.
 
@@ -189,6 +193,7 @@ The work item number is a 4-digit identifier (e.g. `0001`). Both `0001` and
 |------|-------------|
 | `--non-interactive` | Run the agent in print/non-interactive mode |
 | `--plan` | Run the agent in plan mode (read-only, no file modifications) |
+| `--allow-docker` | Mount the host Docker daemon socket into the container (see [Docker Socket Access](#docker-socket-access)) |
 
 **Interactive Mode (default)**
 
@@ -236,7 +241,7 @@ depends on the agent:
 
 ---
 
-### `aspec chat [--non-interactive] [--plan]`
+### `aspec chat [--non-interactive] [--plan] [--allow-docker]`
 
 Starts a freeform chat session with the configured agent in a container.
 
@@ -247,6 +252,7 @@ the agent with no pre-configured prompt — giving you a clean interactive sessi
 aspec chat                      # start interactive chat
 aspec chat --non-interactive    # start in non-interactive mode
 aspec chat --plan               # start in plan mode (read-only)
+aspec chat --allow-docker       # start with Docker daemon access in container
 ```
 
 - Prompts to confirm the Docker mount scope (Git root vs CWD) if needed
@@ -259,6 +265,7 @@ aspec chat --plan               # start in plan mode (read-only)
 |------|-------------|
 | `--non-interactive` | Run the agent in print/non-interactive mode |
 | `--plan` | Run the agent in plan mode (read-only, no file modifications) |
+| `--allow-docker` | Mount the host Docker daemon socket into the container (see [Docker Socket Access](#docker-socket-access)) |
 
 **Interactive Mode (default)**
 
@@ -477,13 +484,13 @@ init --
   init --agent=claude  ·  init --agent=codex  ·  init --agent=opencode
 
 ready --
-  ready --refresh  ·  ready --build  ·  ready --no-cache  ·  ready --build --no-cache  ·  ready --non-interactive  ·  ready --refresh --non-interactive
+  ready --refresh  ·  ready --build  ·  ready --no-cache  ·  ready --build --no-cache  ·  ready --non-interactive  ·  ready --refresh --non-interactive  ·  ready --refresh --allow-docker
 
 implement --
-  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive  ·  implement <NNNN> --plan
+  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive  ·  implement <NNNN> --plan  ·  implement <NNNN> --allow-docker
 
 chat --
-  chat  (start a freeform agent session)  ·  chat --non-interactive  ·  chat --plan
+  chat  (start a freeform agent session)  ·  chat --non-interactive  ·  chat --plan  ·  chat --allow-docker
 ```
 
 ### Unknown Commands
@@ -622,6 +629,55 @@ Whenever an interactive code agent is about to launch (in `ready --refresh` or
 ```
 
 This notice is **not** shown when `--non-interactive` is used.
+
+---
+
+## Docker Socket Access
+
+The `--allow-docker` flag is available on `implement`, `chat`, and `ready`. When
+passed, aspec mounts the host Docker daemon socket into the agent container,
+giving the agent the ability to build and run Docker images itself.
+
+### When to use it
+
+Use `--allow-docker` when your work item or chat session requires the agent to:
+
+- Build Docker images as part of its task
+- Run Docker containers (e.g. test environments, services)
+- Interact with the local Docker daemon in any way
+
+### What happens
+
+Before launching the container, aspec:
+
+1. Verifies the Docker socket exists and is accessible (fails with a clear
+   error if the daemon is not running)
+2. Prints a warning message so you are aware of the elevated access:
+
+```
+Docker socket: /var/run/docker.sock (found)
+WARNING: --allow-docker: mounting host Docker socket into container
+(/var/run/docker.sock:/var/run/docker.sock). This grants the agent elevated host access.
+```
+
+3. Mounts the socket into the container:
+   - Linux / macOS: `-v /var/run/docker.sock:/var/run/docker.sock`
+   - Windows: `--mount type=npipe,source=\\.\pipe\docker_engine,target=\\.\pipe\docker_engine`
+
+### Security note
+
+Mounting the Docker socket grants the agent the ability to run arbitrary
+containers on the host. Only use `--allow-docker` when you trust the agent and
+the work item requires it. This is an intentional capability escalation —
+`aspec` will never mount the Docker socket without this explicit flag.
+
+### Examples
+
+```sh
+aspec implement 0005 --allow-docker    # implement a work item that needs Docker
+aspec chat --allow-docker              # start a chat session with Docker access
+aspec ready --refresh --allow-docker   # run audit with Docker access in container
+```
 
 ---
 

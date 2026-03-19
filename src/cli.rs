@@ -46,6 +46,10 @@ pub enum Command {
         /// Run the agent in non-interactive (print) mode instead of interactive mode.
         #[arg(long)]
         non_interactive: bool,
+
+        /// Mount the host Docker daemon socket into the agent container.
+        #[arg(long)]
+        allow_docker: bool,
     },
 
     /// Launch the dev container to implement a work item.
@@ -60,6 +64,10 @@ pub enum Command {
         /// Run the agent in plan mode (read-only, no file modifications).
         #[arg(long)]
         plan: bool,
+
+        /// Mount the host Docker daemon socket into the agent container.
+        #[arg(long)]
+        allow_docker: bool,
     },
 
     /// Start a freeform chat session with the configured agent in a container.
@@ -71,6 +79,10 @@ pub enum Command {
         /// Run the agent in plan mode (read-only, no file modifications).
         #[arg(long)]
         plan: bool,
+
+        /// Mount the host Docker daemon socket into the agent container.
+        #[arg(long)]
+        allow_docker: bool,
     },
 
     /// Create a new work item from the template.
@@ -173,7 +185,7 @@ mod tests {
     fn ready_all_flags() {
         let cli = parse(&["aspec", "ready", "--refresh", "--build", "--no-cache", "--non-interactive"]);
         match cli.command.unwrap() {
-            Command::Ready { refresh, build, no_cache, non_interactive } => {
+            Command::Ready { refresh, build, no_cache, non_interactive, .. } => {
                 assert!(refresh);
                 assert!(build);
                 assert!(no_cache);
@@ -187,11 +199,12 @@ mod tests {
     fn ready_defaults_no_refresh_no_non_interactive() {
         let cli = parse(&["aspec", "ready"]);
         match cli.command.unwrap() {
-            Command::Ready { refresh, build, no_cache, non_interactive } => {
+            Command::Ready { refresh, build, no_cache, non_interactive, allow_docker } => {
                 assert!(!refresh);
                 assert!(!build);
                 assert!(!no_cache);
                 assert!(!non_interactive);
+                assert!(!allow_docker);
             }
             _ => panic!("expected ready"),
         }
@@ -279,7 +292,7 @@ mod tests {
     fn chat_plan_flag() {
         let cli = parse(&["aspec", "chat", "--plan"]);
         match cli.command.unwrap() {
-            Command::Chat { plan, non_interactive } => {
+            Command::Chat { plan, non_interactive, .. } => {
                 assert!(plan);
                 assert!(!non_interactive);
             }
@@ -300,7 +313,7 @@ mod tests {
     fn chat_plan_and_non_interactive() {
         let cli = parse(&["aspec", "chat", "--plan", "--non-interactive"]);
         match cli.command.unwrap() {
-            Command::Chat { plan, non_interactive } => {
+            Command::Chat { plan, non_interactive, .. } => {
                 assert!(plan);
                 assert!(non_interactive);
             }
@@ -312,7 +325,7 @@ mod tests {
     fn implement_plan_flag() {
         let cli = parse(&["aspec", "implement", "0001", "--plan"]);
         match cli.command.unwrap() {
-            Command::Implement { plan, work_item, non_interactive } => {
+            Command::Implement { plan, work_item, non_interactive, .. } => {
                 assert!(plan);
                 assert_eq!(work_item, "0001");
                 assert!(!non_interactive);
@@ -382,5 +395,97 @@ mod tests {
         assert!(!cli.build);
         assert!(!cli.no_cache);
         assert!(!cli.refresh);
+    }
+
+    // --- --allow-docker flag tests ---
+
+    #[test]
+    fn implement_allow_docker_flag() {
+        let cli = parse(&["aspec", "implement", "0001", "--allow-docker"]);
+        match cli.command.unwrap() {
+            Command::Implement { allow_docker, .. } => assert!(allow_docker),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_defaults_no_allow_docker() {
+        let cli = parse(&["aspec", "implement", "0001"]);
+        match cli.command.unwrap() {
+            Command::Implement { allow_docker, .. } => assert!(!allow_docker),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_allow_docker_with_plan() {
+        let cli = parse(&["aspec", "implement", "0001", "--allow-docker", "--plan"]);
+        match cli.command.unwrap() {
+            Command::Implement { allow_docker, plan, .. } => {
+                assert!(allow_docker);
+                assert!(plan);
+            }
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn chat_allow_docker_flag() {
+        let cli = parse(&["aspec", "chat", "--allow-docker"]);
+        match cli.command.unwrap() {
+            Command::Chat { allow_docker, .. } => assert!(allow_docker),
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_defaults_no_allow_docker() {
+        let cli = parse(&["aspec", "chat"]);
+        match cli.command.unwrap() {
+            Command::Chat { allow_docker, .. } => assert!(!allow_docker),
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_allow_docker_with_plan() {
+        let cli = parse(&["aspec", "chat", "--allow-docker", "--plan"]);
+        match cli.command.unwrap() {
+            Command::Chat { allow_docker, plan, .. } => {
+                assert!(allow_docker);
+                assert!(plan);
+            }
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn ready_allow_docker_flag() {
+        let cli = parse(&["aspec", "ready", "--allow-docker"]);
+        match cli.command.unwrap() {
+            Command::Ready { allow_docker, .. } => assert!(allow_docker),
+            _ => panic!("expected ready"),
+        }
+    }
+
+    #[test]
+    fn ready_defaults_no_allow_docker() {
+        let cli = parse(&["aspec", "ready"]);
+        match cli.command.unwrap() {
+            Command::Ready { allow_docker, .. } => assert!(!allow_docker),
+            _ => panic!("expected ready"),
+        }
+    }
+
+    #[test]
+    fn ready_allow_docker_with_refresh() {
+        let cli = parse(&["aspec", "ready", "--allow-docker", "--refresh"]);
+        match cli.command.unwrap() {
+            Command::Ready { allow_docker, refresh, .. } => {
+                assert!(allow_docker);
+                assert!(refresh);
+            }
+            _ => panic!("expected ready"),
+        }
     }
 }
