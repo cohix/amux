@@ -54,30 +54,63 @@ amux claws ready
 
 ## Subcommands
 
-### `amux init [--agent=<name>]`
+### `amux init [--agent=<name>] [--aspec]`
 
 Initialises the current Git repository for use with `amux`.
 
-- Detects the Git root directory
-- Writes `aspec/.amux.json` (repository config)
-- Downloads the `aspec/` folder from GitHub (`github.com/cohix/aspec`) if it does
-  not already exist in the Git root. This provides the project specification
-  templates, work item template, and architecture documents.
-- Downloads and writes `Dockerfile.dev` from the agent template hosted on GitHub
-  (`github.com/cohix/aspec-cli`). Falls back to the bundled template if the
-  download fails (e.g. no network). Only writes if one does not already exist.
-- Logs download URLs, file sizes, and destinations for all downloaded content
+1. Writes `aspec/.amux.json` (repository config) with the chosen agent
+2. Downloads the `aspec/` folder from GitHub if `--aspec` is passed and the
+   folder does not yet exist. Skipped (noted in summary) without `--aspec`.
+3. Writes `Dockerfile.dev` from the agent template — **never overwrites** an
+   existing file. Falls back to a bundled template if the download fails.
+4. Offers to run the agent audit container (explains what it does and asks
+   for confirmation). Only proceeds if you accept; skipped if you decline.
+5. Builds the dev container image (before audit, and again after if audit ran).
+6. Prints a summary table of every step.
+7. Prints a "What's Next?" panel explaining how to use the TUI.
 
 **Flags**
 
 | Flag | Values | Default |
 |------|--------|---------|
 | `--agent` | `claude`, `codex`, `opencode` | `claude` |
+| `--aspec` | (flag, no value) | off |
 
-**Example**
+**`--aspec`**
+
+When passed, downloads the `aspec/` folder from `github.com/cohix/aspec` to
+provide project specification templates and work item scaffolding. If the
+folder already exists it is left untouched. Without `--aspec`, the folder
+download is skipped and noted in the summary table.
+
+**Summary table**
+
+At the end of every `init` run a summary table is printed:
+
+```
+┌──────────────────────────────────────────────────┐
+│              Init Summary (       claude)         │
+├───────────────────┬──────────────────────────────┤
+│            Config │ ✓ saved                       │
+│      aspec folder │ – use --aspec to download     │
+│    Dockerfile.dev │ ✓ created                     │
+│       Agent audit │ ✓ completed                   │
+│      Docker image │ ✓ built                       │
+└───────────────────┴──────────────────────────────┘
+```
+
+**What's Next?**
+
+After the summary, a decorated panel reminds you to run `amux` to open the
+interactive TUI and explains the `chat`, `new`, and `implement` commands.
+
+**Examples**
 
 ```sh
-amux init --agent=claude
+amux init                       # init with claude agent, skip aspec folder
+amux init --agent=codex         # use codex agent
+amux init --aspec               # also download the aspec/ folder
+amux init --agent=claude --aspec
 ```
 
 ---
@@ -87,18 +120,21 @@ amux init --agent=claude
 Checks that your environment is ready for agentic development.
 
 1. Verifies the Docker daemon is running
-2. Checks that `Dockerfile.dev` exists — if missing, initialises it from the
-   agent template (same as `init`) and **always rebuilds the image** (even if
-   one with the correct name already exists)
-3. Checks for an existing `amux-{projectname}:latest` image — builds one if
+2. Checks the `aspec/` folder — notes if missing and suggests `amux init --aspec`
+3. Checks the local agent installation by sending a random greeting (non-containerized)
+   and displaying the greeting sent and the agent's response
+4. Checks that `Dockerfile.dev` exists — if missing, explains what it does and
+   asks whether to create it and run the audit. Declines result in a failure.
+   If the content matches the default template, offers to run the audit.
+5. Checks for an existing `amux-{projectname}:latest` image — builds one if
    it does not exist yet (with streaming output)
-4. Presents a summary table showing the status of each step
+6. Presents a summary table showing the status of each step
 
 When `--refresh` is passed, `ready` also runs the Dockerfile agent audit:
 
-4. Launches a container with the configured code agent to scan the project
-   and update `Dockerfile.dev` with any missing build/test tools
-5. Rebuilds the image with the updated `Dockerfile.dev`
+- Launches a container with the configured code agent to scan the project
+  and update `Dockerfile.dev` with any missing build/test tools
+- Rebuilds the image with the updated `Dockerfile.dev`
 
 Without `--refresh`, the audit is skipped and a tip is shown suggesting its use.
 
@@ -116,6 +152,31 @@ The image tag is derived from the Git root folder name (e.g. `amux-myapp:latest`
 
 Before launching the audit container, `ready` applies the same mount scope and
 agent authentication flow as `implement` (see [Agent Auth](#agent-authentication)).
+
+**Local Agent Check**
+
+Every `ready` run sends a random greeting to the configured agent on the host
+machine (not inside a container) to verify it is installed and authenticated.
+The greeting and the agent's first response line are printed, e.g.:
+
+```
+Checking local claude agent...
+  > Howdy
+  < Howdy! How can I help you today?
+  claude: installed & authenticated: OK
+```
+
+If the agent is not installed or not authenticated, the check is noted in the
+summary but does not fail the command.
+
+**Dockerfile.dev handling**
+
+- **Missing**: `ready` explains what `Dockerfile.dev` does and asks whether to
+  create it and run the audit. Declining results in a command failure (the dev
+  image cannot be built without it).
+- **Matches default template**: `ready` offers to run the audit container to
+  customize the Dockerfile for your project's actual toolchain.
+- **Custom content**: The audit offer is skipped; use `--refresh` explicitly.
 
 **Flags**
 
@@ -151,6 +212,8 @@ of each step:
 ├───────────────────┬──────────────────────────────┤
 │    Docker daemon  │ ✓ running                    │
 │    Dockerfile.dev │ ✓ exists                     │
+│      aspec folder │ ✓ present                    │
+│       Local agent │ ✓ claude: installed & ...    │
 │         Dev image │ ✓ exists                     │
 │   Refresh (audit) │ – use --refresh to run       │
 │     Image rebuild │ – no refresh                 │

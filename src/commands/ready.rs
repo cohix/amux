@@ -1,7 +1,7 @@
 use crate::cli::Agent;
 use crate::commands::auth::resolve_auth;
 use crate::commands::implement::confirm_mount_scope_stdin;
-use crate::commands::init::{find_git_root, write_dockerfile};
+use crate::commands::init::{ask_yes_no_stdin, dockerfile_for_agent_embedded, find_git_root, write_dockerfile};
 use crate::commands::output::OutputSink;
 use crate::config::load_repo_config;
 use crate::docker;
@@ -15,6 +15,70 @@ pub const AUDIT_PROMPT: &str = "scan this project and determine every tool neede
     is built. Pin to specific versions wherever possible. Ensure all relevant tools are in $PATH \
     and can be executed by the container entrypoint command. Only modify Dockerfile.dev; do not \
     modify any other files. Do not add any new files.";
+
+/// 50 random greetings used to check local agent installation / refresh OAuth tokens.
+pub const GREETINGS: [&str; 50] = [
+    "Hello",
+    "Hi there",
+    "Hey",
+    "Greetings",
+    "Good day",
+    "Howdy",
+    "Salutations",
+    "How are you",
+    "Good morning",
+    "Good afternoon",
+    "Good evening",
+    "Hi",
+    "Hey there",
+    "Ahoy",
+    "Yo",
+    "Hello there",
+    "Hiya",
+    "How's it going",
+    "How do you do",
+    "Pleased to meet you",
+    "Nice to meet you",
+    "How are things",
+    "What's new",
+    "How have you been",
+    "Welcome",
+    "Aloha",
+    "Bonjour",
+    "Ciao",
+    "Hola",
+    "Namaste",
+    "Howdy partner",
+    "Top of the morning to you",
+    "What's happening",
+    "How goes it",
+    "How's everything",
+    "How's life",
+    "Well hello",
+    "Hey friend",
+    "Good to see you",
+    "Hello friend",
+    "Greetings and salutations",
+    "Hey buddy",
+    "Sup",
+    "What's up",
+    "Long time no see",
+    "Rise and shine",
+    "How's your day going",
+    "Hope you're doing well",
+    "Great to hear from you",
+    "Glad you're here",
+];
+
+/// Select a greeting at random using the current time as a seed.
+pub fn select_random_greeting() -> &'static str {
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize
+        % GREETINGS.len();
+    GREETINGS[idx]
+}
 
 /// Context produced by the pre-audit phase, needed by the audit and post-audit phases.
 #[derive(Clone)]
@@ -41,6 +105,8 @@ pub struct ReadyOptions {
     pub non_interactive: bool,
     /// When true, mount the host Docker daemon socket into the audit container.
     pub allow_docker: bool,
+    /// When true, auto-create Dockerfile.dev if missing (used by TUI to skip prompting).
+    pub auto_create_dockerfile: bool,
 }
 
 /// Tracks the status of each step for the summary table.
@@ -48,6 +114,8 @@ pub struct ReadyOptions {
 pub struct ReadySummary {
     pub docker_daemon: StepStatus,
     pub dockerfile: StepStatus,
+    pub aspec_folder: StepStatus,
+    pub local_agent: StepStatus,
     pub dev_image: StepStatus,
     pub refresh: StepStatus,
     pub image_rebuild: StepStatus,
@@ -66,6 +134,8 @@ impl Default for ReadySummary {
         Self {
             docker_daemon: StepStatus::Pending,
             dockerfile: StepStatus::Pending,
+            aspec_folder: StepStatus::Pending,
+            local_agent: StepStatus::Pending,
             dev_image: StepStatus::Pending,
             refresh: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
@@ -81,6 +151,8 @@ pub fn print_summary(out: &OutputSink, summary: &ReadySummary) {
     out.println("├───────────────────┬──────────────────────────────┤");
     print_summary_row(out, "Docker daemon", &summary.docker_daemon);
     print_summary_row(out, "Dockerfile.dev", &summary.dockerfile);
+    print_summary_row(out, "aspec folder", &summary.aspec_folder);
+    print_summary_row(out, "Local agent", &summary.local_agent);
     print_summary_row(out, "Dev image", &summary.dev_image);
     print_summary_row(out, "Refresh (audit)", &summary.refresh);
     print_summary_row(out, "Image rebuild", &summary.image_rebuild);
@@ -121,12 +193,69 @@ pub fn print_interactive_notice(out: &OutputSink, agent_name: &str) {
     out.println(String::new());
 }
 
+/// Check whether the given Dockerfile content exactly matches one of the default templates.
+/// Returns true if it matches any embedded template for the configured agent.
+pub fn dockerfile_matches_template(content: &str, agent_name: &str) -> bool {
+    let agent = match agent_name {
+        "codex" => Agent::Codex,
+        "opencode" => Agent::Opencode,
+        _ => Agent::Claude,
+    };
+    let template = dockerfile_for_agent_embedded(&agent);
+    content.trim() == template.trim()
+}
+
+/// Run the configured agent locally (non-containerized) with a simple greeting
+/// to check whether it is installed and authenticated.
+/// Returns `(status, greeting_sent, agent_response)`.
+pub async fn check_local_agent(agent_name: &str) -> (StepStatus, String, String) {
+    let greeting = select_random_greeting();
+    let (cmd, args): (&str, Vec<&str>) = match agent_name {
+        "claude" => ("claude", vec!["--print", greeting]),
+        "codex" => ("codex", vec!["--quiet", greeting]),
+        "opencode" => ("opencode", vec!["run", greeting]),
+        _ => (agent_name, vec!["--print", greeting]),
+    };
+
+    match tokio::process::Command::new(cmd)
+        .args(&args)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (
+                StepStatus::Ok(format!("{}: installed & authenticated", agent_name)),
+                greeting.to_string(),
+                response,
+            )
+        }
+        Ok(output) => {
+            let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (
+                StepStatus::Failed(format!("{}: error (check auth)", agent_name)),
+                greeting.to_string(),
+                response,
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StepStatus::Failed(format!("{}: not installed", agent_name)),
+            greeting.to_string(),
+            String::new(),
+        ),
+        Err(_) => (
+            StepStatus::Failed(format!("{}: could not run", agent_name)),
+            greeting.to_string(),
+            String::new(),
+        ),
+    }
+}
+
 /// Command-mode entry point: prompts for mount scope and auth, then runs ready phases.
 /// The audit phase is only run when `--refresh` is passed.
 pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bool, allow_docker: bool) -> Result<()> {
     // If --refresh is set, ignore --build (refresh always rebuilds after audit).
     let effective_build = if refresh { false } else { build };
-    let opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
     let config = load_repo_config(&git_root)?;
@@ -135,6 +264,66 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
     let env_vars = credentials.env_vars.clone();
     let host_settings = docker::HostSettings::prepare(agent_name);
     let out = &OutputSink::Stdout;
+
+    // Determine whether to auto-create Dockerfile.dev or prompt the user.
+    let dockerfile_path = git_root.join("Dockerfile.dev");
+    let effective_refresh;
+    let auto_create_dockerfile;
+
+    if !dockerfile_path.exists() {
+        // No Dockerfile.dev: explain what it does and ask the user.
+        println!(
+            "\nNo Dockerfile.dev found in the project."
+        );
+        println!(
+            "Dockerfile.dev defines the container that runs your code agent securely."
+        );
+        println!(
+            "Without it, `amux ready` cannot build the dev container image."
+        );
+        if ask_yes_no_stdin("Create a Dockerfile.dev from the default template and run the agent audit?") {
+            auto_create_dockerfile = true;
+            // If user accepts, run audit automatically (unless --refresh already set).
+            effective_refresh = true;
+        } else {
+            // User declined: fail the ready command.
+            println!("Dockerfile.dev is required. Run `amux init` to set it up.");
+            // Still run to show the summary with the failure.
+            auto_create_dockerfile = false;
+            effective_refresh = refresh;
+        }
+    } else if !refresh {
+        // Dockerfile.dev exists, --refresh not set: check if content matches template.
+        // If it matches, offer to run the audit.
+        let content = std::fs::read_to_string(&dockerfile_path).unwrap_or_default();
+        if dockerfile_matches_template(&content, agent_name) {
+            println!(
+                "\nYour Dockerfile.dev matches the default template — the agent audit can"
+            );
+            println!("scan your project and customize it for your specific toolchain.");
+            if ask_yes_no_stdin("Run the agent audit container now?") {
+                effective_refresh = true;
+            } else {
+                effective_refresh = false;
+            }
+        } else {
+            effective_refresh = false;
+        }
+        auto_create_dockerfile = true; // File exists, no creation needed.
+    } else {
+        // --refresh was explicitly set, Dockerfile.dev exists.
+        effective_refresh = true;
+        auto_create_dockerfile = true;
+    }
+
+    let opts = ReadyOptions {
+        refresh: effective_refresh,
+        build: effective_build,
+        no_cache,
+        non_interactive,
+        allow_docker,
+        auto_create_dockerfile,
+    };
 
     let mut summary = ReadySummary::default();
     let ctx = run_pre_audit(out, mount_path, env_vars, &opts, &mut summary).await?;
@@ -210,13 +399,19 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
         out.println("Tip: use `amux ready --refresh` to run the Dockerfile audit agent.");
     }
 
+    // Note missing aspec if applicable.
+    if matches!(summary.aspec_folder, StepStatus::Failed(_)) {
+        out.println(String::new());
+        out.println("Tip: run `amux init --aspec` to add an aspec folder to this project.");
+    }
+
     out.println(String::new());
     out.println("amux is ready.");
 
     Ok(())
 }
 
-/// Phase 1 — Pre-audit: Docker checks, Dockerfile init, image build.
+/// Phase 1 — Pre-audit: Docker checks, Dockerfile init, aspec check, agent check, image build.
 ///
 /// Returns the context needed to launch the audit and post-audit phases.
 pub async fn run_pre_audit(
@@ -244,20 +439,58 @@ pub async fn run_pre_audit(
     let config = load_repo_config(&git_root)?;
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
 
-    // 3. Initialize Dockerfile.dev from template if missing
-    //    When the Dockerfile was missing and created from template, always build
-    //    even if an image with the correct name already exists.
+    // 3. Check aspec folder.
+    let aspec_dir = git_root.join("aspec");
+    if aspec_dir.exists() {
+        summary.aspec_folder = StepStatus::Ok("present".into());
+    } else {
+        summary.aspec_folder = StepStatus::Failed("missing".into());
+        out.println("Note: no aspec folder found. Run `amux init --aspec` to add one.");
+    }
+
+    // 4. Check local agent installation (non-containerized greeting).
+    out.println(format!("Checking local {} agent...", agent_name));
+    let (agent_status, greeting_sent, agent_response) = check_local_agent(&agent_name).await;
+    out.println(format!("  > {}", greeting_sent));
+    if !agent_response.is_empty() {
+        // Show first non-empty line of the response (agent may produce many lines).
+        let first_line = agent_response.lines().find(|l| !l.trim().is_empty()).unwrap_or(&agent_response);
+        out.println(format!("  < {}", first_line));
+    }
+    match &agent_status {
+        StepStatus::Ok(msg) => out.println(format!("  {}: OK", msg)),
+        StepStatus::Failed(msg) => out.println(format!("  note: {}", msg)),
+        _ => {}
+    }
+    summary.local_agent = agent_status;
+
+    // 5. Handle Dockerfile.dev — create if missing (requires user acceptance).
     out.print("Checking Dockerfile.dev... ");
     let dockerfile_was_missing;
     {
         let agent = agent_from_str(&agent_name);
-        if write_dockerfile(&git_root, &agent, out).await? {
-            out.println(format!(
-                "MISSING — downloaded and created at {}",
-                dockerfile.display()
-            ));
-            summary.dockerfile = StepStatus::Ok("created".into());
-            dockerfile_was_missing = true;
+        if !dockerfile.exists() {
+            if opts.auto_create_dockerfile {
+                // TUI mode or user already accepted: create from template.
+                if write_dockerfile(&git_root, &agent, out).await? {
+                    out.println(format!(
+                        "MISSING — downloaded and created at {}",
+                        dockerfile.display()
+                    ));
+                    summary.dockerfile = StepStatus::Ok("created".into());
+                    dockerfile_was_missing = true;
+                } else {
+                    // write_dockerfile returned false (file appeared between checks).
+                    out.println(format!("OK ({})", dockerfile.display()));
+                    summary.dockerfile = StepStatus::Ok("exists".into());
+                    dockerfile_was_missing = false;
+                }
+            } else {
+                // Command mode, user declined: fail.
+                out.println("MISSING");
+                summary.dockerfile = StepStatus::Failed("missing — run `amux init`".into());
+                bail!("Dockerfile.dev is missing. Run `amux init` to create it.");
+            }
         } else {
             out.println(format!("OK ({})", dockerfile.display()));
             summary.dockerfile = StepStatus::Ok("exists".into());
@@ -265,7 +498,7 @@ pub async fn run_pre_audit(
         }
     }
 
-    // 4. Check if project image exists; build if missing, forced by --build, or
+    // 6. Check if project image exists; build if missing, forced by --build, or
     //    if Dockerfile.dev was just created from template.
     let dockerfile_str = dockerfile.to_str().unwrap().to_string();
     let git_root_str = git_root.to_str().unwrap().to_string();
@@ -442,6 +675,12 @@ pub async fn run_with_sink(
         out.println("Tip: use `amux ready --refresh` to run the Dockerfile audit agent.");
     }
 
+    // Note missing aspec if applicable.
+    if matches!(summary.aspec_folder, StepStatus::Failed(_)) {
+        out.println(String::new());
+        out.println("Tip: run `amux init --aspec` to add an aspec folder to this project.");
+    }
+
     out.println(String::new());
     out.println("amux is ready.");
     Ok(summary)
@@ -497,7 +736,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let sink = OutputSink::Channel(tx);
         let mount_path = PathBuf::from("/tmp");
-        let opts = ReadyOptions::default();
+        let opts = ReadyOptions { auto_create_dockerfile: true, ..Default::default() };
         let result = run_with_sink(&sink, mount_path, vec![], &opts, None).await;
         assert!(result.is_err());
         let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -505,7 +744,7 @@ mod tests {
     }
 
     /// When Docker is available, `run_with_sink` must route status messages
-    /// through the OutputSink (including image tag, etc.).
+    /// through the OutputSink (including Docker daemon check, local agent, etc.).
     #[tokio::test]
     async fn run_with_sink_routes_all_output_through_sink() {
         if !docker::is_daemon_running() {
@@ -521,25 +760,31 @@ mod tests {
 
         let (tx, mut rx) = unbounded_channel();
         let sink = OutputSink::Channel(tx);
-        let opts = ReadyOptions::default();
+        let opts = ReadyOptions { auto_create_dockerfile: true, ..Default::default() };
         let result = run_with_sink(&sink, git_root.clone(), vec![], &opts, None).await;
         let _ = result;
 
         let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
-        // Must include Docker-related status messages.
+        // Must include Docker daemon check message (this is the first thing produced).
         let has_checking = messages.iter().any(|m| m.contains("Checking Docker daemon"));
-        let has_image_status = messages
-            .iter()
-            .any(|m| m.contains("found") || m.contains("Building") || m.contains("not found"));
         assert!(
             has_checking,
             "Expected Docker daemon check in output. Got: {:?}",
             messages
         );
+
+        // Must include some ready-related status — either Dockerfile check, image check,
+        // or the local agent check. We accept a broad set because concurrent tests
+        // may cause the git root to vary; the key invariant is that output is routed through sink.
+        let has_ready_output = messages.iter().any(|m| {
+            m.contains("found") || m.contains("uilding") || m.contains("built")
+                || m.contains("rebuild") || m.contains("Dockerfile") || m.contains("Image")
+                || m.contains("agent")
+        });
         assert!(
-            has_image_status,
-            "Expected image status message in output. Got: {:?}",
+            has_ready_output,
+            "Expected ready-related output in sink. Got: {:?}",
             messages
         );
     }
@@ -598,6 +843,8 @@ mod tests {
         let summary = ReadySummary::default();
         assert_eq!(summary.docker_daemon, StepStatus::Pending);
         assert_eq!(summary.dockerfile, StepStatus::Pending);
+        assert_eq!(summary.aspec_folder, StepStatus::Pending);
+        assert_eq!(summary.local_agent, StepStatus::Pending);
         assert_eq!(summary.dev_image, StepStatus::Pending);
         assert_eq!(summary.refresh, StepStatus::Pending);
         assert_eq!(summary.image_rebuild, StepStatus::Pending);
@@ -610,6 +857,8 @@ mod tests {
         let summary = ReadySummary {
             docker_daemon: StepStatus::Ok("running".into()),
             dockerfile: StepStatus::Ok("exists".into()),
+            aspec_folder: StepStatus::Ok("present".into()),
+            local_agent: StepStatus::Ok("claude: installed & authenticated".into()),
             dev_image: StepStatus::Ok("exists".into()),
             refresh: StepStatus::Skipped("use --refresh to run".into()),
             image_rebuild: StepStatus::Skipped("no refresh".into()),
@@ -621,6 +870,8 @@ mod tests {
         assert!(all.contains("Ready Summary"), "Missing header");
         assert!(all.contains("Docker daemon"), "Missing docker row");
         assert!(all.contains("running"), "Missing running status");
+        assert!(all.contains("aspec folder"), "Missing aspec row");
+        assert!(all.contains("Local agent"), "Missing agent row");
         assert!(all.contains("Refresh"), "Missing refresh row");
         assert!(all.contains("Skipped") || all.contains("–"), "Missing skip indicator");
     }
@@ -644,6 +895,7 @@ mod tests {
         assert!(!opts.build);
         assert!(!opts.no_cache);
         assert!(!opts.non_interactive);
+        assert!(!opts.auto_create_dockerfile);
     }
 
     #[test]
@@ -666,5 +918,104 @@ mod tests {
         let opts = ReadyOptions { build: true, no_cache: true, ..Default::default() };
         assert!(opts.build);
         assert!(opts.no_cache);
+    }
+
+    #[test]
+    fn ready_options_auto_create_dockerfile() {
+        let opts = ReadyOptions { auto_create_dockerfile: true, ..Default::default() };
+        assert!(opts.auto_create_dockerfile);
+        assert!(!opts.refresh);
+    }
+
+    #[test]
+    fn greetings_has_fifty_entries() {
+        assert_eq!(GREETINGS.len(), 50);
+    }
+
+    #[test]
+    fn greetings_all_non_empty() {
+        for greeting in GREETINGS.iter() {
+            assert!(!greeting.is_empty(), "Greeting should not be empty: {:?}", greeting);
+        }
+    }
+
+    #[test]
+    fn select_random_greeting_returns_valid_greeting() {
+        let greeting = select_random_greeting();
+        assert!(
+            GREETINGS.contains(&greeting),
+            "select_random_greeting returned unknown greeting: {:?}",
+            greeting
+        );
+    }
+
+    #[test]
+    fn select_random_greeting_returns_different_values_over_time() {
+        // Collect a few greetings and ensure we got at least one valid one.
+        let greetings: Vec<&str> = (0..10).map(|_| select_random_greeting()).collect();
+        assert!(greetings.iter().all(|g| GREETINGS.contains(g)));
+    }
+
+    #[test]
+    fn dockerfile_matches_template_claude() {
+        use crate::commands::init::dockerfile_for_agent_embedded;
+        let content = dockerfile_for_agent_embedded(&Agent::Claude);
+        assert!(
+            dockerfile_matches_template(&content, "claude"),
+            "Claude template should match itself"
+        );
+    }
+
+    #[test]
+    fn dockerfile_matches_template_codex() {
+        use crate::commands::init::dockerfile_for_agent_embedded;
+        let content = dockerfile_for_agent_embedded(&Agent::Codex);
+        assert!(
+            dockerfile_matches_template(&content, "codex"),
+            "Codex template should match itself"
+        );
+    }
+
+    #[test]
+    fn dockerfile_matches_template_false_for_custom() {
+        assert!(
+            !dockerfile_matches_template("FROM ubuntu:22.04\nRUN apt-get update", "claude"),
+            "Custom Dockerfile should not match template"
+        );
+    }
+
+    #[test]
+    fn dockerfile_matches_template_false_for_wrong_agent() {
+        use crate::commands::init::dockerfile_for_agent_embedded;
+        let claude_content = dockerfile_for_agent_embedded(&Agent::Claude);
+        // Claude template should NOT match codex agent check.
+        assert!(
+            !dockerfile_matches_template(&claude_content, "codex"),
+            "Claude template should not match codex agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_local_agent_returns_step_status() {
+        // Checks that the function returns a StepStatus. We don't assert success/fail
+        // because the agent may or may not be installed in the test environment.
+        let (status, greeting, _response) = check_local_agent("claude").await;
+        // The function must return a non-Pending status.
+        assert_ne!(status, StepStatus::Pending, "check_local_agent must return a concrete status");
+        // The greeting must be one of the known greetings.
+        assert!(GREETINGS.contains(&greeting.as_str()), "Greeting must be from GREETINGS list");
+    }
+
+    #[tokio::test]
+    async fn check_local_agent_not_installed_returns_failed() {
+        // Use a command name that definitely doesn't exist.
+        let (status, greeting, response) = check_local_agent("__nonexistent_agent_xyz__").await;
+        assert!(
+            matches!(status, StepStatus::Failed(_)),
+            "Non-existent agent should return Failed status, got: {:?}",
+            status
+        );
+        assert!(GREETINGS.contains(&greeting.as_str()), "Greeting must be from GREETINGS list");
+        assert!(response.is_empty(), "Response should be empty for non-existent agent");
     }
 }

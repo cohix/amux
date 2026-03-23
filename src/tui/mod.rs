@@ -257,8 +257,9 @@ async fn execute_command(app: &mut App, cmd: &str) {
             let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
             app.exit_rx = Some(exit_rx);
             let tx = app.output_tx.clone();
+            let aspec = parts.iter().any(|p| *p == "--aspec");
             spawn_text_command(tx, exit_tx, move |sink| async move {
-                init::run_with_sink(agent, &sink).await
+                init::run_with_sink(agent, aspec, false, false, &sink).await
             });
         }
 
@@ -267,7 +268,7 @@ async fn execute_command(app: &mut App, cmd: &str) {
             // If --refresh is set, ignore --build (refresh always rebuilds after audit).
             let effective_build = if refresh { false } else { build };
             app.pending_command = PendingCommand::Ready { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
-            app.ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
+            app.ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
             show_pre_command_dialogs(app).await;
         }
 
@@ -355,7 +356,7 @@ async fn show_pre_command_dialogs(app: &mut App) {
 async fn launch_pending_command(app: &mut App) {
     match app.pending_command.clone() {
         PendingCommand::Ready { refresh, build, no_cache, non_interactive, allow_docker } => {
-            app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker };
+            app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
             launch_ready(app).await;
         }
         PendingCommand::Implement { work_item, non_interactive, plan, allow_docker } => {

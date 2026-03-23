@@ -53,15 +53,25 @@ Navigate to your project's Git root and run:
 amux init
 ```
 
-This creates the `aspec/` directory with project specification templates and a
-`Dockerfile.dev` for building your development container. By default, the
-Claude agent is used. To choose a different agent:
+This writes `aspec/.amux.json`, downloads `Dockerfile.dev` from the agent
+template (if not already present), and interactively offers to run the agent
+audit container (which customizes `Dockerfile.dev` for your project's
+toolchain). At the end it prints a summary table and a "What's Next?" panel.
+
+To also download the `aspec/` folder (project specification templates):
+
+```sh
+amux init --aspec
+```
+
+To choose a different agent:
 
 ```sh
 amux init --agent=codex      # or opencode
+amux init --agent=claude --aspec
 ```
 
-See [init reference](usage.md#amux-init---agentname) for details.
+See [init reference](usage.md#amux-init---agentname---aspec) for details.
 
 ### 2. Verify your environment
 
@@ -69,9 +79,14 @@ See [init reference](usage.md#amux-init---agentname) for details.
 amux ready
 ```
 
-This checks that Docker is running, `Dockerfile.dev` exists, and the dev
-container image is built. If the image does not exist yet, `amux ready`
-builds it automatically.
+This checks that Docker is running, verifies the local agent is installed and
+authenticated (by sending a random greeting and displaying the response),
+checks `Dockerfile.dev` exists, and ensures the dev container image is built.
+If the image does not exist yet, `amux ready` builds it automatically. A
+summary table is shown at the end.
+
+If `Dockerfile.dev` is missing, `ready` explains what it does and asks whether
+to create it and run the agent audit. Declining fails the command.
 
 On your first run (or after changing project dependencies), use `--refresh`
 to have the agent audit your Dockerfile and add any missing tools:
@@ -80,7 +95,7 @@ to have the agent audit your Dockerfile and add any missing tools:
 amux ready --refresh
 ```
 
-See [ready reference](usage.md#amux-ready---refresh---build---no-cache---non-interactive) for all flags and options.
+See [ready reference](usage.md#amux-ready---refresh---build---no-cache---non-interactive---allow-docker) for all flags and options.
 
 ### 3. Start a chat session
 

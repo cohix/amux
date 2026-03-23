@@ -181,7 +181,8 @@ async fn init_downloads_aspec_folder_when_missing() {
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let result = init::run_with_sink(Agent::Claude, &out).await;
+    // Pass aspec=true so the aspec folder is downloaded.
+    let result = init::run_with_sink(Agent::Claude, true, false, false, &out).await;
 
     std::env::set_current_dir(original_dir).unwrap();
 
@@ -224,7 +225,8 @@ async fn init_skips_aspec_download_when_folder_exists() {
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let result = init::run_with_sink(Agent::Claude, &out).await;
+    // Pass aspec=true so init tries to download, but the folder already exists.
+    let result = init::run_with_sink(Agent::Claude, true, false, false, &out).await;
 
     std::env::set_current_dir(original_dir).unwrap();
 

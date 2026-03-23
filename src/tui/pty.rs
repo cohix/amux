@@ -172,6 +172,9 @@ mod tests {
                 }
                 Ok(PtyEvent::Exit(code)) => {
                     exit_code = Some(code);
+                    // Give the reader thread a moment to flush any in-flight data
+                    // before draining: the wait thread and reader thread race.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     // Drain any remaining Data events already in the channel.
                     while let Ok(PtyEvent::Data(bytes)) = event_rx.try_recv() {
                         let text = String::from_utf8_lossy(&bytes);

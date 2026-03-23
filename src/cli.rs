@@ -27,6 +27,9 @@ pub enum Command {
         /// Code agent to install in the Dockerfile.dev container.
         #[arg(long, value_enum, default_value = "claude")]
         agent: Agent,
+        /// Download aspec templates to the current project.
+        #[arg(long)]
+        aspec: bool,
     },
 
     /// Check Docker daemon, verify Dockerfile.dev, build image, and report status.
@@ -138,7 +141,7 @@ mod tests {
     fn init_default_agent_is_claude() {
         let cli = parse(&["amux", "init"]);
         match cli.command.unwrap() {
-            Command::Init { agent } => assert_eq!(agent.as_str(), "claude"),
+            Command::Init { agent, .. } => assert_eq!(agent.as_str(), "claude"),
             _ => panic!("expected init"),
         }
     }
@@ -147,7 +150,37 @@ mod tests {
     fn init_explicit_agent() {
         let cli = parse(&["amux", "init", "--agent", "codex"]);
         match cli.command.unwrap() {
-            Command::Init { agent } => assert_eq!(agent.as_str(), "codex"),
+            Command::Init { agent, .. } => assert_eq!(agent.as_str(), "codex"),
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn init_aspec_flag_false_by_default() {
+        let cli = parse(&["amux", "init"]);
+        match cli.command.unwrap() {
+            Command::Init { aspec, .. } => assert!(!aspec),
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn init_aspec_flag_set() {
+        let cli = parse(&["amux", "init", "--aspec"]);
+        match cli.command.unwrap() {
+            Command::Init { aspec, .. } => assert!(aspec),
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn init_aspec_with_agent() {
+        let cli = parse(&["amux", "init", "--aspec", "--agent", "codex"]);
+        match cli.command.unwrap() {
+            Command::Init { agent, aspec } => {
+                assert_eq!(agent.as_str(), "codex");
+                assert!(aspec);
+            }
             _ => panic!("expected init"),
         }
     }

@@ -14,7 +14,7 @@ use anyhow::Result;
 
 pub async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Init { agent } => init::run(agent).await,
+        Command::Init { agent, aspec } => init::run(agent, aspec).await,
         Command::Ready {
             refresh,
             build,

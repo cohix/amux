@@ -12,6 +12,12 @@ pub enum OutputSink {
 }
 
 impl OutputSink {
+    /// Returns true when the sink writes directly to a terminal (stdout),
+    /// enabling ANSI colour output. Returns false for TUI channel sinks.
+    pub fn supports_color(&self) -> bool {
+        matches!(self, OutputSink::Stdout)
+    }
+
     pub fn println(&self, s: impl Into<String>) {
         match self {
             OutputSink::Stdout => println!("{}", s.into()),

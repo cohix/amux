@@ -18,7 +18,8 @@ use amux::commands::new::{
 };
 use amux::commands::output::OutputSink;
 use amux::commands::ready::{
-    audit_entrypoint, audit_entrypoint_non_interactive, ReadyOptions, ReadySummary, StepStatus,
+    audit_entrypoint, audit_entrypoint_non_interactive,
+    ReadyOptions, ReadySummary, StepStatus,
     print_summary, print_interactive_notice,
 };
 use amux::commands::{init, new, ready};
@@ -37,7 +38,8 @@ async fn init_via_sink_produces_output_lines() {
     let sink = OutputSink::Channel(tx);
 
     // run_with_sink from inside a git repo (the amux repo itself)
-    let result = init::run_with_sink(amux::cli::Agent::Claude, &sink).await;
+    // aspec=false to avoid downloading; run_audit=false to skip Docker.
+    let result = init::run_with_sink(amux::cli::Agent::Claude, false, false, false, &sink).await;
     drop(result); // may succeed or fail; we only care that the sink was used.
 
     let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -135,6 +137,8 @@ fn ready_summary_table_outputs_all_rows() {
     let summary = ReadySummary {
         docker_daemon: StepStatus::Ok("running".into()),
         dockerfile: StepStatus::Ok("exists".into()),
+        aspec_folder: StepStatus::Ok("present".into()),
+        local_agent: StepStatus::Ok("claude: installed & authenticated".into()),
         dev_image: StepStatus::Ok("exists".into()),
         refresh: StepStatus::Skipped("use --refresh to run".into()),
         image_rebuild: StepStatus::Skipped("no refresh".into()),
@@ -157,6 +161,95 @@ fn ready_summary_table_outputs_all_rows() {
 // ---------------------------------------------------------------------------
 // 2h. interactive notice
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 2i. ready summary includes new aspec_folder and local_agent rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ready_summary_includes_aspec_and_local_agent_rows() {
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+    let summary = ReadySummary {
+        docker_daemon: StepStatus::Ok("running".into()),
+        dockerfile: StepStatus::Ok("exists".into()),
+        aspec_folder: StepStatus::Failed("missing".into()),
+        local_agent: StepStatus::Failed("claude: not installed".into()),
+        dev_image: StepStatus::Ok("exists".into()),
+        refresh: StepStatus::Skipped("use --refresh to run".into()),
+        image_rebuild: StepStatus::Skipped("no refresh".into()),
+    };
+    print_summary(&sink, &summary);
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let all = messages.join("\n");
+    assert!(all.contains("aspec folder"), "Missing aspec folder row");
+    assert!(all.contains("Local agent"), "Missing local agent row");
+    assert!(all.contains("not installed"), "Missing not-installed status");
+    assert!(all.contains("missing"), "Missing aspec missing status");
+}
+
+// ---------------------------------------------------------------------------
+// 2j. init summary and whats_next produce output (CLI/TUI parity)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_via_sink_includes_whats_next() {
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    // Run init without aspec, without audit (no Docker needed).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _ = rt.block_on(init::run_with_sink(amux::cli::Agent::Claude, false, false, false, &sink));
+
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let all = messages.join("\n");
+    // Should include summary table and what's next section.
+    assert!(all.contains("Init Summary"), "Missing init summary table");
+    assert!(all.contains("chat"), "Missing chat command in what's next");
+    assert!(all.contains("implement"), "Missing implement in what's next");
+}
+
+// ---------------------------------------------------------------------------
+// 2k. greetings array and random selection work correctly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ready_greetings_all_valid() {
+    use amux::commands::ready::{GREETINGS, select_random_greeting};
+    assert_eq!(GREETINGS.len(), 50, "Expected exactly 50 greetings");
+    let greeting = select_random_greeting();
+    assert!(GREETINGS.contains(&greeting), "Selected greeting not in list");
+}
+
+// ---------------------------------------------------------------------------
+// 2l. dockerfile_matches_template logic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ready_dockerfile_matches_template_for_claude() {
+    use amux::commands::init::dockerfile_for_agent_embedded;
+    use amux::commands::ready::dockerfile_matches_template;
+    use amux::cli::Agent;
+    let content = dockerfile_for_agent_embedded(&Agent::Claude);
+    assert!(dockerfile_matches_template(&content, "claude"));
+    assert!(!dockerfile_matches_template("FROM scratch", "claude"));
+}
+
+// ---------------------------------------------------------------------------
+// 2m. ReadyOptions auto_create_dockerfile flag
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ready_options_auto_create_dockerfile_defaults_false() {
+    let opts = ReadyOptions::default();
+    assert!(!opts.auto_create_dockerfile, "Should default to false (prompt user)");
+}
+
+#[test]
+fn ready_options_auto_create_dockerfile_can_be_set() {
+    let opts = ReadyOptions { auto_create_dockerfile: true, ..Default::default() };
+    assert!(opts.auto_create_dockerfile);
+}
 
 #[test]
 fn interactive_notice_contains_agent_info() {
