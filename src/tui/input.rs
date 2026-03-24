@@ -38,6 +38,10 @@ pub enum Action {
 
 /// Dispatch a key press to the correct handler based on application state.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+    // Any key press on the active tab counts as interaction — clear stuck warning.
+    // (Tab-switch keys also call acknowledge_stuck on the newly active tab in mod.rs.)
+    app.active_tab_mut().acknowledge_stuck();
+
     // Modal dialogs intercept all input.
     let dialog = app.active_tab().dialog.clone();
     match dialog {

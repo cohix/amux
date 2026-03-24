@@ -87,6 +87,8 @@ where
                     handle_action(&mut app, action).await;
                 }
                 Event::Mouse(mouse) => {
+                    // Any mouse interaction counts as "checking on" the tab.
+                    app.active_tab_mut().acknowledge_stuck();
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             let tab = app.active_tab_mut();
@@ -230,6 +232,8 @@ async fn handle_action(app: &mut App, action: Action) {
             if len > 0 {
                 app.active_tab_idx = (app.active_tab_idx + len - 1) % len;
             }
+            // Switching to a tab counts as "checking on it" — clear any stuck warning.
+            app.active_tab_mut().acknowledge_stuck();
         }
 
         Action::SwitchTabRight => {
@@ -237,6 +241,8 @@ async fn handle_action(app: &mut App, action: Action) {
             if len > 0 {
                 app.active_tab_idx = (app.active_tab_idx + 1) % len;
             }
+            // Switching to a tab counts as "checking on it" — clear any stuck warning.
+            app.active_tab_mut().acknowledge_stuck();
         }
 
         Action::CloseCurrentTab => {

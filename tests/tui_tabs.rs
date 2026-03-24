@@ -2,7 +2,8 @@
 ///
 /// Verifies that the `App` multi-tab manager correctly creates, switches,
 /// closes, and isolates state between `TabState` instances.
-use amux::tui::state::{App, ClawsPhase, ContainerWindowState, ExecutionPhase};
+use amux::tui::state::{App, ClawsPhase, ContainerWindowState, ExecutionPhase, STUCK_TIMEOUT};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // 1. App starts with exactly one tab
@@ -214,6 +215,109 @@ fn tab_subcommand_label_truncates_long_command() {
     let label = tab.tab_subcommand_label(20);
     assert!(label.ends_with('…'), "expected truncation ellipsis, got: {}", label);
     assert!(label.chars().count() <= 16);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. tab_color is yellow when stuck; reverts to normal after acknowledge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_color_stuck_container_is_yellow() {
+    use ratatui::style::Color;
+    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    tab.container_window = ContainerWindowState::Maximized;
+    // Simulate 61 seconds of silence.
+    tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+    assert_eq!(tab.tab_color(), Color::Yellow);
+}
+
+#[test]
+fn tab_color_reverts_to_green_after_acknowledge() {
+    use ratatui::style::Color;
+    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    tab.container_window = ContainerWindowState::Maximized;
+    tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+    assert_eq!(tab.tab_color(), Color::Yellow);
+
+    tab.acknowledge_stuck();
+    // Container is still running → should revert to green (not yellow).
+    assert_eq!(tab.tab_color(), Color::Green);
+}
+
+#[test]
+fn tab_subcommand_label_shows_warning_when_stuck() {
+    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    tab.container_window = ContainerWindowState::Maximized;
+    tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+
+    let label = tab.tab_subcommand_label(30);
+    assert!(
+        label.contains('⚠'),
+        "expected warning symbol in stuck label, got: {:?}",
+        label
+    );
+}
+
+#[test]
+fn tab_subcommand_label_clears_warning_after_acknowledge() {
+    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    tab.container_window = ContainerWindowState::Maximized;
+    tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+
+    // Stuck warning is visible.
+    assert!(tab.tab_subcommand_label(30).contains('⚠'));
+
+    // User acknowledges (switches to tab / provides input).
+    tab.acknowledge_stuck();
+    assert!(!tab.tab_subcommand_label(30).contains('⚠'));
+}
+
+#[test]
+fn stuck_state_is_independent_per_tab() {
+    use ratatui::style::Color;
+    let mut app = App::new(std::path::PathBuf::from("/tmp/a"));
+    app.create_tab(std::path::PathBuf::from("/tmp/b"));
+
+    // Tab 0: make it stuck.
+    app.tabs[0].phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    app.tabs[0].container_window = ContainerWindowState::Maximized;
+    app.tabs[0].last_output_time =
+        Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+
+    // Tab 1: running with fresh output.
+    app.tabs[1].phase = ExecutionPhase::Running { command: "implement 0002".into() };
+    app.tabs[1].container_window = ContainerWindowState::Maximized;
+    app.tabs[1].last_output_time = Some(Instant::now());
+
+    assert_eq!(app.tabs[0].tab_color(), Color::Yellow, "tab 0 should be stuck (yellow)");
+    assert_eq!(app.tabs[1].tab_color(), Color::Green, "tab 1 should not be stuck (green)");
+}
+
+#[test]
+fn acknowledging_one_tab_does_not_affect_other() {
+    use ratatui::style::Color;
+    let mut app = App::new(std::path::PathBuf::from("/tmp/a"));
+    app.create_tab(std::path::PathBuf::from("/tmp/b"));
+
+    let old_time = Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1));
+    app.tabs[0].phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    app.tabs[0].container_window = ContainerWindowState::Maximized;
+    app.tabs[0].last_output_time = Some(old_time);
+
+    app.tabs[1].phase = ExecutionPhase::Running { command: "implement 0002".into() };
+    app.tabs[1].container_window = ContainerWindowState::Maximized;
+    app.tabs[1].last_output_time = Some(old_time);
+
+    // Acknowledge only tab 1.
+    app.tabs[1].acknowledge_stuck();
+
+    // Tab 0 is still stuck; tab 1 is no longer stuck.
+    assert_eq!(app.tabs[0].tab_color(), Color::Yellow);
+    assert_eq!(app.tabs[1].tab_color(), Color::Green);
 }
 
 // ---------------------------------------------------------------------------

@@ -616,6 +616,52 @@ When the window is **unselected** (grey or red border):
 - A hint below the window reminds you: "Press ↑ to focus the window"
 - Error exit codes remain visible in red even when the window is unselected
 
+### Multi-Tab Support
+
+The TUI supports multiple simultaneous sessions — each tab runs its own
+independent project context (working directory, command, container).
+
+**Tab bar** — displayed at the top of the screen. Each tab shows:
+
+- Project name (folder name of the tab's working directory, ≤14 characters)
+- Subcommand currently running (or last run), truncated if needed
+- Arrow `➡` in the active tab's title
+
+**Tab colours** reflect the state of each tab's current command:
+
+| Colour | Meaning |
+|--------|---------|
+| Grey | Idle or completed |
+| Blue | Running (no container) |
+| Green | Running with an active container |
+| Magenta/Purple | Running a claws session |
+| Red | Exited with an error |
+| **Yellow** | Container has been **silent for 60 seconds** (stuck warning) |
+
+**Stuck tab detection** — if a running container produces no output for more
+than 60 seconds, the tab turns **yellow** and the subcommand label gains a
+**⚠️** prefix (e.g. `⚠️ implement 0001`). This alerts you that the container
+may be waiting for input or has stalled.
+
+The yellow warning is automatically cleared as soon as you:
+- Switch to the yellow tab (**Ctrl+A** / **Ctrl+D**)
+- Press any key while the tab is active
+- Scroll with the mouse wheel
+
+**Tab keyboard shortcuts:**
+
+| Key | Action |
+|-----|--------|
+| **Ctrl+T** | Open a new tab (prompts for working directory) |
+| **Ctrl+A** | Switch to the previous tab |
+| **Ctrl+D** | Switch to the next tab |
+| **Ctrl+C** (in command box, multiple tabs) | Close the current tab |
+
+Tabs are independent — each has its own output, phase, and container state.
+Background tabs continue running even when not active.
+
+---
+
 ### Autocomplete
 
 As you type, amux shows suggestions below the command box:
