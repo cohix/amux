@@ -73,7 +73,7 @@ templates/
   Dockerfile.claude        Bundled fallback via include_str! (debian:bookworm-slim base)
   Dockerfile.codex         Bundled fallback (debian:bookworm-slim base)
   Dockerfile.opencode      Bundled fallback (debian:bookworm-slim base)
-                           Primary source: downloaded from github.com/cohix/aspec-cli
+                           Primary source: downloaded from github.com/prettysmartdev/aspec-cli
 tests/
   cli_integration.rs       Binary-level integration tests
   command_tui_parity.rs    Verifies command/TUI mode share the same logic

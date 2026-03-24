@@ -126,7 +126,7 @@ There's quite a lot more I want to do with amux. The spec-driven workflow and co
 
 ## Getting Started
 
-Check out the project: [github.com/cohix/amux](https://github.com/cohix/amux).
+Check out the project: [github.com/prettysmartdev/amux](https://github.com/prettysmartdev/amux).
 
 amux is built on the idea that the best agentic coding happens when agents have clear context (specs) and hard boundaries (containers).
 

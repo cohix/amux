@@ -1,61 +1,131 @@
 <p align="center">
-  <strong>Secure, Predictable Code and Claw Agents</strong> <br>
-  Run agents inside containers, not on your machine.<br>
-  Use structured Markdown specs to guide agents for predictable results.
-  <br>
+  <strong>Secure multi-agent TUI for code and claw agents.</strong> <br>
+  Run and manage agents in parallel. <br>
+  Keep your machine safe with containers.<br>
   <br>
   <img src="./docs/amux_logo_v3.svg" width="420" alt="AMUX">
 </p>
 
-
 <p align="center">
-  <img src="https://github.com/cohix/amux/actions/workflows/test.yml/badge.svg">
+  <img src="https://github.com/prettysmartdev/amux/actions/workflows/test.yml/badge.svg">
+</p>
 
 ## What is `amux`?
 
-Claw-like and code agents are powerful, but running them directly on your machine means giving them unrestricted access to your filesystem, environment, and credentials. One bad prompt or hallucination can be dangerous.
+`amux` is a terminal multiplexer for AI code and claw agents. It gives you an interactive TUI where you can launch, monitor, and coordinate multiple agent sessions at the same time — each running safely inside its own container, isolated from your host machine.
 
-**amux** is a CLI that takes a different approach:
+Think of it like tmux for agents: tabs, live output, scrollback, container stats, and stuck-session detection, all in your terminal.
 
-- **Containerized by design** — every agent action runs inside a Docker container. Your host machine is never exposed to agent-generated code execution.
-- **Spec-driven development** — define your project's architecture, security constraints, and design decisions in structured spec files. Agents read these specs to produce code that fits your project, not just code that compiles.
-- **Predictable workflows** — work items, environment setup, and agent sessions follow a repeatable process. No more ad-hoc prompting with inconsistent results.
-- **Agent-agnostic** — supports Nanoclaw, Claude Code, Codex, and OpenCode out of the box. Swap agents without changing your workflow.
+---
 
-`amux` is built on the idea that agents are best used when they have clear context (specs) and hard boundaries (containers).
+## Why `amux`?
 
-`amux` pairs with `aspec` for spec-driven-development templates. Learn more about the [aspec methodology](https://github.com/cohix/aspec).
+Running agents one at a time is slow. Running them directly on your machine is risky. `amux` solves both:
+
+- **Parallel sessions** — open multiple tabs, each running a different agent against the same or different projects simultaneously
+- **Hard isolation** — every agent runs in a container; your filesystem, credentials, and environment are never exposed to agent-generated code execution
+- **Secure claw agents** — `amux` sets up and manages a fully containerized nanoclaw install that lives securely on your machine for 24/7 subagents, workflows, and messaging app chat.
+- **Agent-agnostic** — supports Claude Code, Nanoclaw, Codex, and OpenCode out of the box
+
+---
+
+## The TUI
+
+Running `amux` with no arguments opens the interactive TUI:
+
+```sh
+amux
+```
+
+```
+┌── amux · implement 0001 ─┐ ┌── api · chat ─────────┐ ┌── +
+│➡ implement 0001          │ │  chat                  │
+└──────────────────────────┘ └────────────────────────┘
+
+┌─── ● running: implement 0001 ───────────────────────────────┐
+│ $ docker run --rm -it --name amux-12345 ...                  │
+│ ╭─ 🔒 Claude Code (containerized) ── amux-12345 | 5% | 200mb ─╮│
+│ │                                                              ││
+│ │  [Agent output here...]                                      ││
+│ │                                                              ││
+│ ╰──────────────────────────────────────────────────────────────╯│
+└──────────────────────────────────────────────────────────────────┘
+┌─── command ──────────────────────────────────────────────────────┐
+│ > _                                                              │
+└──────────────────────────────────────────────────────────────────┘
+  init  ·  ready  ·  implement  ·  chat  ·  new
+```
+
+### Multi-tab agent coordination
+
+Each tab is fully independent — its own working directory, running command, and container session. Tabs continue running in the background when you switch away.
+
+Tab colors reflect live state:
+
+| Color | Meaning |
+|-------|---------|
+| Grey | Idle |
+| Blue | Command running |
+| Green | Agent container active |
+| Purple | Claw session running |
+| Red | Exited with error |
+| Yellow | stuck agent detected |
+
+Stuck tab detection: amux detects when an agent is stuck and needs help, it will alert you with a yellow tab so you can intervene.
+
+### Interactive container terminal
+
+When an agent container starts, a dedicated terminal appears with:
+- Full interactive terminal emulator (arrow keys, Ctrl+O, all agent shortcuts work natively)
+- Mouse scroll for terminal scrollback history
+- Live container stats: CPU, memory, total runtime
+- Press **Esc** to minimize (agent keeps running); **c** to maximize
+
+---
+
+## Claw agent management
+
+`amux claws` commands set up and manage a persistent [nanoclaw](https://github.com/qwibitai/nanoclaw) container — a machine-global background agent with Docker socket access, designed for long-running, scheduled, or cross-project work. Accessible via your messaging app of choice.
+
+```sh
+amux claws ready    # guided setup and status
+```
+
+The nanoclaw container:
+- Runs persistently in the background across `amux` sessions
+- Survives reboots (check status with `claws ready`)
+- Has Docker socket access to build and run containers on your behalf
+- Manage seamlessly via the amux TUI
+
+---
+
+## Security
+
+`amux` enforces a hard boundary: **agents never execute on the host machine**.
+
+- All agent code runs inside containers built from `Dockerfile.dev`
+- `amux` will automatically scan your project to create a `Dockerfile.dev` with every tool needed for your workflow
+- Only the current Git repository is mounted — never parent directories
+- Your code agent is automatically configured and authenticated with secure copies of config files and OAuth tokens from your host installation.
+- `amux` itself is a statically compiled Rust binary — memory-safe and unmodifiable by agents
+- Every Docker command is printed in full before execution so you can see exactly what runs
 
 ---
 
 ## Quick Start
 
-See the [Getting Started Guide](docs/getting-started.md) for a complete walkthrough.
+```sh
+# 1. Initialize your repo (only once)
+amux init
 
-All agent sessions run in Docker containers with your project directory mounted. The agent can read and write your code, but cannot execute anything on your host.
+# 2. Open the TUI and start an agent session
+amux
 
----
-## Security first
+# 3. Then run an amux command (starts an agent chat session)
+chat
+```
 
-amux enforces a hard security boundary: **agents never execute on the host machine**.
-
-- All agent code runs inside Docker containers built from `Dockerfile.dev`
-- Only the current Git repository is mounted — never parent directories
-- amux itself is a statically compiled Rust binary - memory safe and immutable by agents
-- Docker commands are displayed in full so you can see exactly what runs
-
-See the [Usage Guide](docs/usage.md#agent-authentication) for details on credential handling.
-
----
-
-## Spec-driven for predictability
-
-`aspec` templates can be added to your project by `amux init`, allowing you to define the entire structure and best practices for your project:
-- Architecture, design, components, and infrastruction
-- Security, operations, CI/CD, and local development
-- Work items that define specs for a new feature, bugfix, or enhancement
-
-Your agent co-worker uses the project's `aspec` to remain grounded in your desired software development standards, and keeps everyting that was fed into the agent directly within the project iself. Agents gain sorely needed context, humans gain predictability by covering edge cases, testing, and more.
+See the [Getting Started Guide](docs/getting-started.md) for a full walkthrough.
 
 ---
 
@@ -63,7 +133,7 @@ Your agent co-worker uses the project's `aspec` to remain grounded in your desir
 
 ### From releases
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/cohix/amux/releases).
+Download the latest binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
 
 | Platform | Binary |
 |----------|--------|
@@ -78,10 +148,11 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 Requires Rust 1.94+ and make:
 
 ```sh
-git clone https://github.com/cohix/amux.git
+git clone https://github.com/prettysmartdev/amux.git
 cd amux
-make install
+sudo make install
 ```
+
 ---
 
 ## Development
@@ -92,6 +163,7 @@ make install  # build + install to /usr/local/bin/
 make test     # run all tests
 make clean    # clean build artifacts
 ```
+
 ---
 
 ## Full Documentation

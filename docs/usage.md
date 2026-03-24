@@ -78,7 +78,7 @@ Initialises the current Git repository for use with `amux`.
 
 **`--aspec`**
 
-When passed, downloads the `aspec/` folder from `github.com/cohix/aspec` to
+When passed, downloads the `aspec/` folder from `github.com/prettysmartdev/aspec` to
 provide project specification templates and work item scaffolding. If the
 folder already exists it is left untouched. Without `--aspec`, the folder
 download is skipped and noted in the summary table.
@@ -460,7 +460,7 @@ stdin prompts.
 hyphens, and all non-alphanumeric characters (except hyphens) are removed.
 
 **Edge case**: If no template is found in the current Git root, `amux` will
-automatically download the `aspec/` folder from GitHub (`github.com/cohix/aspec`)
+automatically download the `aspec/` folder from GitHub (`github.com/prettysmartdev/aspec`)
 to provide the template. If the download also fails, an error message is displayed.
 
 **Example**
