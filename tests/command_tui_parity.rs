@@ -688,27 +688,27 @@ fn autocomplete_new_shows_hint() {
 fn container_window_lifecycle() {
     use amux::tui::state::{App, ContainerWindowState, ExecutionPhase};
 
-    let mut app = App::new();
-    assert_eq!(app.container_window, ContainerWindowState::Hidden);
+    let mut app = App::new(std::path::PathBuf::new());
+    assert_eq!(app.active_tab().container_window, ContainerWindowState::Hidden);
 
     // Start a container.
-    app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-    app.start_container("amux-test-123".into(), "Claude Code".into(), 78, 18);
-    assert_eq!(app.container_window, ContainerWindowState::Maximized);
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    app.active_tab_mut().start_container("amux-test-123".into(), "Claude Code".into(), 78, 18);
+    assert_eq!(app.active_tab().container_window, ContainerWindowState::Maximized);
 
     // Minimize.
-    app.container_window = ContainerWindowState::Minimized;
-    assert_eq!(app.container_window, ContainerWindowState::Minimized);
+    app.active_tab_mut().container_window = ContainerWindowState::Minimized;
+    assert_eq!(app.active_tab().container_window, ContainerWindowState::Minimized);
 
     // Restore.
-    app.container_window = ContainerWindowState::Maximized;
-    assert_eq!(app.container_window, ContainerWindowState::Maximized);
+    app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+    assert_eq!(app.active_tab().container_window, ContainerWindowState::Maximized);
 
     // Container exits → summary created, window hidden.
-    app.finish_command(0);
-    assert_eq!(app.container_window, ContainerWindowState::Hidden);
-    assert!(app.last_container_summary.is_some());
-    let summary = app.last_container_summary.as_ref().unwrap();
+    app.active_tab_mut().finish_command(0);
+    assert_eq!(app.active_tab().container_window, ContainerWindowState::Hidden);
+    assert!(app.active_tab().last_container_summary.is_some());
+    let summary = app.active_tab().last_container_summary.as_ref().unwrap();
     assert_eq!(summary.exit_code, 0);
     assert_eq!(summary.agent_display_name, "Claude Code");
     assert_eq!(summary.container_name, "amux-test-123");
@@ -722,25 +722,25 @@ fn container_window_lifecycle() {
 fn container_pty_output_routing() {
     use amux::tui::state::{App, ExecutionPhase};
 
-    let mut app = App::new();
-    app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    let mut app = App::new(std::path::PathBuf::new());
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
 
     // Without container window: PTY data goes to output_lines.
-    app.process_pty_data(b"outer line\n");
-    assert!(app.output_lines.iter().any(|l| l == "outer line"));
-    assert!(app.vt100_parser.is_none());
+    app.active_tab_mut().process_pty_data(b"outer line\n");
+    assert!(app.active_tab().output_lines.iter().any(|l| l == "outer line"));
+    assert!(app.active_tab().vt100_parser.is_none());
 
     // Activate container window: PTY data goes to vt100 parser.
-    app.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
-    assert!(app.vt100_parser.is_some());
+    app.active_tab_mut().start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+    assert!(app.active_tab().vt100_parser.is_some());
     // Feed data through the vt100 parser (simulating what tick() does).
-    if let Some(ref mut parser) = app.vt100_parser {
+    if let Some(ref mut parser) = app.active_tab_mut().vt100_parser {
         parser.process(b"container line\r\n");
     }
-    let screen_text = app.vt100_parser.as_ref().unwrap().screen().contents();
+    let screen_text = app.active_tab().vt100_parser.as_ref().unwrap().screen().contents();
     assert!(screen_text.contains("container line"), "vt100 screen should contain container output");
     // The outer window should still have "outer line" from before.
-    assert!(app.output_lines.iter().any(|l| l == "outer line"));
+    assert!(app.active_tab().output_lines.iter().any(|l| l == "outer line"));
 }
 
 // ---------------------------------------------------------------------------
@@ -817,20 +817,20 @@ fn pty_args_container_name() {
 fn container_summary_averages_stats() {
     use amux::tui::state::{App, ExecutionPhase};
 
-    let mut app = App::new();
-    app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-    app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+    let mut app = App::new(std::path::PathBuf::new());
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+    app.active_tab_mut().start_container("amux-test".into(), "Claude Code".into(), 78, 18);
 
     // Simulate stats history.
-    if let Some(ref mut info) = app.container_info {
+    if let Some(ref mut info) = app.active_tab_mut().container_info {
         info.stats_history.push((10.0, 100.0));
         info.stats_history.push((20.0, 200.0));
         info.stats_history.push((30.0, 300.0));
     }
 
-    app.finish_command(0);
+    app.active_tab_mut().finish_command(0);
 
-    let summary = app.last_container_summary.as_ref().unwrap();
+    let summary = app.active_tab().last_container_summary.as_ref().unwrap();
     assert_eq!(summary.avg_cpu, "20.0%");
     assert_eq!(summary.avg_memory, "200MiB");
 }

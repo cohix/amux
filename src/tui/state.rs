@@ -32,6 +32,10 @@ pub enum ExecutionPhase {
 pub enum Dialog {
     None,
     QuitConfirm,
+    /// Prompts user for new tab's working directory.
+    NewTabDirectory { input: String },
+    /// Close current tab (when idle + multiple tabs).
+    CloseTabConfirm,
     /// Ask whether to mount the Git root or just CWD.
     MountScope { git_root: PathBuf, cwd: PathBuf },
     /// Ask whether to mount agent credentials (and save the decision).
@@ -170,8 +174,10 @@ pub enum ReadyPhase {
     PostAudit,
 }
 
-/// All application state for the TUI event loop.
-pub struct App {
+/// Per-tab application state for the TUI event loop.
+pub struct TabState {
+    /// Working directory for this tab.
+    pub cwd: PathBuf,
     pub focus: Focus,
     pub phase: ExecutionPhase,
     pub dialog: Dialog,
@@ -249,9 +255,6 @@ pub struct App {
     /// Held here so the temp dir lives as long as the container runs; dropped on finish.
     pub host_settings: Option<docker::HostSettings>,
 
-    /// Set to true to break out of the event loop.
-    pub should_quit: bool,
-
     // --- Claws wizard state ---
     /// Which phase of the claws workflow is active.
     pub claws_phase: ClawsPhase,
@@ -275,10 +278,11 @@ pub struct App {
     pub claws_docker_accept_response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
-impl App {
-    pub fn new() -> Self {
+impl TabState {
+    pub fn new(cwd: PathBuf) -> Self {
         let (output_tx, output_rx) = mpsc::unbounded_channel();
         Self {
+            cwd,
             focus: Focus::CommandBox,
             phase: ExecutionPhase::Idle,
             dialog: Dialog::None,
@@ -309,7 +313,6 @@ impl App {
             last_container_summary: None,
             stats_rx: None,
             host_settings: None,
-            should_quit: false,
             claws_phase: ClawsPhase::Inactive,
             claws_container_id: None,
             claws_container_id_rx: None,
@@ -568,6 +571,64 @@ impl App {
         }
     }
 
+    /// Color for the tab indicator based on current phase and container state.
+    pub fn tab_color(&self) -> Color {
+        match &self.phase {
+            ExecutionPhase::Error { .. } => Color::Red,
+            ExecutionPhase::Running { command } => {
+                if self.claws_phase != ClawsPhase::Inactive || command.starts_with("claws") {
+                    Color::Magenta
+                } else if self.container_window != ContainerWindowState::Hidden {
+                    Color::Green
+                } else {
+                    Color::Blue
+                }
+            }
+            ExecutionPhase::Idle | ExecutionPhase::Done { .. } => Color::DarkGray,
+        }
+    }
+
+    /// Project folder name for the tab border title (≤14 chars).
+    pub fn tab_project_name(&self) -> String {
+        let name = self.cwd.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        if name.chars().count() > 14 {
+            let t: String = name.chars().take(13).collect();
+            format!("{}…", t)
+        } else {
+            name
+        }
+    }
+
+    /// Full subcommand shown inside the tab box, truncated if wider than the tab.
+    /// `tab_width` is the total width of the tab widget (including borders).
+    /// Empty string when idle.
+    pub fn tab_subcommand_label(&self, tab_width: u16) -> String {
+        let cmd = match &self.phase {
+            ExecutionPhase::Idle => return String::new(),
+            ExecutionPhase::Running { command }
+            | ExecutionPhase::Done { command }
+            | ExecutionPhase::Error { command, .. } => command.as_str(),
+        };
+        // Inner width: tab_width minus 2 borders minus 2 padding spaces.
+        let max_chars = tab_width.saturating_sub(4) as usize;
+        if cmd.chars().count() > max_chars && max_chars > 1 {
+            let truncated: String = cmd.chars().take(max_chars - 1).collect();
+            format!("{}…", truncated)
+        } else {
+            cmd.to_string()
+        }
+    }
+
+    /// Combined display name for the tab: "projname" or "projname | cmd".
+    pub fn tab_display_name(&self) -> String {
+        let proj = self.tab_project_name();
+        let cmd = self.tab_subcommand_label(20);
+        if cmd.is_empty() { proj } else { format!("{} | {}", proj, cmd) }
+    }
+
     /// Poll all channels for new data; called once per event loop tick.
     pub fn tick(&mut self) {
         // Drain text command output.
@@ -663,276 +724,332 @@ impl App {
     }
 }
 
+/// Top-level application state: manages multiple tabs.
+pub struct App {
+    pub tabs: Vec<TabState>,
+    pub active_tab_idx: usize,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new(cwd: std::path::PathBuf) -> Self {
+        Self {
+            tabs: vec![TabState::new(cwd)],
+            active_tab_idx: 0,
+            should_quit: false,
+        }
+    }
+
+    pub fn active_tab(&self) -> &TabState {
+        &self.tabs[self.active_tab_idx]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active_tab_idx]
+    }
+
+    /// Create a new tab immediately after the active tab. Returns the new tab index.
+    pub fn create_tab(&mut self, cwd: std::path::PathBuf) -> usize {
+        let new_idx = self.active_tab_idx + 1;
+        self.tabs.insert(new_idx, TabState::new(cwd));
+        new_idx
+    }
+
+    /// Close the tab at `idx`. Adjusts `active_tab_idx`.
+    /// If only one tab remains, sets `should_quit`.
+    pub fn close_tab(&mut self, idx: usize) {
+        if self.tabs.len() <= 1 {
+            self.should_quit = true;
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.active_tab_idx >= self.tabs.len() {
+            self.active_tab_idx = self.tabs.len() - 1;
+        }
+    }
+
+    /// Call `tick()` on every tab so background PTY sessions stay live.
+    pub fn tick_all(&mut self) {
+        for tab in &mut self.tabs {
+            tab.tick();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn new_tab() -> TabState {
+        TabState::new(std::path::PathBuf::new())
+    }
+
     #[test]
     fn window_border_color_blue_when_selected_and_running() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "ready".into() };
-        app.focus = Focus::ExecutionWindow;
-        assert_eq!(app.window_border_color(), Color::Blue);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "ready".into() };
+        tab.focus = Focus::ExecutionWindow;
+        assert_eq!(tab.window_border_color(), Color::Blue);
     }
 
     #[test]
     fn window_border_color_grey_when_unselected_running() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "ready".into() };
-        app.focus = Focus::CommandBox;
-        assert_eq!(app.window_border_color(), Color::Gray);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "ready".into() };
+        tab.focus = Focus::CommandBox;
+        assert_eq!(tab.window_border_color(), Color::Gray);
     }
 
     #[test]
     fn window_border_color_green_when_selected_and_done() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Done { command: "ready".into() };
-        app.focus = Focus::ExecutionWindow;
-        assert_eq!(app.window_border_color(), Color::Green);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Done { command: "ready".into() };
+        tab.focus = Focus::ExecutionWindow;
+        assert_eq!(tab.window_border_color(), Color::Green);
     }
 
     #[test]
     fn window_border_color_grey_when_unselected_done() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Done { command: "ready".into() };
-        app.focus = Focus::CommandBox;
-        assert_eq!(app.window_border_color(), Color::Gray);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Done { command: "ready".into() };
+        tab.focus = Focus::CommandBox;
+        assert_eq!(tab.window_border_color(), Color::Gray);
     }
 
     #[test]
     fn window_border_color_red_on_error_selected() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
-        app.focus = Focus::ExecutionWindow;
-        assert_eq!(app.window_border_color(), Color::Red);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
+        tab.focus = Focus::ExecutionWindow;
+        assert_eq!(tab.window_border_color(), Color::Red);
     }
 
     #[test]
     fn window_border_color_red_on_error_unselected() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
-        app.focus = Focus::CommandBox;
-        assert_eq!(app.window_border_color(), Color::Red);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
+        tab.focus = Focus::CommandBox;
+        assert_eq!(tab.window_border_color(), Color::Red);
     }
 
     #[test]
     fn start_command_clears_output_and_focuses_window() {
-        let mut app = App::new();
-        app.output_lines.push("old line".into());
-        app.start_command("ready".into());
-        assert!(app.output_lines.is_empty());
-        assert_eq!(app.focus, Focus::ExecutionWindow);
-        assert!(matches!(app.phase, ExecutionPhase::Running { .. }));
+        let mut tab = new_tab();
+        tab.output_lines.push("old line".into());
+        tab.start_command("ready".into());
+        assert!(tab.output_lines.is_empty());
+        assert_eq!(tab.focus, Focus::ExecutionWindow);
+        assert!(matches!(tab.phase, ExecutionPhase::Running { .. }));
     }
 
     #[test]
     fn continue_command_preserves_output() {
-        let mut app = App::new();
-        app.output_lines.push("phase 1 output".into());
-        app.output_lines.push("more output".into());
-        app.continue_command("phase 2".into());
+        let mut tab = new_tab();
+        tab.output_lines.push("phase 1 output".into());
+        tab.output_lines.push("more output".into());
+        tab.continue_command("phase 2".into());
         // Output from previous phase must be preserved.
-        assert_eq!(app.output_lines.len(), 2);
-        assert_eq!(app.output_lines[0], "phase 1 output");
-        assert!(matches!(app.phase, ExecutionPhase::Running { .. }));
-        assert_eq!(app.focus, Focus::ExecutionWindow);
+        assert_eq!(tab.output_lines.len(), 2);
+        assert_eq!(tab.output_lines[0], "phase 1 output");
+        assert!(matches!(tab.phase, ExecutionPhase::Running { .. }));
+        assert_eq!(tab.focus, Focus::ExecutionWindow);
     }
 
     #[test]
     fn finish_command_zero_transitions_to_done() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "init".into() };
-        app.finish_command(0);
-        assert!(matches!(app.phase, ExecutionPhase::Done { .. }));
-        assert_eq!(app.focus, Focus::CommandBox);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "init".into() };
+        tab.finish_command(0);
+        assert!(matches!(tab.phase, ExecutionPhase::Done { .. }));
+        assert_eq!(tab.focus, Focus::CommandBox);
     }
 
     #[test]
     fn finish_command_nonzero_transitions_to_error() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "ready".into() };
-        app.finish_command(1);
-        assert!(matches!(app.phase, ExecutionPhase::Error { exit_code: 1, .. }));
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "ready".into() };
+        tab.finish_command(1);
+        assert!(matches!(tab.phase, ExecutionPhase::Error { exit_code: 1, .. }));
     }
 
     #[test]
     fn pty_data_newlines_create_separate_lines() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
-        app.process_pty_data(b"Hello\nWorld\n");
-        assert_eq!(app.output_lines, vec!["Hello", "World"]);
-        assert!(!app.pty_live_line);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
+        tab.process_pty_data(b"Hello\nWorld\n");
+        assert_eq!(tab.output_lines, vec!["Hello", "World"]);
+        assert!(!tab.pty_live_line);
     }
 
     #[test]
     fn pty_data_cr_overwrites_current_line() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // First chunk: spinner frame 1
-        app.process_pty_data(b"Thinking...");
-        assert_eq!(app.output_lines, vec!["Thinking..."]);
-        assert!(app.pty_live_line);
+        tab.process_pty_data(b"Thinking...");
+        assert_eq!(tab.output_lines, vec!["Thinking..."]);
+        assert!(tab.pty_live_line);
 
         // Second chunk: \r clears the buffer, "Done!" overwrites the live line
-        app.process_pty_data(b"\rDone!      ");
-        assert_eq!(app.output_lines, vec!["Done!      "]);
-        assert!(app.pty_live_line);
+        tab.process_pty_data(b"\rDone!      ");
+        assert_eq!(tab.output_lines, vec!["Done!      "]);
+        assert!(tab.pty_live_line);
 
         // Newline finalises the line
-        app.process_pty_data(b"\n");
-        assert_eq!(app.output_lines, vec!["Done!      "]);
-        assert!(!app.pty_live_line);
+        tab.process_pty_data(b"\n");
+        assert_eq!(tab.output_lines, vec!["Done!      "]);
+        assert!(!tab.pty_live_line);
     }
 
     #[test]
     fn pty_data_cr_lf_treated_as_newline() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
-        app.process_pty_data(b"Hello\r\nWorld\r\n");
-        assert_eq!(app.output_lines, vec!["Hello", "World"]);
-        assert!(!app.pty_live_line);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
+        tab.process_pty_data(b"Hello\r\nWorld\r\n");
+        assert_eq!(tab.output_lines, vec!["Hello", "World"]);
+        assert!(!tab.pty_live_line);
     }
 
     #[test]
     fn pty_data_multiple_cr_in_one_chunk() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // Multiple carriage returns in one chunk — each \r clears the buffer
         // so only the final frame survives (overwrite behavior).
-        app.process_pty_data(b"frame1\rframe2\rframe3\n");
-        assert_eq!(app.output_lines, vec!["frame3"]);
+        tab.process_pty_data(b"frame1\rframe2\rframe3\n");
+        assert_eq!(tab.output_lines, vec!["frame3"]);
     }
 
     #[test]
     fn pty_data_cr_lf_split_across_chunks() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // \r\n split: \r at end of chunk 1, \n at start of chunk 2.
         // Must be treated as a newline, NOT as bare \r (which would lose text).
-        app.process_pty_data(b"Hello\r");
-        assert!(app.pty_pending_cr, "should defer \\r at end of chunk");
+        tab.process_pty_data(b"Hello\r");
+        assert!(tab.pty_pending_cr, "should defer \\r at end of chunk");
         // The text should still be visible as a live line while pending.
-        assert_eq!(app.output_lines, vec!["Hello"]);
+        assert_eq!(tab.output_lines, vec!["Hello"]);
 
-        app.process_pty_data(b"\nWorld\r\n");
-        assert!(!app.pty_pending_cr);
-        assert_eq!(app.output_lines, vec!["Hello", "World"]);
-        assert!(!app.pty_live_line);
+        tab.process_pty_data(b"\nWorld\r\n");
+        assert!(!tab.pty_pending_cr);
+        assert_eq!(tab.output_lines, vec!["Hello", "World"]);
+        assert!(!tab.pty_live_line);
     }
 
     #[test]
     fn pty_data_cr_split_then_bare_cr() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // \r at end of chunk, but next chunk does NOT start with \n → bare \r.
-        app.process_pty_data(b"old text\r");
-        assert!(app.pty_pending_cr);
+        tab.process_pty_data(b"old text\r");
+        assert!(tab.pty_pending_cr);
 
-        app.process_pty_data(b"new text\n");
-        assert!(!app.pty_pending_cr);
+        tab.process_pty_data(b"new text\n");
+        assert!(!tab.pty_pending_cr);
         // bare \r clears the buffer, so "new text" overwrites "old text".
-        assert_eq!(app.output_lines, vec!["new text"]);
+        assert_eq!(tab.output_lines, vec!["new text"]);
     }
 
     #[test]
     fn pty_data_empty_chunk_preserves_pending_cr() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
-        app.process_pty_data(b"text\r");
-        assert!(app.pty_pending_cr);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
+        tab.process_pty_data(b"text\r");
+        assert!(tab.pty_pending_cr);
         // Empty chunk should not resolve the pending \r.
-        app.process_pty_data(b"");
-        assert!(app.pty_pending_cr);
+        tab.process_pty_data(b"");
+        assert!(tab.pty_pending_cr);
     }
 
     #[test]
     fn pty_data_control_chars_filtered() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // BEL (0x07) and BS (0x08) should be filtered out of the line buffer.
-        app.process_pty_data(b"Hello\x07World\x08!\n");
-        assert_eq!(app.output_lines, vec!["HelloWorld!"]);
+        tab.process_pty_data(b"Hello\x07World\x08!\n");
+        assert_eq!(tab.output_lines, vec!["HelloWorld!"]);
     }
 
     #[test]
     fn pty_data_tabs_stripped_by_ansi_strip() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
         // strip_ansi_escapes also removes tabs; verify they don't cause issues.
-        app.process_pty_data(b"col1\tcol2\n");
-        assert_eq!(app.output_lines, vec!["col1col2"]);
+        tab.process_pty_data(b"col1\tcol2\n");
+        assert_eq!(tab.output_lines, vec!["col1col2"]);
     }
 
     // --- Container window tests ---
 
     #[test]
     fn container_window_starts_hidden() {
-        let app = App::new();
-        assert_eq!(app.container_window, ContainerWindowState::Hidden);
-        assert!(app.container_info.is_none());
-        assert!(app.vt100_parser.is_none());
-        assert!(app.last_container_summary.is_none());
+        let tab = new_tab();
+        assert_eq!(tab.container_window, ContainerWindowState::Hidden);
+        assert!(tab.container_info.is_none());
+        assert!(tab.vt100_parser.is_none());
+        assert!(tab.last_container_summary.is_none());
     }
 
     #[test]
     fn start_container_activates_window() {
-        let mut app = App::new();
-        app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
-        assert_eq!(app.container_window, ContainerWindowState::Maximized);
-        assert!(app.container_info.is_some());
-        assert!(app.vt100_parser.is_some());
-        let info = app.container_info.as_ref().unwrap();
+        let mut tab = new_tab();
+        tab.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+        assert_eq!(tab.container_window, ContainerWindowState::Maximized);
+        assert!(tab.container_info.is_some());
+        assert!(tab.vt100_parser.is_some());
+        let info = tab.container_info.as_ref().unwrap();
         assert_eq!(info.container_name, "amux-test");
         assert_eq!(info.agent_display_name, "Claude Code");
     }
 
     #[test]
     fn pty_data_routes_to_vt100_when_container_active() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
 
         // Feed data through the vt100 parser (simulating what tick() does).
-        if let Some(ref mut parser) = app.vt100_parser {
+        if let Some(ref mut parser) = tab.vt100_parser {
             parser.process(b"Hello from container\r\n");
         }
 
         // Output goes to vt100 screen, not outer window lines.
-        let screen_text = app.vt100_parser.as_ref().unwrap().screen().contents();
+        let screen_text = tab.vt100_parser.as_ref().unwrap().screen().contents();
         assert!(
             screen_text.contains("Hello from container"),
             "vt100 screen should contain container output"
         );
         assert!(
-            app.output_lines.is_empty()
-                || !app.output_lines.iter().any(|l| l.contains("Hello from container")),
+            tab.output_lines.is_empty()
+                || !tab.output_lines.iter().any(|l| l.contains("Hello from container")),
             "Outer window should not contain container output"
         );
     }
 
     #[test]
     fn pty_data_routes_to_outer_when_no_container() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "test".into() };
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "test".into() };
 
-        app.process_pty_data(b"Hello outer\n");
-        assert_eq!(app.output_lines, vec!["Hello outer"]);
-        assert!(app.vt100_parser.is_none());
+        tab.process_pty_data(b"Hello outer\n");
+        assert_eq!(tab.output_lines, vec!["Hello outer"]);
+        assert!(tab.vt100_parser.is_none());
     }
 
     #[test]
     fn finish_command_closes_container_and_creates_summary() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
 
-        app.finish_command(0);
+        tab.finish_command(0);
 
-        assert_eq!(app.container_window, ContainerWindowState::Hidden);
-        assert!(app.container_info.is_none());
-        assert!(app.vt100_parser.is_none());
-        assert!(app.last_container_summary.is_some());
-        let summary = app.last_container_summary.as_ref().unwrap();
+        assert_eq!(tab.container_window, ContainerWindowState::Hidden);
+        assert!(tab.container_info.is_none());
+        assert!(tab.vt100_parser.is_none());
+        assert!(tab.last_container_summary.is_some());
+        let summary = tab.last_container_summary.as_ref().unwrap();
         assert_eq!(summary.container_name, "amux-test");
         assert_eq!(summary.agent_display_name, "Claude Code");
         assert_eq!(summary.exit_code, 0);
@@ -940,20 +1057,20 @@ mod tests {
 
     #[test]
     fn finish_command_with_error_records_exit_code() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
 
-        app.finish_command(1);
+        tab.finish_command(1);
 
-        let summary = app.last_container_summary.as_ref().unwrap();
+        let summary = tab.last_container_summary.as_ref().unwrap();
         assert_eq!(summary.exit_code, 1);
     }
 
     #[test]
     fn start_container_clears_previous_summary() {
-        let mut app = App::new();
-        app.last_container_summary = Some(LastContainerSummary {
+        let mut tab = new_tab();
+        tab.last_container_summary = Some(LastContainerSummary {
             agent_display_name: "old".into(),
             container_name: "old".into(),
             avg_cpu: "0%".into(),
@@ -962,8 +1079,8 @@ mod tests {
             exit_code: 0,
         });
 
-        app.start_container("amux-new".into(), "Claude Code".into(), 78, 18);
-        assert!(app.last_container_summary.is_none());
+        tab.start_container("amux-new".into(), "Claude Code".into(), 78, 18);
+        assert!(tab.last_container_summary.is_none());
     }
 
     #[test]
@@ -1000,87 +1117,204 @@ mod tests {
 
     #[test]
     fn container_stats_history_used_for_averages() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
 
         // Simulate stats arriving
-        if let Some(ref mut info) = app.container_info {
+        if let Some(ref mut info) = tab.container_info {
             info.stats_history.push((5.0, 200.0));
             info.stats_history.push((10.0, 300.0));
         }
 
-        app.finish_command(0);
+        tab.finish_command(0);
 
-        let summary = app.last_container_summary.as_ref().unwrap();
+        let summary = tab.last_container_summary.as_ref().unwrap();
         assert_eq!(summary.avg_cpu, "7.5%");
         assert_eq!(summary.avg_memory, "250MiB");
     }
 
     #[test]
     fn container_scroll_offset_starts_at_zero() {
-        let app = App::new();
-        assert_eq!(app.container_scroll_offset, 0);
+        let tab = new_tab();
+        assert_eq!(tab.container_scroll_offset, 0);
     }
 
     #[test]
     fn start_container_resets_scroll_offset() {
-        let mut app = App::new();
-        app.container_scroll_offset = 10;
-        app.start_container("test".into(), "Agent".into(), 80, 24);
-        assert_eq!(app.container_scroll_offset, 0);
+        let mut tab = new_tab();
+        tab.container_scroll_offset = 10;
+        tab.start_container("test".into(), "Agent".into(), 80, 24);
+        assert_eq!(tab.container_scroll_offset, 0);
     }
 
     #[test]
     fn claws_wizard_defaults_correct() {
-        let app = App::new();
-        assert!(app.claws_wizard_username.is_none());
-        assert!(!app.claws_wizard_already_forked);
-        assert_eq!(app.claws_phase, ClawsPhase::Inactive);
-        assert!(app.claws_container_id.is_none());
-        assert!(app.claws_sudo_request_rx.is_none());
-        assert!(app.claws_sudo_response_tx.is_none()); // channel for Option<String> (password or None)
+        let tab = TabState::new(std::path::PathBuf::from("/tmp"));
+        assert!(tab.claws_wizard_username.is_none());
+        assert!(!tab.claws_wizard_already_forked);
+        assert_eq!(tab.claws_phase, ClawsPhase::Inactive);
+        assert!(tab.claws_container_id.is_none());
+        assert!(tab.claws_sudo_request_rx.is_none());
+        assert!(tab.claws_sudo_response_tx.is_none()); // channel for Option<String> (password or None)
     }
 
     #[test]
     fn tick_shows_sudo_confirm_dialog_when_request_received() {
-        let mut app = App::new();
+        let mut tab = new_tab();
         let (sudo_tx, sudo_rx) = tokio::sync::oneshot::channel::<()>();
-        app.claws_sudo_request_rx = Some(sudo_rx);
+        tab.claws_sudo_request_rx = Some(sudo_rx);
         // Send the signal.
         sudo_tx.send(()).unwrap();
-        app.tick();
-        assert_eq!(app.dialog, Dialog::ClawsReadySudoConfirm { password: String::new() });
-        assert!(app.claws_sudo_request_rx.is_none(), "rx should be consumed after signal");
+        tab.tick();
+        assert_eq!(tab.dialog, Dialog::ClawsReadySudoConfirm { password: String::new() });
+        assert!(tab.claws_sudo_request_rx.is_none(), "rx should be consumed after signal");
     }
 
     #[test]
     fn tick_does_not_show_sudo_dialog_when_no_signal() {
-        let mut app = App::new();
+        let mut tab = new_tab();
         let (_sudo_tx, sudo_rx) = tokio::sync::oneshot::channel::<()>();
-        app.claws_sudo_request_rx = Some(sudo_rx);
+        tab.claws_sudo_request_rx = Some(sudo_rx);
         // Do NOT send the signal.
-        app.tick();
-        assert_eq!(app.dialog, Dialog::None);
+        tab.tick();
+        assert_eq!(tab.dialog, Dialog::None);
     }
 
     #[test]
     fn pending_command_claws_ready() {
-        let mut app = App::new();
-        app.pending_command = PendingCommand::ClawsReady;
-        assert_eq!(app.pending_command, PendingCommand::ClawsReady);
+        let mut tab = new_tab();
+        tab.pending_command = PendingCommand::ClawsReady;
+        assert_eq!(tab.pending_command, PendingCommand::ClawsReady);
     }
 
     #[test]
     fn finish_command_does_not_leave_stale_scroll_offset() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.start_container("test".into(), "Agent".into(), 80, 24);
-        app.container_scroll_offset = 15;
-        app.finish_command(0);
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("test".into(), "Agent".into(), 80, 24);
+        tab.container_scroll_offset = 15;
+        tab.finish_command(0);
         // After finishing, container is hidden and scroll offset is irrelevant,
         // but it should be left at 0 for the next container session.
         // start_container resets it, so this just verifies no panic.
-        assert_eq!(app.container_window, ContainerWindowState::Hidden);
+        assert_eq!(tab.container_window, ContainerWindowState::Hidden);
+    }
+
+    // --- tab_color tests ---
+
+    #[test]
+    fn tab_color_idle_is_dark_gray() {
+        let tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        assert_eq!(tab.tab_color(), Color::DarkGray);
+    }
+
+    #[test]
+    fn tab_color_running_no_container_is_blue() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Running { command: "chat".into() };
+        assert_eq!(tab.tab_color(), Color::Blue);
+    }
+
+    #[test]
+    fn tab_color_running_with_container_is_green() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.container_window = ContainerWindowState::Maximized;
+        assert_eq!(tab.tab_color(), Color::Green);
+    }
+
+    #[test]
+    fn tab_color_error_is_red() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
+        assert_eq!(tab.tab_color(), Color::Red);
+    }
+
+    #[test]
+    fn tab_color_claws_command_no_container_is_magenta() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Running { command: "claws ready".into() };
+        assert_eq!(tab.tab_color(), Color::Magenta);
+    }
+
+    #[test]
+    fn tab_color_claws_command_with_container_is_magenta() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Running { command: "claws ready (attached)".into() };
+        tab.container_window = ContainerWindowState::Maximized;
+        assert_eq!(tab.tab_color(), Color::Magenta);
+    }
+
+    #[test]
+    fn tab_color_claws_phase_active_is_magenta() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
+        tab.phase = ExecutionPhase::Running { command: "claws ready".into() };
+        tab.claws_phase = ClawsPhase::Setup;
+        assert_eq!(tab.tab_color(), Color::Magenta);
+    }
+
+    #[test]
+    fn tab_display_name_idle_shows_project() {
+        let tab = TabState::new(std::path::PathBuf::from("/home/user/myproject"));
+        assert_eq!(tab.tab_display_name(), "myproject");
+    }
+
+    #[test]
+    fn tab_display_name_running_shows_command() {
+        let mut tab = TabState::new(std::path::PathBuf::from("/home/user/proj"));
+        tab.phase = ExecutionPhase::Running { command: "chat --plan".into() };
+        // Full command shown: "proj | chat --plan"
+        assert_eq!(tab.tab_display_name(), "proj | chat --plan");
+    }
+
+    #[test]
+    fn tab_display_name_truncates_long_names() {
+        let tab = TabState::new(std::path::PathBuf::from("/home/user/a-very-long-project-name"));
+        // "a-very-long-pr…" should be 15 chars with ellipsis
+        let name = tab.tab_display_name();
+        assert!(name.chars().count() <= 14, "Name too long: {}", name);
+    }
+
+    #[test]
+    fn app_new_creates_one_tab() {
+        let app = App::new(std::path::PathBuf::from("/tmp"));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn app_create_tab_inserts_after_active() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/a"));
+        let new_idx = app.create_tab(std::path::PathBuf::from("/tmp/b"));
+        assert_eq!(new_idx, 1);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[1].cwd, std::path::PathBuf::from("/tmp/b"));
+    }
+
+    #[test]
+    fn app_close_tab_removes_and_adjusts_idx() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/a"));
+        app.create_tab(std::path::PathBuf::from("/tmp/b"));
+        app.active_tab_idx = 1;
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+    }
+
+    #[test]
+    fn app_close_tab_single_tab_is_noop() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp"));
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn app_active_tab_returns_correct_tab() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/a"));
+        app.create_tab(std::path::PathBuf::from("/tmp/b"));
+        app.active_tab_idx = 1;
+        assert_eq!(app.active_tab().cwd, std::path::PathBuf::from("/tmp/b"));
     }
 }

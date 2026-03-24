@@ -379,9 +379,9 @@ pub fn ask_yes_no_stdin(prompt: &str) -> bool {
     matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Walks upward from CWD to find the nearest directory containing a `.git` folder.
-pub fn find_git_root() -> Option<std::path::PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
+/// Walks upward from the given directory to find the nearest `.git` folder.
+pub fn find_git_root_from(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = cwd.to_path_buf();
     loop {
         if dir.join(".git").exists() {
             return Some(dir);
@@ -390,6 +390,11 @@ pub fn find_git_root() -> Option<std::path::PathBuf> {
             return None;
         }
     }
+}
+
+/// Walks upward from CWD to find the nearest directory containing a `.git` folder.
+pub fn find_git_root() -> Option<std::path::PathBuf> {
+    find_git_root_from(&std::env::current_dir().ok()?)
 }
 
 /// Write Dockerfile.dev to the git root using a template downloaded from GitHub.

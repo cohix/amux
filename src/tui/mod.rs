@@ -9,7 +9,7 @@ use crate::commands::chat::{chat_entrypoint, chat_entrypoint_non_interactive};
 use crate::commands::implement::{
     agent_entrypoint, agent_entrypoint_non_interactive, find_work_item, parse_work_item,
 };
-use crate::commands::init::find_git_root;
+use crate::commands::init::find_git_root_from;
 use crate::commands::new::WorkItemKind;
 use crate::commands::{claws, init, new, ready};
 use crate::commands::ready::{ReadyOptions, print_interactive_notice, print_summary};
@@ -60,7 +60,8 @@ where
     B: ratatui::backend::Backend + io::Write,
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    let mut app = App::new();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut app = App::new(cwd);
 
     // Auto-run `ready` at startup, forwarding any flags passed to the root `amux` command.
     let mut startup_cmd = "ready".to_string();
@@ -88,55 +89,59 @@ where
                 Event::Mouse(mouse) => {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
-                            if app.container_window == ContainerWindowState::Maximized {
+                            let tab = app.active_tab_mut();
+                            if tab.container_window == ContainerWindowState::Maximized {
                                 // Scroll up through the container's vt100 scrollback.
                                 // Cap at the screen row count due to a vt100 crate
                                 // limitation in set_scrollback's internal row arithmetic.
-                                let max_scroll = app.vt100_parser.as_ref()
+                                let max_scroll = tab.vt100_parser.as_ref()
                                     .map(|p| p.screen().size().0 as usize)
                                     .unwrap_or(0);
-                                app.container_scroll_offset =
-                                    (app.container_scroll_offset + 3).min(max_scroll);
+                                tab.container_scroll_offset =
+                                    (tab.container_scroll_offset + 3).min(max_scroll);
                             } else {
-                                let max = app.output_lines.len();
-                                if app.scroll_offset < max {
-                                    app.scroll_offset = app.scroll_offset.saturating_add(3);
+                                let max = tab.output_lines.len();
+                                if tab.scroll_offset < max {
+                                    tab.scroll_offset = tab.scroll_offset.saturating_add(3);
                                 }
                             }
                         }
                         MouseEventKind::ScrollDown => {
-                            if app.container_window == ContainerWindowState::Maximized {
+                            let tab = app.active_tab_mut();
+                            if tab.container_window == ContainerWindowState::Maximized {
                                 // Scroll down towards the live view.
-                                app.container_scroll_offset =
-                                    app.container_scroll_offset.saturating_sub(3);
+                                tab.container_scroll_offset =
+                                    tab.container_scroll_offset.saturating_sub(3);
                             } else {
-                                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                                tab.scroll_offset = tab.scroll_offset.saturating_sub(3);
                             }
                         }
                         _ => {}
                     }
                 }
                 Event::Resize(cols, rows) => {
-                    if let Some(ref pty) = app.pty {
-                        if app.container_window != ContainerWindowState::Hidden {
-                            // Resize the PTY and vt100 parser to match the container inner area.
-                            let (inner_cols, inner_rows) = calculate_container_inner_size(cols, rows);
-                            pty.resize(PtySize {
-                                rows: inner_rows,
-                                cols: inner_cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
-                            if let Some(ref mut parser) = app.vt100_parser {
-                                parser.set_size(inner_rows, inner_cols);
+                    for tab in app.tabs.iter_mut() {
+                        if let Some(ref pty) = tab.pty {
+                            if tab.container_window != ContainerWindowState::Hidden {
+                                // Resize the PTY and vt100 parser to match the container inner area.
+                                let (inner_cols, inner_rows) = calculate_container_inner_size(cols, rows);
+                                pty.resize(PtySize {
+                                    rows: inner_rows,
+                                    cols: inner_cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
+                                if let Some(ref mut parser) = tab.vt100_parser {
+                                    parser.set_size(inner_rows, inner_cols);
+                                }
+                            } else {
+                                pty.resize(PtySize {
+                                    rows,
+                                    cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
                             }
-                        } else {
-                            pty.resize(PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
                         }
                     }
                 }
@@ -145,9 +150,9 @@ where
         }
 
         // Drain all pending channel messages (PTY output, command output, exit codes).
-        let was_running = matches!(app.phase, state::ExecutionPhase::Running { .. });
-        app.tick();
-        let now_done = !matches!(app.phase, state::ExecutionPhase::Running { .. });
+        let was_running = matches!(app.active_tab().phase, state::ExecutionPhase::Running { .. });
+        app.tick_all();
+        let now_done = !matches!(app.active_tab().phase, state::ExecutionPhase::Running { .. });
 
         // Check if a ready workflow phase just completed and continue to the next phase.
         if was_running && now_done {
@@ -179,26 +184,26 @@ async fn handle_action(app: &mut App, action: Action) {
         }
 
         Action::MountScopeChosen(path) => {
-            app.pending_mount_path = Some(path);
+            app.active_tab_mut().pending_mount_path = Some(path);
             launch_pending_command(app).await;
         }
 
         Action::AuthAccepted => {
-            if let Dialog::AgentAuth { ref agent, ref git_root } = app.dialog.clone() {
+            if let Dialog::AgentAuth { ref agent, ref git_root } = app.active_tab().dialog.clone() {
                 let _ = apply_auth_decision(git_root, agent, true);
             }
             launch_pending_command(app).await;
         }
 
         Action::AuthDeclined => {
-            if let Dialog::AgentAuth { ref agent, ref git_root } = app.dialog.clone() {
+            if let Dialog::AgentAuth { ref agent, ref git_root } = app.active_tab().dialog.clone() {
                 let _ = apply_auth_decision(git_root, agent, false);
             }
             launch_pending_command(app).await;
         }
 
         Action::ForwardToPty(bytes) => {
-            if let Some(ref pty) = app.pty {
+            if let Some(ref pty) = app.active_tab().pty {
                 pty.write_bytes(&bytes);
             }
         }
@@ -214,7 +219,42 @@ async fn handle_action(app: &mut App, action: Action) {
         Action::ClawsReadyStartContainer => {
             launch_claws_start_container(app).await;
         }
+
+        Action::CreateTab => {
+            let cwd = app.active_tab().cwd.clone();
+            app.active_tab_mut().dialog = Dialog::NewTabDirectory { input: cwd.to_string_lossy().to_string() };
+        }
+
+        Action::SwitchTabLeft => {
+            let len = app.tabs.len();
+            if len > 0 {
+                app.active_tab_idx = (app.active_tab_idx + len - 1) % len;
+            }
+        }
+
+        Action::SwitchTabRight => {
+            let len = app.tabs.len();
+            if len > 0 {
+                app.active_tab_idx = (app.active_tab_idx + 1) % len;
+            }
+        }
+
+        Action::CloseCurrentTab => {
+            let idx = app.active_tab_idx;
+            app.close_tab(idx);
+        }
+
+        Action::NewTabDirectoryChosen(path) => {
+            let new_idx = app.create_tab(path.clone());
+            app.active_tab_idx = new_idx;
+            execute_tab_command(app, new_idx, "ready").await;
+        }
     }
+}
+
+/// Execute a command on a specific tab by index.
+async fn execute_tab_command(app: &mut App, _tab_idx: usize, cmd: &str) {
+    execute_command(app, cmd).await;
 }
 
 /// Parse flags from the command parts, returning (refresh, build, no_cache, non_interactive, allow_docker).
@@ -253,10 +293,10 @@ async fn execute_command(app: &mut App, cmd: &str) {
     match parts[0] {
         "init" => {
             let agent = parse_agent_flag(&parts).unwrap_or(Agent::Claude);
-            app.start_command(cmd.to_string());
+            app.active_tab_mut().start_command(cmd.to_string());
             let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-            app.exit_rx = Some(exit_rx);
-            let tx = app.output_tx.clone();
+            app.active_tab_mut().exit_rx = Some(exit_rx);
+            let tx = app.active_tab().output_tx.clone();
             let aspec = parts.iter().any(|p| *p == "--aspec");
             spawn_text_command(tx, exit_tx, move |sink| async move {
                 init::run_with_sink(agent, aspec, false, false, &sink).await
@@ -267,8 +307,8 @@ async fn execute_command(app: &mut App, cmd: &str) {
             let (refresh, build, no_cache, non_interactive, allow_docker) = parse_ready_flags(&parts);
             // If --refresh is set, ignore --build (refresh always rebuilds after audit).
             let effective_build = if refresh { false } else { build };
-            app.pending_command = PendingCommand::Ready { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
-            app.ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
+            app.active_tab_mut().pending_command = PendingCommand::Ready { refresh, build: effective_build, no_cache, non_interactive, allow_docker };
+            app.active_tab_mut().ready_opts = ReadyOptions { refresh, build: effective_build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
             show_pre_command_dialogs(app).await;
         }
 
@@ -282,33 +322,33 @@ async fn execute_command(app: &mut App, cmd: &str) {
             {
                 Some(n) => n,
                 None => {
-                    app.input_error =
+                    app.active_tab_mut().input_error =
                         Some("Usage: implement <work-item-number> [--non-interactive] [--plan] [--allow-docker]".into());
                     return;
                 }
             };
-            app.pending_command = PendingCommand::Implement { work_item, non_interactive, plan, allow_docker };
+            app.active_tab_mut().pending_command = PendingCommand::Implement { work_item, non_interactive, plan, allow_docker };
             show_pre_command_dialogs(app).await;
         }
 
         "chat" => {
             let (non_interactive, plan, allow_docker) = parse_chat_flags(&parts);
-            app.pending_command = PendingCommand::Chat { non_interactive, plan, allow_docker };
+            app.active_tab_mut().pending_command = PendingCommand::Chat { non_interactive, plan, allow_docker };
             show_pre_command_dialogs(app).await;
         }
 
         "new" => {
-            app.dialog = state::Dialog::NewKindSelect;
+            app.active_tab_mut().dialog = state::Dialog::NewKindSelect;
         }
 
         "claws" => {
             match parts.get(1) {
                 Some(&"ready") => {
-                    app.pending_command = PendingCommand::ClawsReady;
+                    app.active_tab_mut().pending_command = PendingCommand::ClawsReady;
                     show_claws_ready_start(app).await;
                 }
                 _ => {
-                    app.input_error = Some("Usage: claws ready".into());
+                    app.active_tab_mut().input_error = Some("Usage: claws ready".into());
                 }
             }
         }
@@ -317,7 +357,7 @@ async fn execute_command(app: &mut App, cmd: &str) {
             let suggestion = input::closest_subcommand(unknown)
                 .map(|s| format!("  Did you mean: {}", s))
                 .unwrap_or_default();
-            app.input_error = Some(format!(
+            app.active_tab_mut().input_error = Some(format!(
                 "'{}' is not an amux command.{}",
                 unknown, suggestion
             ));
@@ -328,24 +368,25 @@ async fn execute_command(app: &mut App, cmd: &str) {
 /// Show any needed dialogs (mount scope, agent auth) before launching a command.
 /// Used by both `ready` and `implement` in TUI mode.
 async fn show_pre_command_dialogs(app: &mut App) {
-    let git_root = match find_git_root() {
+    let tab_cwd = app.active_tab().cwd.clone();
+    let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
         None => {
-            app.input_error = Some("Not inside a Git repository.".into());
+            app.active_tab_mut().input_error = Some("Not inside a Git repository.".into());
             return;
         }
     };
 
     // Check mount scope.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| git_root.clone());
+    let cwd = tab_cwd;
     if cwd != git_root {
-        app.dialog = Dialog::MountScope {
+        app.active_tab_mut().dialog = Dialog::MountScope {
             git_root: git_root.clone(),
             cwd,
         };
         return; // Wait for user choice; handle_action resumes after dialog.
     }
-    app.pending_mount_path = Some(git_root.clone());
+    app.active_tab_mut().pending_mount_path = Some(git_root.clone());
 
     // Auto-passthrough: no agent auth dialog needed. Credentials are always
     // read from the keychain automatically.
@@ -354,9 +395,9 @@ async fn show_pre_command_dialogs(app: &mut App) {
 
 /// Resume the pending command after all dialogs have been answered.
 async fn launch_pending_command(app: &mut App) {
-    match app.pending_command.clone() {
+    match app.active_tab().pending_command.clone() {
         PendingCommand::Ready { refresh, build, no_cache, non_interactive, allow_docker } => {
-            app.ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
+            app.active_tab_mut().ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
             launch_ready(app).await;
         }
         PendingCommand::Implement { work_item, non_interactive, plan, allow_docker } => {
@@ -376,38 +417,39 @@ async fn launch_pending_command(app: &mut App) {
 /// Launch the ready command — phase 1 (pre-audit) as a text command.
 /// The audit and post-audit phases are triggered automatically via `check_ready_continuation`.
 async fn launch_ready(app: &mut App) {
-    let git_root = match find_git_root() {
+    let tab_cwd = app.active_tab().cwd.clone();
+    let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
         None => {
-            app.input_error = Some("Not inside a Git repository.".into());
+            app.active_tab_mut().input_error = Some("Not inside a Git repository.".into());
             return;
         }
     };
 
     let config = load_repo_config(&git_root).unwrap_or_default();
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
-    let mount_path = app.pending_mount_path.take().unwrap_or_else(|| git_root.clone());
+    let mount_path = app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone());
 
     // Auto-passthrough: always pass credentials from keychain if available.
     let credentials = agent_keychain_credentials(&agent_name);
     let env_vars = credentials.env_vars;
 
     // Prepare host settings (sanitized config files in a temp dir).
-    app.host_settings = docker::HostSettings::prepare(&agent_name);
+    app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
 
-    let opts = app.ready_opts.clone();
+    let opts = app.active_tab().ready_opts.clone();
 
-    app.ready_phase = ReadyPhase::PreAudit;
-    app.start_command("ready".to_string());
+    app.active_tab_mut().ready_phase = ReadyPhase::PreAudit;
+    app.active_tab_mut().start_command("ready".to_string());
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
+    app.active_tab_mut().exit_rx = Some(exit_rx);
     let (ctx_tx, ctx_rx) = tokio::sync::oneshot::channel();
-    app.ready_ctx_rx = Some(ctx_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().ready_ctx_rx = Some(ctx_rx);
+    let tx = app.active_tab().output_tx.clone();
 
     // If not refreshing, run the full sink-based workflow (no audit/post-audit).
     if !opts.refresh {
-        app.ready_phase = ReadyPhase::Inactive; // No multi-phase needed.
+        app.active_tab_mut().ready_phase = ReadyPhase::Inactive; // No multi-phase needed.
         spawn_text_command(tx, exit_tx, move |sink| async move {
             let _ = ready::run_with_sink(&sink, mount_path, env_vars, &opts, None).await?;
             Ok(())
@@ -425,31 +467,32 @@ async fn launch_ready(app: &mut App) {
 
 /// Check if a ready workflow phase just completed and automatically launch the next phase.
 async fn check_ready_continuation(app: &mut App) {
-    match app.ready_phase {
+    match app.active_tab().ready_phase {
         ReadyPhase::PreAudit => {
             // Pre-audit just finished. If it failed, abort the workflow.
-            if matches!(app.phase, state::ExecutionPhase::Error { .. }) {
-                app.ready_phase = ReadyPhase::Inactive;
-                app.ready_ctx = None;
-                app.ready_ctx_rx = None;
-                app.host_settings = None;
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.ready_phase = ReadyPhase::Inactive;
+                tab.ready_ctx = None;
+                tab.ready_ctx_rx = None;
+                tab.host_settings = None;
                 return;
             }
             // The context should have arrived via the channel by now.
-            if app.ready_ctx.is_none() {
-                app.push_output("Internal error: pre-audit completed but no context received.");
-                app.ready_phase = ReadyPhase::Inactive;
+            if app.active_tab().ready_ctx.is_none() {
+                app.active_tab_mut().push_output("Internal error: pre-audit completed but no context received.");
+                app.active_tab_mut().ready_phase = ReadyPhase::Inactive;
                 return;
             }
 
-            let opts = app.ready_opts.clone();
+            let opts = app.active_tab().ready_opts.clone();
             if opts.refresh {
                 if !opts.non_interactive {
                     // Print the interactive notice via output.
-                    let agent_name = app.ready_ctx.as_ref()
+                    let agent_name = app.active_tab().ready_ctx.as_ref()
                         .map(|c| c.agent_name.clone())
                         .unwrap_or_else(|| "agent".into());
-                    let sink = crate::commands::output::OutputSink::Channel(app.output_tx.clone());
+                    let sink = crate::commands::output::OutputSink::Channel(app.active_tab().output_tx.clone());
                     print_interactive_notice(&sink, &agent_name);
                 }
                 // Launch the audit via PTY (or captured if non-interactive).
@@ -460,26 +503,29 @@ async fn check_ready_continuation(app: &mut App) {
                 }
             } else {
                 // No refresh — skip audit & post-audit, print summary.
-                app.ready_phase = ReadyPhase::Inactive;
-                app.ready_ctx = None;
+                let tab = app.active_tab_mut();
+                tab.ready_phase = ReadyPhase::Inactive;
+                tab.ready_ctx = None;
             }
         }
         ReadyPhase::Audit => {
             // Audit PTY just finished. If it failed, abort.
-            if matches!(app.phase, state::ExecutionPhase::Error { .. }) {
-                app.ready_phase = ReadyPhase::Inactive;
-                app.ready_ctx = None;
-                app.host_settings = None;
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.ready_phase = ReadyPhase::Inactive;
+                tab.ready_ctx = None;
+                tab.host_settings = None;
                 return;
             }
             // Launch post-audit (image rebuild — no container, no settings needed).
-            app.host_settings = None;
+            app.active_tab_mut().host_settings = None;
             launch_ready_post_audit(app);
         }
         ReadyPhase::PostAudit => {
             // Post-audit done; workflow complete.
-            app.ready_phase = ReadyPhase::Inactive;
-            app.ready_ctx = None;
+            let tab = app.active_tab_mut();
+            tab.ready_phase = ReadyPhase::Inactive;
+            tab.ready_ctx = None;
         }
         ReadyPhase::Inactive => {}
     }
@@ -487,23 +533,23 @@ async fn check_ready_continuation(app: &mut App) {
 
 /// Phase 2: Launch the interactive audit agent via PTY.
 fn launch_ready_audit(app: &mut App) {
-    let ctx = match &app.ready_ctx {
-        Some(ctx) => ctx.clone(),
+    let ctx = match app.active_tab().ready_ctx.clone() {
+        Some(ctx) => ctx,
         None => {
-            app.push_output("Internal error: missing ready context for audit phase.");
-            app.ready_phase = ReadyPhase::Inactive;
+            app.active_tab_mut().push_output("Internal error: missing ready context for audit phase.");
+            app.active_tab_mut().ready_phase = ReadyPhase::Inactive;
             return;
         }
     };
 
-    let allow_docker = app.ready_opts.allow_docker;
+    let allow_docker = app.active_tab().ready_opts.allow_docker;
 
     // If --allow-docker, check the socket and print a warning before launching.
     if allow_docker {
         match docker::check_docker_socket() {
             Ok(socket_path) => {
-                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
-                app.push_output(format!(
+                app.active_tab_mut().push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.active_tab_mut().push_output(format!(
                     "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
                      This grants the agent elevated host access.",
                     socket_path.display(),
@@ -511,8 +557,8 @@ fn launch_ready_audit(app: &mut App) {
                 ));
             }
             Err(e) => {
-                app.push_output(format!("Error: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Error: {}", e));
+                app.active_tab_mut().finish_command(1);
                 return;
             }
         }
@@ -528,7 +574,7 @@ fn launch_ready_audit(app: &mut App) {
         &entrypoint_refs,
         &ctx.env_vars,
         Some(&container_name),
-        app.host_settings.as_ref(),
+        app.active_tab().host_settings.as_ref(),
         allow_docker,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
@@ -543,45 +589,45 @@ fn launch_ready_audit(app: &mut App) {
         pixel_height: 0,
     };
 
-    app.ready_phase = ReadyPhase::Audit;
-    app.continue_command("ready (audit)".to_string());
+    app.active_tab_mut().ready_phase = ReadyPhase::Audit;
+    app.active_tab_mut().continue_command("ready (audit)".to_string());
 
     // Activate the container window.
     let display_name = state::agent_display_name(&ctx.agent_name).to_string();
-    app.start_container(container_name.clone(), display_name, inner_cols, inner_rows);
+    app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
 
     match PtySession::spawn("docker", &docker_str_refs, size) {
         Ok((session, pty_rx)) => {
-            app.pty = Some(session);
-            app.pty_rx = Some(pty_rx);
-            app.stats_rx = Some(spawn_stats_poller(container_name));
+            app.active_tab_mut().pty = Some(session);
+            app.active_tab_mut().pty_rx = Some(pty_rx);
+            app.active_tab_mut().stats_rx = Some(spawn_stats_poller(container_name));
         }
         Err(e) => {
-            app.push_output(format!("Failed to launch audit container: {}", e));
-            app.finish_command(1);
+            app.active_tab_mut().push_output(format!("Failed to launch audit container: {}", e));
+            app.active_tab_mut().finish_command(1);
         }
     }
 }
 
 /// Phase 2 (non-interactive): Launch audit agent in captured mode.
 fn launch_ready_audit_captured(app: &mut App) {
-    let ctx = match &app.ready_ctx {
-        Some(ctx) => ctx.clone(),
+    let ctx = match app.active_tab().ready_ctx.clone() {
+        Some(ctx) => ctx,
         None => {
-            app.push_output("Internal error: missing ready context for audit phase.");
-            app.ready_phase = ReadyPhase::Inactive;
+            app.active_tab_mut().push_output("Internal error: missing ready context for audit phase.");
+            app.active_tab_mut().ready_phase = ReadyPhase::Inactive;
             return;
         }
     };
 
-    let allow_docker = app.ready_opts.allow_docker;
+    let allow_docker = app.active_tab().ready_opts.allow_docker;
 
     // If --allow-docker, check the socket and print a warning before launching.
     if allow_docker {
         match docker::check_docker_socket() {
             Ok(socket_path) => {
-                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
-                app.push_output(format!(
+                app.active_tab_mut().push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.active_tab_mut().push_output(format!(
                     "WARNING: --allow-docker: mounting host Docker socket into audit container ({}:{}). \
                      This grants the agent elevated host access.",
                     socket_path.display(),
@@ -589,22 +635,22 @@ fn launch_ready_audit_captured(app: &mut App) {
                 ));
             }
             Err(e) => {
-                app.push_output(format!("Error: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Error: {}", e));
+                app.active_tab_mut().finish_command(1);
                 return;
             }
         }
     }
 
     // Move host_settings into the task so the temp dir lives until the container exits.
-    let host_settings = app.host_settings.take();
+    let host_settings = app.active_tab_mut().host_settings.take();
 
-    app.ready_phase = ReadyPhase::Audit;
-    app.continue_command("ready (audit - non-interactive)".to_string());
+    app.active_tab_mut().ready_phase = ReadyPhase::Audit;
+    app.active_tab_mut().continue_command("ready (audit - non-interactive)".to_string());
 
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    let tx = app.active_tab().output_tx.clone();
 
     spawn_text_command(tx, exit_tx, move |sink| async move {
         let entrypoint = ready::audit_entrypoint_non_interactive(&ctx.agent_name);
@@ -626,21 +672,21 @@ fn launch_ready_audit_captured(app: &mut App) {
 
 /// Phase 3: Rebuild the Docker image after the audit agent has updated Dockerfile.dev.
 fn launch_ready_post_audit(app: &mut App) {
-    let ctx = match &app.ready_ctx {
-        Some(ctx) => ctx.clone(),
+    let ctx = match app.active_tab().ready_ctx.clone() {
+        Some(ctx) => ctx,
         None => {
-            app.push_output("Internal error: missing ready context for post-audit phase.");
-            app.ready_phase = ReadyPhase::Inactive;
+            app.active_tab_mut().push_output("Internal error: missing ready context for post-audit phase.");
+            app.active_tab_mut().ready_phase = ReadyPhase::Inactive;
             return;
         }
     };
 
-    let opts = app.ready_opts.clone();
-    app.ready_phase = ReadyPhase::PostAudit;
-    app.continue_command("ready (rebuild)".to_string());
+    let opts = app.active_tab().ready_opts.clone();
+    app.active_tab_mut().ready_phase = ReadyPhase::PostAudit;
+    app.active_tab_mut().continue_command("ready (rebuild)".to_string());
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    let tx = app.active_tab().output_tx.clone();
     spawn_text_command(tx, exit_tx, move |sink| async move {
         let mut summary = ready::ReadySummary::default();
         // Populate summary fields for the steps that already completed.
@@ -658,30 +704,31 @@ fn launch_ready_post_audit(app: &mut App) {
 
 /// Actually spawn the docker container for `implement` via PTY.
 async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool, allow_docker: bool) {
-    let git_root = match find_git_root() {
+    let tab_cwd = app.active_tab().cwd.clone();
+    let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
         None => {
-            app.input_error = Some("Not inside a Git repository.".into());
+            app.active_tab_mut().input_error = Some("Not inside a Git repository.".into());
             return;
         }
     };
 
     // Validate work item exists before proceeding.
     if let Err(e) = find_work_item(&git_root, work_item) {
-        app.input_error = Some(format!("{}", e));
+        app.active_tab_mut().input_error = Some(format!("{}", e));
         return;
     }
 
     let config = load_repo_config(&git_root).unwrap_or_default();
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
-    let mount_path = app.pending_mount_path.take().unwrap_or_else(|| git_root.clone());
+    let mount_path = app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone());
 
     // Auto-passthrough: always pass credentials from keychain if available.
     let credentials = agent_keychain_credentials(&agent_name);
     let env_vars = credentials.env_vars;
 
     // Prepare host settings (sanitized config files in a temp dir).
-    app.host_settings = docker::HostSettings::prepare(&agent_name);
+    app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
 
     let entrypoint = if non_interactive {
         agent_entrypoint_non_interactive(&agent_name, work_item, plan)
@@ -697,21 +744,21 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref(), allow_docker)
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker)
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker)
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker)
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
     let command_display = format!("implement {:04}", work_item);
-    app.start_command(command_display);
+    app.active_tab_mut().start_command(command_display);
 
     // If --allow-docker, check the socket and print a warning before launching.
     if allow_docker {
         match docker::check_docker_socket() {
             Ok(socket_path) => {
-                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
-                app.push_output(format!(
+                app.active_tab_mut().push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.active_tab_mut().push_output(format!(
                     "WARNING: --allow-docker: mounting host Docker socket into container ({}:{}). \
                      This grants the agent elevated host access.",
                     socket_path.display(),
@@ -719,23 +766,23 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
                 ));
             }
             Err(e) => {
-                app.push_output(format!("Error: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Error: {}", e));
+                app.active_tab_mut().finish_command(1);
                 return;
             }
         }
     }
 
-    app.push_output(format!("$ {}", cmd_display));
+    app.active_tab_mut().push_output(format!("$ {}", cmd_display));
 
     if non_interactive {
-        app.push_output("Tip: remove --non-interactive to interact with the agent directly.");
+        app.active_tab_mut().push_output("Tip: remove --non-interactive to interact with the agent directly.");
         // Move host_settings into the task so the temp dir lives until the container exits.
-        let host_settings = app.host_settings.take();
+        let host_settings = app.active_tab_mut().host_settings.take();
         // Run captured in a text command.
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-        app.exit_rx = Some(exit_rx);
-        let tx = app.output_tx.clone();
+        app.active_tab_mut().exit_rx = Some(exit_rx);
+        let tx = app.active_tab().output_tx.clone();
         let mount_str = mount_path.to_str().unwrap().to_string();
         spawn_text_command(tx, exit_tx, move |sink| async move {
             let entrypoint = agent_entrypoint_non_interactive(&agent_name, work_item, plan);
@@ -755,11 +802,11 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
         });
     } else {
         // Print interactive notice to the outer window.
-        let sink = crate::commands::output::OutputSink::Channel(app.output_tx.clone());
+        let sink = crate::commands::output::OutputSink::Channel(app.active_tab().output_tx.clone());
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker);
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker);
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.
@@ -774,18 +821,18 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
         // Activate the container window.
         let display_name = state::agent_display_name(&agent_name).to_string();
-        app.start_container(container_name.clone(), display_name, inner_cols, inner_rows);
+        app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
 
         match PtySession::spawn("docker", &docker_str_refs, size) {
             Ok((session, pty_rx)) => {
-                app.pty = Some(session);
-                app.pty_rx = Some(pty_rx);
+                app.active_tab_mut().pty = Some(session);
+                app.active_tab_mut().pty_rx = Some(pty_rx);
                 // Start Docker stats polling.
-                app.stats_rx = Some(spawn_stats_poller(container_name));
+                app.active_tab_mut().stats_rx = Some(spawn_stats_poller(container_name));
             }
             Err(e) => {
-                app.push_output(format!("Failed to launch container: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Failed to launch container: {}", e));
+                app.active_tab_mut().finish_command(1);
             }
         }
     }
@@ -793,24 +840,25 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
 /// Actually spawn the docker container for `chat` via PTY.
 async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_docker: bool) {
-    let git_root = match find_git_root() {
+    let tab_cwd = app.active_tab().cwd.clone();
+    let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
         None => {
-            app.input_error = Some("Not inside a Git repository.".into());
+            app.active_tab_mut().input_error = Some("Not inside a Git repository.".into());
             return;
         }
     };
 
     let config = load_repo_config(&git_root).unwrap_or_default();
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
-    let mount_path = app.pending_mount_path.take().unwrap_or_else(|| git_root.clone());
+    let mount_path = app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone());
 
     // Auto-passthrough: always pass credentials from keychain if available.
     let credentials = agent_keychain_credentials(&agent_name);
     let env_vars = credentials.env_vars;
 
     // Prepare host settings (sanitized config files in a temp dir).
-    app.host_settings = docker::HostSettings::prepare(&agent_name);
+    app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
 
     let entrypoint = if non_interactive {
         chat_entrypoint_non_interactive(&agent_name, plan)
@@ -826,21 +874,21 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.host_settings.as_ref(), allow_docker)
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker)
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker)
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker)
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
     let command_display = "chat".to_string();
-    app.start_command(command_display);
+    app.active_tab_mut().start_command(command_display);
 
     // If --allow-docker, check the socket and print a warning before launching.
     if allow_docker {
         match docker::check_docker_socket() {
             Ok(socket_path) => {
-                app.push_output(format!("Docker socket: {} (found)", socket_path.display()));
-                app.push_output(format!(
+                app.active_tab_mut().push_output(format!("Docker socket: {} (found)", socket_path.display()));
+                app.active_tab_mut().push_output(format!(
                     "WARNING: --allow-docker: mounting host Docker socket into container ({}:{}). \
                      This grants the agent elevated host access.",
                     socket_path.display(),
@@ -848,23 +896,23 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
                 ));
             }
             Err(e) => {
-                app.push_output(format!("Error: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Error: {}", e));
+                app.active_tab_mut().finish_command(1);
                 return;
             }
         }
     }
 
-    app.push_output(format!("$ {}", cmd_display));
+    app.active_tab_mut().push_output(format!("$ {}", cmd_display));
 
     if non_interactive {
-        app.push_output("Tip: remove --non-interactive to interact with the agent directly.");
+        app.active_tab_mut().push_output("Tip: remove --non-interactive to interact with the agent directly.");
         // Move host_settings into the task so the temp dir lives until the container exits.
-        let host_settings = app.host_settings.take();
+        let host_settings = app.active_tab_mut().host_settings.take();
         // Run captured in a text command.
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-        app.exit_rx = Some(exit_rx);
-        let tx = app.output_tx.clone();
+        app.active_tab_mut().exit_rx = Some(exit_rx);
+        let tx = app.active_tab().output_tx.clone();
         let mount_str = mount_path.to_str().unwrap().to_string();
         spawn_text_command(tx, exit_tx, move |sink| async move {
             let entrypoint = chat_entrypoint_non_interactive(&agent_name, plan);
@@ -884,11 +932,11 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
         });
     } else {
         // Print interactive notice to the outer window.
-        let sink = crate::commands::output::OutputSink::Channel(app.output_tx.clone());
+        let sink = crate::commands::output::OutputSink::Channel(app.active_tab().output_tx.clone());
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.host_settings.as_ref(), allow_docker);
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker);
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.
@@ -903,18 +951,18 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
 
         // Activate the container window.
         let display_name = state::agent_display_name(&agent_name).to_string();
-        app.start_container(container_name.clone(), display_name, inner_cols, inner_rows);
+        app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
 
         match PtySession::spawn("docker", &docker_str_refs, size) {
             Ok((session, pty_rx)) => {
-                app.pty = Some(session);
-                app.pty_rx = Some(pty_rx);
+                app.active_tab_mut().pty = Some(session);
+                app.active_tab_mut().pty_rx = Some(pty_rx);
                 // Start Docker stats polling.
-                app.stats_rx = Some(spawn_stats_poller(container_name));
+                app.active_tab_mut().stats_rx = Some(spawn_stats_poller(container_name));
             }
             Err(e) => {
-                app.push_output(format!("Failed to launch container: {}", e));
-                app.finish_command(1);
+                app.active_tab_mut().push_output(format!("Failed to launch container: {}", e));
+                app.active_tab_mut().finish_command(1);
             }
         }
     }
@@ -958,7 +1006,7 @@ async fn show_claws_ready_start(app: &mut App) {
 
     if !nanoclaw_dir.exists() {
         // First run: start the wizard.
-        app.dialog = Dialog::ClawsReadyHasForked;
+        app.active_tab_mut().dialog = Dialog::ClawsReadyHasForked;
         return;
     }
 
@@ -968,10 +1016,10 @@ async fn show_claws_ready_start(app: &mut App) {
             if let Some(ref id) = config.nanoclaw_container_id {
                 if docker::is_container_running(id) {
                     // Container is running — show status.
-                    app.start_command("claws ready".to_string());
+                    app.active_tab_mut().start_command("claws ready".to_string());
                     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-                    app.exit_rx = Some(exit_rx);
-                    let tx = app.output_tx.clone();
+                    app.active_tab_mut().exit_rx = Some(exit_rx);
+                    let tx = app.active_tab().output_tx.clone();
                     let container_id = id.clone();
                     spawn_text_command(tx, exit_tx, move |sink| async move {
                         let mut summary = claws::ClawsSummary {
@@ -990,10 +1038,10 @@ async fn show_claws_ready_start(app: &mut App) {
                 }
             }
             // Container not running or no saved ID.
-            app.dialog = Dialog::ClawsReadyOfferStart;
+            app.active_tab_mut().dialog = Dialog::ClawsReadyOfferStart;
         }
         Err(_) => {
-            app.dialog = Dialog::ClawsReadyOfferStart;
+            app.active_tab_mut().dialog = Dialog::ClawsReadyOfferStart;
         }
     }
 }
@@ -1003,7 +1051,7 @@ async fn show_claws_ready_start(app: &mut App) {
 /// Clones the repo and sets up the container. After the text phase completes,
 /// `check_claws_continuation` attaches the agent via PTY.
 async fn launch_claws_ready(app: &mut App) {
-    let username = app.claws_wizard_username.clone();
+    let username = app.active_tab().claws_wizard_username.clone();
 
     // Resolve credentials using the same auto-passthrough as other containers.
     let agent_name = {
@@ -1014,22 +1062,22 @@ async fn launch_claws_ready(app: &mut App) {
     let env_vars = credentials.env_vars;
 
     // Prepare sanitized host config (same as `chat`/`implement` auto-configuration).
-    // Stored in app.host_settings so the temp dir outlives the background setup task
+    // Stored in tab.host_settings so the temp dir outlives the background setup task
     // and remains valid through the subsequent PTY exec session.
-    app.host_settings = docker::HostSettings::prepare(&agent_name);
-    // A path-only view is moved into the closure; the actual TempDir lives in app.
-    let closure_host_settings = app.host_settings.as_ref().map(|hs| {
+    app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
+    // A path-only view is moved into the closure; the actual TempDir lives in the tab.
+    let closure_host_settings = app.active_tab().host_settings.as_ref().map(|hs| {
         docker::HostSettings::from_paths(hs.config_path.clone(), hs.claude_dir_path.clone())
     });
 
-    app.claws_phase = ClawsPhase::Setup;
-    app.start_command("claws ready".to_string());
+    app.active_tab_mut().claws_phase = ClawsPhase::Setup;
+    app.active_tab_mut().start_command("claws ready".to_string());
 
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
+    app.active_tab_mut().exit_rx = Some(exit_rx);
     let (container_tx, container_rx) = tokio::sync::oneshot::channel::<String>();
-    app.claws_container_id_rx = Some(container_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().claws_container_id_rx = Some(container_rx);
+    let tx = app.active_tab().output_tx.clone();
 
     // Channels for the background task to request sudo permission when the clone
     // destination ($HOME/.nanoclaw) is not writable by the current user.
@@ -1037,15 +1085,15 @@ async fn launch_claws_ready(app: &mut App) {
     // sudo password, None = user declined.
     let (sudo_request_tx, sudo_request_rx) = tokio::sync::oneshot::channel::<()>();
     let (sudo_response_tx, sudo_response_rx) = tokio::sync::oneshot::channel::<Option<String>>();
-    app.claws_sudo_request_rx = Some(sudo_request_rx);
-    app.claws_sudo_response_tx = Some(sudo_response_tx);
+    app.active_tab_mut().claws_sudo_request_rx = Some(sudo_request_rx);
+    app.active_tab_mut().claws_sudo_response_tx = Some(sudo_response_tx);
 
     // Channels for the background task to request docker socket acceptance after the
     // image rebuild completes. The response carries bool: true = accepted, false = declined.
     let (docker_accept_request_tx, docker_accept_request_rx) = tokio::sync::oneshot::channel::<()>();
     let (docker_accept_response_tx, docker_accept_response_rx) = tokio::sync::oneshot::channel::<bool>();
-    app.claws_docker_accept_request_rx = Some(docker_accept_request_rx);
-    app.claws_docker_accept_response_tx = Some(docker_accept_response_tx);
+    app.active_tab_mut().claws_docker_accept_request_rx = Some(docker_accept_request_rx);
+    app.active_tab_mut().claws_docker_accept_response_tx = Some(docker_accept_response_tx);
 
     spawn_text_command(tx, exit_tx, move |sink| async move {
         if let Some(ref username) = username {
@@ -1112,21 +1160,21 @@ async fn launch_claws_start_container(app: &mut App) {
     let credentials = agent_keychain_credentials(&agent_name);
     let env_vars = credentials.env_vars;
 
-    // Prepare sanitized host config. Stored in app so TempDir outlives the
+    // Prepare sanitized host config. Stored in tab so TempDir outlives the
     // background setup task and remains valid through the PTY exec session.
-    app.host_settings = docker::HostSettings::prepare(&agent_name);
-    let closure_host_settings = app.host_settings.as_ref().map(|hs| {
+    app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
+    let closure_host_settings = app.active_tab().host_settings.as_ref().map(|hs| {
         docker::HostSettings::from_paths(hs.config_path.clone(), hs.claude_dir_path.clone())
     });
 
-    app.claws_phase = ClawsPhase::Setup;
-    app.start_command("claws ready".to_string());
+    app.active_tab_mut().claws_phase = ClawsPhase::Setup;
+    app.active_tab_mut().start_command("claws ready".to_string());
 
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
+    app.active_tab_mut().exit_rx = Some(exit_rx);
     let (container_tx, container_rx) = tokio::sync::oneshot::channel::<String>();
-    app.claws_container_id_rx = Some(container_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().claws_container_id_rx = Some(container_rx);
+    let tx = app.active_tab().output_tx.clone();
 
     spawn_text_command(tx, exit_tx, move |sink| async move {
         let nanoclaw_str = claws::nanoclaw_path_str();
@@ -1162,26 +1210,28 @@ async fn launch_claws_start_container(app: &mut App) {
 
 /// Check if the claws setup phase just completed and attach to the container.
 async fn check_claws_continuation(app: &mut App) {
-    if app.claws_phase != ClawsPhase::Setup {
+    if app.active_tab().claws_phase != ClawsPhase::Setup {
         return;
     }
 
-    if matches!(app.phase, state::ExecutionPhase::Error { .. }) {
-        app.claws_phase = ClawsPhase::Inactive;
-        app.claws_container_id = None;
-        app.claws_container_id_rx = None;
+    if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+        let tab = app.active_tab_mut();
+        tab.claws_phase = ClawsPhase::Inactive;
+        tab.claws_container_id = None;
+        tab.claws_container_id_rx = None;
         return;
     }
 
     // Container ID is delivered via tick() into claws_container_id.
-    if let Some(container_id) = app.claws_container_id.take() {
-        app.claws_phase = ClawsPhase::Inactive;
-        app.claws_container_id_rx = None;
+    if let Some(container_id) = app.active_tab_mut().claws_container_id.take() {
+        app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+        app.active_tab_mut().claws_container_id_rx = None;
         launch_claws_exec(app, container_id).await;
     } else {
         // Setup completed but no container ID — error path.
-        app.claws_phase = ClawsPhase::Inactive;
-        app.claws_container_id_rx = None;
+        let tab = app.active_tab_mut();
+        tab.claws_phase = ClawsPhase::Inactive;
+        tab.claws_container_id_rx = None;
     }
 }
 
@@ -1221,28 +1271,28 @@ async fn launch_claws_exec(app: &mut App, container_id: String) {
     let container_name = format!("nanoclaw-{}", &container_id[..container_id.len().min(12)]);
     let display_name = state::agent_display_name(&agent_name).to_string();
 
-    app.continue_command("claws ready (attached)".to_string());
-    app.start_container(container_name.clone(), display_name, inner_cols, inner_rows);
+    app.active_tab_mut().continue_command("claws ready (attached)".to_string());
+    app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
 
     match PtySession::spawn("docker", &exec_str_refs, size) {
         Ok((session, pty_rx)) => {
-            app.pty = Some(session);
-            app.pty_rx = Some(pty_rx);
-            app.stats_rx = Some(spawn_stats_poller(container_name));
+            app.active_tab_mut().pty = Some(session);
+            app.active_tab_mut().pty_rx = Some(pty_rx);
+            app.active_tab_mut().stats_rx = Some(spawn_stats_poller(container_name));
         }
         Err(e) => {
-            app.push_output(format!("Failed to attach to nanoclaw container: {}", e));
-            app.finish_command(1);
+            app.active_tab_mut().push_output(format!("Failed to attach to nanoclaw container: {}", e));
+            app.active_tab_mut().finish_command(1);
         }
     }
 }
 
 /// Launch the `new` command after collecting kind and title from the dialog.
 async fn launch_new(app: &mut App, kind: WorkItemKind, title: String) {
-    app.start_command("new".to_string());
+    app.active_tab_mut().start_command("new".to_string());
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    app.exit_rx = Some(exit_rx);
-    let tx = app.output_tx.clone();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    let tx = app.active_tab().output_tx.clone();
     spawn_text_command(tx, exit_tx, move |sink| async move {
         new::run_with_sink(&sink, Some(kind), Some(title)).await
     });

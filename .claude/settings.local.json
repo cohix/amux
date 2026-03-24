@@ -3,7 +3,10 @@
     "allow": [
       "Bash(wc:*)",
       "Bash(grep -r \"aspec\" /workspace/aspec/work-items/*.md)",
-      "Bash(target/release/amux --version)"
+      "Bash(target/release/amux --version)",
+      "Bash(grep \"\\\\.rs$\")",
+      "Bash(xargs cat:*)",
+      "Bash(wait)"
     ]
   }
 }

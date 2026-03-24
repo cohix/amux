@@ -1,7 +1,7 @@
 use crate::cli::Agent;
 use crate::commands::auth::resolve_auth;
 use crate::commands::implement::confirm_mount_scope_stdin;
-use crate::commands::init::{ask_yes_no_stdin, dockerfile_for_agent_embedded, find_git_root, write_dockerfile};
+use crate::commands::init::{ask_yes_no_stdin, dockerfile_for_agent_embedded, find_git_root, find_git_root_from, write_dockerfile};
 use crate::commands::output::OutputSink;
 use crate::config::load_repo_config;
 use crate::docker;
@@ -433,7 +433,9 @@ pub async fn run_pre_audit(
     }
 
     // 2. Git root + project-specific image tag
-    let git_root = find_git_root().context("Not inside a Git repository")?;
+    // Derive the git root from mount_path (the tab's working directory) so that
+    // each tab operates against its own project, not the process CWD.
+    let git_root = find_git_root_from(&mount_path).context("Not inside a Git repository")?;
     let image_tag = docker::project_image_tag(&git_root);
     let dockerfile = git_root.join("Dockerfile.dev");
     let config = load_repo_config(&git_root)?;

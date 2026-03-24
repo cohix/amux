@@ -1,5 +1,5 @@
 use crate::tui::state::{
-    App, ContainerWindowState, Dialog, ExecutionPhase, Focus, LastContainerSummary,
+    App, TabState, ContainerWindowState, Dialog, ExecutionPhase, Focus, LastContainerSummary,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -13,34 +13,45 @@ use ratatui::{
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // Vertical split: tab bar (3 rows) + main content area.
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+    let tab_bar_area = vert[0];
+    let main_area = vert[1];
+
+    draw_tab_bar(frame, app, tab_bar_area);
+
+    let tab = app.active_tab_mut();
+
     // Determine if we need a minimized container bar or a summary bar.
-    let show_minimized_bar = app.container_window == ContainerWindowState::Minimized;
+    let show_minimized_bar = tab.container_window == ContainerWindowState::Minimized;
     let show_summary = !show_minimized_bar
-        && app.container_window == ContainerWindowState::Hidden
-        && app.last_container_summary.is_some();
+        && tab.container_window == ContainerWindowState::Hidden
+        && tab.last_container_summary.is_some();
     let extra_bar_height = if show_minimized_bar || show_summary { 3 } else { 0 };
 
-    // Outer layout: execution section (top) + optional bar + status bar + command box + suggestions.
     let constraints = if extra_bar_height > 0 {
         vec![
-            Constraint::Min(5),                       // execution window (grows)
-            Constraint::Length(extra_bar_height),      // minimized container bar or summary
-            Constraint::Length(1),                     // status / hint bar
-            Constraint::Length(3),                     // command input box
-            Constraint::Length(1),                     // autocomplete suggestions
+            Constraint::Min(5),
+            Constraint::Length(extra_bar_height),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ]
     } else {
         vec![
-            Constraint::Min(5),    // execution window (grows)
-            Constraint::Length(1), // status / hint bar
-            Constraint::Length(3), // command input box
-            Constraint::Length(1), // autocomplete suggestions
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ]
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(area);
+        .split(main_area);
 
     let (exec_area, status_idx, cmd_idx, suggest_idx) = if extra_bar_height > 0 {
         (chunks[0], 2, 3, 4)
@@ -48,27 +59,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (chunks[0], 1, 2, 3)
     };
 
-    draw_exec_window(frame, app, exec_area);
+    draw_exec_window(frame, tab, exec_area);
 
-    // Draw optional minimized container bar or summary.
     if show_minimized_bar {
-        draw_minimized_container_bar(frame, app, chunks[1]);
+        draw_minimized_container_bar(frame, tab, chunks[1]);
     } else if show_summary {
-        draw_container_summary(frame, app.last_container_summary.as_ref().unwrap(), chunks[1]);
+        draw_container_summary(frame, tab.last_container_summary.as_ref().unwrap(), chunks[1]);
     }
 
-    draw_status_bar(frame, app, chunks[status_idx]);
-    draw_command_box(frame, app, chunks[cmd_idx]);
-    draw_suggestions(frame, app, chunks[suggest_idx]);
+    draw_status_bar(frame, tab, chunks[status_idx]);
+    draw_command_box(frame, tab, chunks[cmd_idx]);
+    draw_suggestions(frame, tab, chunks[suggest_idx]);
 
-    // Container window overlays on top of the execution window when maximized.
-    if app.container_window == ContainerWindowState::Maximized {
-        draw_container_window(frame, app, exec_area);
+    if tab.container_window == ContainerWindowState::Maximized {
+        draw_container_window(frame, tab, exec_area);
     }
 
-    // Dialogs are drawn on top (centered, floating).
-    if app.dialog != Dialog::None {
-        draw_dialog(frame, app, area);
+    if tab.dialog != Dialog::None {
+        draw_dialog(frame, tab, area);
     }
 }
 
@@ -77,28 +85,79 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// This mirrors the layout used in `draw_container_window` so the vt100 parser
 /// and PTY are sized to match the actual rendered area.
 pub fn calculate_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
-    // Match the outer layout: exec window takes all vertical space minus fixed rows.
-    // Fixed rows: status bar (1) + command box (3) + suggestions (1) = 5
-    let exec_height = term_rows.saturating_sub(5);
-    // Container window: 95% of exec area width and height, centered.
+    // No sidebar. Tab bar takes 3 rows at top.
+    // Fixed rows below tab bar: status(1) + cmd(3) + suggest(1) = 5.
+    let exec_height = term_rows.saturating_sub(3 + 5);
+    // Container window: 95% of exec area, centered.
     let container_height = (exec_height * 95 / 100).max(5);
     let container_width = (term_cols * 95 / 100).max(10);
-    // Inner area excludes borders (1 row/col on each side).
+    // Inner area excludes borders.
     let inner_rows = container_height.saturating_sub(2);
     let inner_cols = container_width.saturating_sub(2);
     (inner_cols, inner_rows)
 }
 
+// --- Tab bar (horizontal, top) ---
+
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    const TAB_WIDTH: u16 = 20;
+    for (i, tab) in app.tabs.iter().enumerate() {
+        let x = area.x + (i as u16) * TAB_WIDTH;
+        if x + TAB_WIDTH > area.x + area.width {
+            break;
+        }
+        let is_active = i == app.active_tab_idx;
+        // All tabs share the same 3-row height, flush to the top of the tab bar area.
+        let tab_area = Rect { x, y: area.y, width: TAB_WIDTH, height: 3 };
+        let color = tab.tab_color();
+        let project = tab.tab_project_name();
+        let subcmd = tab.tab_subcommand_label(TAB_WIDTH);
+
+        let (border_style, title_style, content_style) = if is_active {
+            (
+                Style::default().fg(color),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                Style::default().fg(color),
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+
+        let title_text = if is_active {
+            format!(" ➡ {} ", project)
+        } else {
+            format!(" {} ", project)
+        };
+
+        let block = Block::default()
+            .title(Span::styled(title_text, title_style))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style);
+
+        let content = Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", subcmd),
+            content_style,
+        )))
+        .block(block);
+        frame.render_widget(content, tab_area);
+    }
+}
+
 // --- Execution window (outer window) ---
 
-fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = app.window_border_color();
+fn draw_exec_window(frame: &mut Frame, tab: &TabState, area: Rect) {
+    let border_color = tab.window_border_color();
     let border_style = Style::default().fg(border_color);
 
     // Calculate how many visual rows fit in the window (subtract borders).
     let inner_height = area.height.saturating_sub(2) as usize;
 
-    let phase_label = match &app.phase {
+    let phase_label = match &tab.phase {
         ExecutionPhase::Idle => " amux ".to_string(),
         ExecutionPhase::Running { command } => format!(" ● running: {} ", command),
         ExecutionPhase::Done { command } => format!(" ✓ done: {} ", command),
@@ -116,8 +175,8 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
 
     let inner_width = area.width.saturating_sub(2) as usize; // exclude borders
 
-    let lines: Vec<Line> = if app.output_lines.is_empty() {
-        if matches!(app.phase, ExecutionPhase::Idle) {
+    let lines: Vec<Line> = if tab.output_lines.is_empty() {
+        if matches!(tab.phase, ExecutionPhase::Idle) {
             vec![
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -133,7 +192,7 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
             vec![]
         }
     } else {
-        app.output_lines
+        tab.output_lines
             .iter()
             .map(|l| Line::from(l.as_str()))
             .collect()
@@ -153,7 +212,7 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
             .sum()
     };
     let max_scroll = total_visual.saturating_sub(inner_height);
-    let effective_offset = app.scroll_offset.min(max_scroll);
+    let effective_offset = tab.scroll_offset.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(effective_offset);
 
     let para = Paragraph::new(lines)
@@ -165,7 +224,7 @@ fn draw_exec_window(frame: &mut Frame, app: &App, area: Rect) {
 
 // --- Container window (overlay on top of outer window) ---
 
-fn draw_container_window(frame: &mut Frame, app: &mut App, outer_area: Rect) {
+fn draw_container_window(frame: &mut Frame, tab: &mut TabState, outer_area: Rect) {
     // Container window takes 95% of the outer window's width and height, centered.
     let container_height = (outer_area.height * 95 / 100).max(5);
     let container_width = (outer_area.width * 95 / 100).max(10);
@@ -182,14 +241,14 @@ fn draw_container_window(frame: &mut Frame, app: &mut App, outer_area: Rect) {
     frame.render_widget(Clear, container_area);
 
     // Build title strings.
-    let agent_name = app
+    let agent_name = tab
         .container_info
         .as_ref()
         .map(|i| i.agent_display_name.as_str())
         .unwrap_or("Agent");
     let left_title = format!(" \u{1F512} {} (containerized) ", agent_name);
 
-    let right_title = build_stats_title(app);
+    let right_title = build_stats_title(tab);
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -199,8 +258,8 @@ fn draw_container_window(frame: &mut Frame, app: &mut App, outer_area: Rect) {
         .border_style(Style::default().fg(Color::Green));
 
     // Show scroll indicator when viewing scrollback.
-    if app.container_scroll_offset > 0 {
-        let scroll_hint = format!(" \u{2191} scrollback ({} lines up) ", app.container_scroll_offset);
+    if tab.container_scroll_offset > 0 {
+        let scroll_hint = format!(" \u{2191} scrollback ({} lines up) ", tab.container_scroll_offset);
         block = block.title(
             Line::from(Span::styled(scroll_hint, Style::default().fg(Color::Yellow)))
                 .alignment(Alignment::Center),
@@ -211,12 +270,12 @@ fn draw_container_window(frame: &mut Frame, app: &mut App, outer_area: Rect) {
     frame.render_widget(block, container_area);
 
     // Render the vt100 terminal emulator screen into the inner area.
-    if let Some(ref mut parser) = app.vt100_parser {
-        if app.container_scroll_offset > 0 {
+    if let Some(ref mut parser) = tab.vt100_parser {
+        if tab.container_scroll_offset > 0 {
             // set_scrollback() supports offsets up to the screen row count.
             // Cap to the screen row count to avoid overflow in the vt100 grid.
             let max_safe = parser.screen().size().0 as usize;
-            let offset = app.container_scroll_offset.min(max_safe);
+            let offset = tab.container_scroll_offset.min(max_safe);
             if offset > 0 {
                 parser.set_scrollback(offset);
                 render_vt100_screen_no_cursor(frame, parser.screen(), inner);
@@ -343,13 +402,13 @@ fn convert_vt100_color(color: vt100::Color) -> Color {
 
 // --- Minimized container bar ---
 
-fn draw_minimized_container_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let agent_name = app
+fn draw_minimized_container_bar(frame: &mut Frame, tab: &TabState, area: Rect) {
+    let agent_name = tab
         .container_info
         .as_ref()
         .map(|i| i.agent_display_name.as_str())
         .unwrap_or("Agent");
-    let stats_title = build_stats_title(app);
+    let stats_title = build_stats_title(tab);
 
     let content = format!(
         "\u{1F512} {} | {}",
@@ -423,8 +482,8 @@ fn draw_container_summary(frame: &mut Frame, summary: &LastContainerSummary, are
 }
 
 /// Build the right-side title for the container window: "name | cpu | mem | time"
-fn build_stats_title(app: &App) -> String {
-    let info = match &app.container_info {
+fn build_stats_title(tab: &TabState) -> String {
+    let info = match &tab.container_info {
         Some(i) => i,
         None => return String::new(),
     };
@@ -444,8 +503,8 @@ fn build_stats_title(app: &App) -> String {
 
 // --- Status / hint bar ---
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let spans: Vec<Span> = match (&app.phase, &app.focus, &app.container_window) {
+fn draw_status_bar(frame: &mut Frame, tab: &TabState, area: Rect) {
+    let spans: Vec<Span> = match (&tab.phase, &tab.focus, &tab.container_window) {
         // Container maximized + window focused: Esc to minimize, scroll for history.
         (ExecutionPhase::Running { .. }, Focus::ExecutionWindow, ContainerWindowState::Maximized) => {
             vec![Span::styled(
@@ -521,41 +580,42 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 // --- Command input box ---
 
-fn draw_command_box(frame: &mut Frame, app: &App, area: Rect) {
-    let is_active = app.focus == Focus::CommandBox
-        && !matches!(app.phase, ExecutionPhase::Running { .. });
+fn draw_command_box(frame: &mut Frame, tab: &TabState, area: Rect) {
+    let is_running = matches!(tab.phase, ExecutionPhase::Running { .. });
+    let is_active = tab.focus == Focus::CommandBox && !is_running;
 
-    let border_color = if is_active {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
+    let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
 
+    let title = if is_active { " command " } else { " command (inactive) " };
     let block = Block::default()
-        .title(if is_active { " command " } else { " command (inactive) " })
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
-    // Show error or current input.
-    let content = if let Some(ref err) = app.input_error {
+    let content = if is_running && tab.focus == Focus::CommandBox {
+        // Blocked: show hint about creating new tab
+        vec![Line::from(vec![Span::styled(
+            "  Press Ctrl+T to run another command in a new tab",
+            Style::default().fg(Color::DarkGray),
+        )])]
+    } else if let Some(ref err) = tab.input_error {
         vec![Line::from(vec![Span::styled(
             format!("  {}", err),
             Style::default().fg(Color::Red),
         )])]
     } else {
         let prefix = Span::styled("> ", Style::default().fg(Color::Cyan));
-        let text = Span::raw(app.input.replace('\n', "↵"));
+        let text = Span::raw(tab.input.replace('\n', "↵"));
         vec![Line::from(vec![prefix, text])]
     };
 
     let para = Paragraph::new(content).block(block);
     frame.render_widget(para, area);
 
-    // Render cursor when active.
-    if is_active && app.input_error.is_none() {
-        let cursor_x = area.x + 1 + 2 + app.cursor_col as u16; // border + "> "
-        let cursor_y = area.y + 1; // inside border
+    if is_active && tab.input_error.is_none() {
+        let cursor_x = area.x + 1 + 2 + tab.cursor_col as u16;
+        let cursor_y = area.y + 1;
         if cursor_x < area.x + area.width - 1 {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
@@ -564,12 +624,22 @@ fn draw_command_box(frame: &mut Frame, app: &App, area: Rect) {
 
 // --- Autocomplete suggestions ---
 
-fn draw_suggestions(frame: &mut Frame, app: &App, area: Rect) {
-    if app.suggestions.is_empty() || app.focus != Focus::CommandBox {
+fn draw_suggestions(frame: &mut Frame, tab: &TabState, area: Rect) {
+    if tab.focus != Focus::CommandBox {
+        return;
+    }
+    if tab.suggestions.is_empty() {
+        // Show the current working directory when no suggestions.
+        let cwd_str = tab.cwd.to_string_lossy();
+        let para = Paragraph::new(Line::from(vec![
+            Span::styled("  cwd: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_str.as_ref().to_string(), Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(para, area);
         return;
     }
 
-    let spans: Vec<Span> = app
+    let spans: Vec<Span> = tab
         .suggestions
         .iter()
         .enumerate()
@@ -586,16 +656,25 @@ fn draw_suggestions(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let para = Paragraph::new(Line::from(spans))
-        .style(Style::default().fg(Color::DarkGray));
-
+    let para = Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(para, area);
 }
 
 // --- Modal dialogs ---
 
-fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, body) = match &app.dialog {
+fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
+    let (title, body) = match &tab.dialog {
+        Dialog::CloseTabConfirm => (
+            " Close Tab? ",
+            "  1) Close this tab\n  2) Exit amux\n  3) Cancel\n\n  [1/2/3 or Esc]  ".to_string(),
+        ),
+        Dialog::NewTabDirectory { input } => (
+            " New Tab — Working Directory ",
+            format!(
+                "  Enter working directory for new tab:\n\n  > {}\n\n  [Enter to confirm, Esc to cancel]  ",
+                input
+            ),
+        ),
         Dialog::QuitConfirm => (
             " Quit amux? ",
             "  Are you sure you want to quit? [y/n]  ".to_string(),
@@ -620,12 +699,12 @@ fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
             " New Work Item — Type ",
             "  Select work item type:\n\n  1) Feature\n  2) Bug\n  3) Task\n\n  [1/2/3 or Esc to cancel]  ".to_string(),
         ),
-        Dialog::NewTitleInput { kind, title } => (
+        Dialog::NewTitleInput { kind, title: item_title } => (
             " New Work Item — Title ",
             format!(
                 "  Type: {}\n\n  Enter title: {}\n\n  [Enter to confirm, Esc to cancel]  ",
                 kind.as_str(),
-                title
+                item_title
             ),
         ),
         Dialog::ClawsReadyHasForked => (
@@ -697,21 +776,23 @@ mod tests {
     use crate::tui::state::App;
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn new_app() -> App {
+        App::new(std::path::PathBuf::new())
+    }
+
     /// Helper: render the app into a TestBackend and return the text content
     /// of the execution window's inner area (excluding borders).
+    /// No sidebar. Tab bar is 3 rows at top. Exec window starts after tab bar.
     fn render_exec_window_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| draw(f, app))
-            .unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
         let buf = terminal.backend().buffer();
-        // The exec window occupies the top area. Layout: Min(5), Len(1), Len(3), Len(1).
-        // So exec window height = total_height - 5 (status bar + cmd box + suggestions).
-        let exec_height = height.saturating_sub(5);
-        // Inner area excludes borders (1 row top, 1 row bottom, 1 col left, 1 col right).
-        let inner_top = 1u16;
-        let inner_left = 1u16;
+        // Tab bar takes 3 rows. Exec window height = total - 3 (tab bar) - 5 (status+cmd+suggest).
+        let tab_bar_height = 3u16;
+        let exec_height = height.saturating_sub(tab_bar_height + 5);
+        let inner_top = tab_bar_height + 1; // after tab bar + top border
+        let inner_left = 1u16;              // no sidebar, just left border
         let inner_width = width.saturating_sub(2);
         let inner_rows = exec_height.saturating_sub(2);
 
@@ -729,20 +810,21 @@ mod tests {
 
     #[test]
     fn scroll_changes_visible_content_in_done_state() {
-        let mut app = App::new();
-        // Terminal: 40 wide, 15 tall → exec window = 15-5=10 rows → inner = 8 rows
+        let mut app = new_app();
+        // Terminal: 40 wide, 18 tall
+        // exec window = 18 - 3 (tab bar) - 5 (status+cmd+suggest) = 10 rows → inner = 8 rows
         // Add 20 lines of output so there's content to scroll through.
         for i in 0..20 {
-            app.output_lines.push(format!("line {}", i));
+            app.active_tab_mut().output_lines.push(format!("line {}", i));
         }
-        app.phase = ExecutionPhase::Done {
+        app.active_tab_mut().phase = ExecutionPhase::Done {
             command: "ready".into(),
         };
-        app.focus = Focus::ExecutionWindow;
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
 
         // scroll_offset=0 → should show the LAST 8 lines (lines 12-19).
-        app.scroll_offset = 0;
-        let view0 = render_exec_window_lines(&mut app, 40, 15);
+        app.active_tab_mut().scroll_offset = 0;
+        let view0 = render_exec_window_lines(&mut app, 40, 18);
         assert!(
             view0.iter().any(|l| l.contains("line 19")),
             "scroll_offset=0 should show line 19 (newest). Got: {:?}",
@@ -754,12 +836,12 @@ mod tests {
             view0
         );
 
-        // scroll_offset=5 → should show earlier content.
-        app.scroll_offset = 5;
-        let view5 = render_exec_window_lines(&mut app, 40, 15);
+        // scroll_offset=5 → should show earlier content (lines 7-14 with 8 inner rows).
+        app.active_tab_mut().scroll_offset = 5;
+        let view5 = render_exec_window_lines(&mut app, 40, 18);
         assert!(
-            view5.iter().any(|l| l.contains("line 7")),
-            "scroll_offset=5 should show line 7. Got: {:?}",
+            view5.iter().any(|l| l.contains("line 8")),
+            "scroll_offset=5 should show line 8. Got: {:?}",
             view5
         );
 
@@ -770,8 +852,8 @@ mod tests {
         );
 
         // scroll_offset=max → should show the FIRST lines.
-        app.scroll_offset = 20;
-        let view_top = render_exec_window_lines(&mut app, 40, 15);
+        app.active_tab_mut().scroll_offset = 20;
+        let view_top = render_exec_window_lines(&mut app, 40, 18);
         assert!(
             view_top.iter().any(|l| l.contains("line 0")),
             "scroll_offset=max should show line 0 (oldest). Got: {:?}",
@@ -781,20 +863,19 @@ mod tests {
 
     #[test]
     fn unicode_lines_do_not_cause_scroll_overshoot() {
-        let mut app = App::new();
+        let mut app = new_app();
         // Box-drawing chars: "─" is 3 bytes but 1 display column.
         for i in 0..10 {
-            app.output_lines
-                .push(format!("──── step {} ────", i));
+            app.active_tab_mut().output_lines.push(format!("──── step {} ────", i));
         }
-        app.phase = ExecutionPhase::Done {
+        app.active_tab_mut().phase = ExecutionPhase::Done {
             command: "ready".into(),
         };
-        app.focus = Focus::ExecutionWindow;
-        app.scroll_offset = 0;
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().scroll_offset = 0;
 
-        // 40 wide, 15 tall → inner = 8 rows. 10 lines of ~16 display cols each.
-        let view = render_exec_window_lines(&mut app, 40, 15);
+        // 40 wide, 18 tall → exec_height = 9, inner = 7 rows.
+        let view = render_exec_window_lines(&mut app, 40, 18);
         assert!(
             view.iter().any(|l| l.contains("step 9")),
             "Newest line must be visible with Unicode content. Got: {:?}",
@@ -804,9 +885,9 @@ mod tests {
 
     #[test]
     fn container_summary_renders_after_container_exit() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Done { command: "implement 0001".into() };
-        app.last_container_summary = Some(LastContainerSummary {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Done { command: "implement 0001".into() };
+        app.active_tab_mut().last_container_summary = Some(LastContainerSummary {
             agent_display_name: "Claude Code".into(),
             container_name: "amux-test".into(),
             avg_cpu: "5.0%".into(),
@@ -841,15 +922,15 @@ mod tests {
 
     #[test]
     fn container_window_renders_when_maximized() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
         // Use size matching what TestBackend(80,25) would produce.
         let (inner_cols, inner_rows) = calculate_container_inner_size(80, 25);
-        app.start_container("amux-test".into(), "Claude Code".into(), inner_cols, inner_rows);
+        app.active_tab_mut().start_container("amux-test".into(), "Claude Code".into(), inner_cols, inner_rows);
 
         // Feed data through the vt100 parser.
-        if let Some(ref mut parser) = app.vt100_parser {
+        if let Some(ref mut parser) = app.active_tab_mut().vt100_parser {
             parser.process(b"Hello from container\r\n");
         }
 
@@ -879,11 +960,11 @@ mod tests {
 
     #[test]
     fn minimized_container_bar_renders() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.start_container("amux-test".into(), "Claude Code".into(), 78, 18);
-        app.container_window = ContainerWindowState::Minimized;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().start_container("amux-test".into(), "Claude Code".into(), 78, 18);
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -906,38 +987,35 @@ mod tests {
     #[test]
     fn calculate_container_inner_size_reasonable_values() {
         let (cols, rows) = calculate_container_inner_size(80, 25);
-        // exec_height = 25 - 5 = 20
-        // container_height = 20 * 95 / 100 = 19
+        // exec_height = 25 - 3 (tab bar) - 5 (status+cmd+suggest) = 17
+        // container_height = 17 * 95 / 100 = 16
         // container_width = 80 * 95 / 100 = 76
-        // inner_rows = 19 - 2 = 17
+        // inner_rows = 16 - 2 = 14
         // inner_cols = 76 - 2 = 74
         assert_eq!(cols, 74);
-        assert_eq!(rows, 17);
+        assert_eq!(rows, 14);
     }
 
     #[test]
     fn container_window_is_95_percent_and_centered() {
-        // Verify the container window occupies 95% of outer area and is centered.
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
+        // Verify the container window occupies 95% of content area and is centered.
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
         let (inner_cols, inner_rows) = calculate_container_inner_size(100, 30);
-        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+        app.active_tab_mut().start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
-        // exec_height = 30 - 5 = 25
-        // container_height = 25 * 95 / 100 = 23
-        // container_width = 100 * 95 / 100 = 95
-        // offset_x = (100 - 95) / 2 = 2
-        // offset_y = (25 - 23) / 2 = 1
-        // Container border should be at (2, 1) with green border.
-        // Verify the container window is rendered in the centered area by checking
-        // that the border characters appear at the expected position.
-        let corner = buf[(2, 1)].symbol().to_string();
+        // No sidebar. exec_height = 30 - 4 (tab bar) - 5 = 21
+        // container_width = 100 * 95/100 = 95, container_height = 21 * 95/100 = 19
+        // offset_x = (100 - 95)/2 = 2, offset_y = (21 - 19)/2 = 1
+        // abs_x = 0 + 2 = 2, abs_y = 4 (tab bar) + 1 (offset_y) = 5
+        // Border at (2, 5)
+        let corner = buf[(2, 5)].symbol().to_string();
         assert!(
             corner == "╭" || corner == "│" || corner == "─",
             "Container border character should appear at centered position. Got: '{}'",
@@ -968,22 +1046,22 @@ mod tests {
 
     #[test]
     fn container_scrollback_renders_older_content() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
         let (inner_cols, inner_rows) = calculate_container_inner_size(80, 25);
-        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+        app.active_tab_mut().start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
 
         // Feed enough data to create scrollback: write many lines to push
         // content into the scrollback buffer.
-        if let Some(ref mut parser) = app.vt100_parser {
+        if let Some(ref mut parser) = app.active_tab_mut().vt100_parser {
             for i in 0..50 {
                 parser.process(format!("scrollback line {}\r\n", i).as_bytes());
             }
         }
 
         // At offset 0, the latest lines should be visible.
-        app.container_scroll_offset = 0;
+        app.active_tab_mut().container_scroll_offset = 0;
         let backend = TestBackend::new(80, 25);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1000,10 +1078,8 @@ mod tests {
         );
 
         // Scroll up by a safe amount (capped at screen rows = inner_rows).
-        // With inner_rows = 17 and 50 lines written, scrollback has 33 lines.
-        // Max safe offset is inner_rows (17) due to vt100 set_scrollback limits.
         let max_safe = inner_rows as usize;
-        app.container_scroll_offset = max_safe;
+        app.active_tab_mut().container_scroll_offset = max_safe;
         let backend = TestBackend::new(80, 25);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1028,22 +1104,21 @@ mod tests {
 
     #[test]
     fn container_scroll_indicator_shown_when_scrolled() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
         let (inner_cols, inner_rows) = calculate_container_inner_size(80, 25);
-        app.start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
+        app.active_tab_mut().start_container("test".into(), "Agent".into(), inner_cols, inner_rows);
 
         // Feed data to create scrollback.
-        if let Some(ref mut parser) = app.vt100_parser {
+        if let Some(ref mut parser) = app.active_tab_mut().vt100_parser {
             for i in 0..50 {
                 parser.process(format!("line {}\r\n", i).as_bytes());
             }
         }
 
         // Use a scroll offset within the safe range (≤ screen rows).
-        let (_, inner_rows) = calculate_container_inner_size(80, 25);
-        app.container_scroll_offset = (inner_rows as usize).min(10);
+        app.active_tab_mut().container_scroll_offset = (inner_rows as usize).min(10);
         let backend = TestBackend::new(80, 25);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1064,29 +1139,52 @@ mod tests {
     fn outer_window_scroll_unaffected_by_container_changes() {
         // Verify that the outer execution window scrolling still works correctly
         // even when container-related state is present.
-        let mut app = App::new();
+        let mut app = new_app();
         for i in 0..20 {
-            app.output_lines.push(format!("outer line {}", i));
+            app.active_tab_mut().output_lines.push(format!("outer line {}", i));
         }
-        app.phase = ExecutionPhase::Done { command: "ready".into() };
-        app.focus = Focus::ExecutionWindow;
+        app.active_tab_mut().phase = ExecutionPhase::Done { command: "ready".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
         // Container is hidden (default) — this should not affect outer scrolling.
-        app.container_scroll_offset = 5; // stale value, should be irrelevant
+        app.active_tab_mut().container_scroll_offset = 5; // stale value, should be irrelevant
 
-        app.scroll_offset = 0;
-        let view_bottom = render_exec_window_lines(&mut app, 40, 15);
+        app.active_tab_mut().scroll_offset = 0;
+        let view_bottom = render_exec_window_lines(&mut app, 40, 18);
         assert!(
             view_bottom.iter().any(|l| l.contains("outer line 19")),
             "Outer window should show newest line at offset 0. Got: {:?}",
             view_bottom
         );
 
-        app.scroll_offset = 10;
-        let view_scrolled = render_exec_window_lines(&mut app, 40, 15);
+        app.active_tab_mut().scroll_offset = 10;
+        let view_scrolled = render_exec_window_lines(&mut app, 40, 18);
         assert!(
             !view_scrolled.iter().any(|l| l.contains("outer line 19")),
             "Outer window should not show newest line at offset 10. Got: {:?}",
             view_scrolled
+        );
+    }
+
+    #[test]
+    fn tab_bar_renders_at_top() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/myproject"));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Top-left corner of the first tab's rounded border should be at (0, 0).
+        let corner = buf[(0, 0)].symbol().to_string();
+        assert!(
+            corner == "╭" || corner == "─",
+            "Tab bar border at (0,0): '{}'",
+            corner
+        );
+        // Row 3 should be the start of the exec window border (tab bar is 3 rows).
+        let exec_border = buf[(0, 3)].symbol().to_string();
+        assert!(
+            exec_border == "╭" || exec_border == "─" || exec_border == " ",
+            "Exec window border or space should start at row 3. Got: '{}'",
+            exec_border
         );
     }
 }

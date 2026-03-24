@@ -1,5 +1,5 @@
 use crate::commands::new::WorkItemKind;
-use crate::tui::state::{App, ContainerWindowState, Dialog, ExecutionPhase, Focus};
+use crate::tui::state::{App, TabState, ContainerWindowState, Dialog, ExecutionPhase, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use strsim::levenshtein;
@@ -28,51 +28,74 @@ pub enum Action {
     ClawsReadyProceed,
     /// Claws subsequent run: start the stopped container.
     ClawsReadyStartContainer,
+    // Tab management actions:
+    CreateTab,
+    SwitchTabLeft,
+    SwitchTabRight,
+    CloseCurrentTab,
+    NewTabDirectoryChosen(PathBuf),
 }
 
 /// Dispatch a key press to the correct handler based on application state.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     // Modal dialogs intercept all input.
-    match &app.dialog.clone() {
-        Dialog::QuitConfirm => return handle_quit_confirm(app, key),
+    let dialog = app.active_tab().dialog.clone();
+    match dialog {
+        Dialog::QuitConfirm => return handle_quit_confirm(app.active_tab_mut(), key),
+        Dialog::CloseTabConfirm => return handle_close_tab_confirm(app.active_tab_mut(), key),
         Dialog::MountScope { git_root, cwd } => {
-            return handle_mount_scope(app, key, git_root.clone(), cwd.clone())
+            return handle_mount_scope(app.active_tab_mut(), key, git_root, cwd)
         }
-        Dialog::AgentAuth { .. } => return handle_agent_auth(app, key),
-        Dialog::NewKindSelect => return handle_new_kind_select(app, key),
+        Dialog::AgentAuth { .. } => return handle_agent_auth(app.active_tab_mut(), key),
+        Dialog::NewKindSelect => return handle_new_kind_select(app.active_tab_mut(), key),
         Dialog::NewTitleInput { kind, title } => {
-            return handle_new_title_input(app, key, kind.clone(), title.clone())
+            return handle_new_title_input(app.active_tab_mut(), key, kind, title)
         }
-        Dialog::ClawsReadyHasForked => return handle_claws_has_forked(app, key),
+        Dialog::NewTabDirectory { input } => {
+            return handle_new_tab_directory(app.active_tab_mut(), key, input)
+        }
+        Dialog::ClawsReadyHasForked => return handle_claws_has_forked(app.active_tab_mut(), key),
         Dialog::ClawsReadyUsernameInput { username } => {
-            return handle_claws_username_input(app, key, username.clone())
+            return handle_claws_username_input(app.active_tab_mut(), key, username)
         }
         Dialog::ClawsReadyDockerSocketWarning => {
-            return handle_claws_docker_socket_warning(app, key)
+            return handle_claws_docker_socket_warning(app.active_tab_mut(), key)
         }
-        Dialog::ClawsReadySetupExplain => return handle_claws_setup_explain(app, key),
-        Dialog::ClawsReadyOfferStart => return handle_claws_offer_start(app, key),
+        Dialog::ClawsReadySetupExplain => return handle_claws_setup_explain(app.active_tab_mut(), key),
+        Dialog::ClawsReadyOfferStart => return handle_claws_offer_start(app.active_tab_mut(), key),
         Dialog::ClawsReadySudoConfirm { password } => {
-            return handle_claws_sudo_confirm(app, key, password.clone())
+            return handle_claws_sudo_confirm(app.active_tab_mut(), key, password)
         }
         Dialog::None => {}
     }
 
-    match app.focus {
-        Focus::ExecutionWindow => handle_window_key(app, key),
-        Focus::CommandBox => handle_input_key(app, key),
+    // Tab management keys (only when no dialog active).
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('t') => return Action::CreateTab,
+            KeyCode::Char('a') => return Action::SwitchTabLeft,
+            KeyCode::Char('d') => return Action::SwitchTabRight,
+            _ => {}
+        }
+    }
+
+    let num_tabs = app.tabs.len();
+    let tab = app.active_tab_mut();
+    match tab.focus {
+        Focus::ExecutionWindow => handle_window_key(tab, key),
+        Focus::CommandBox => handle_input_key(tab, key, num_tabs),
     }
 }
 
 // --- Execution window key handling ---
 
-fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
-    match &app.phase {
+fn handle_window_key(tab: &mut TabState, key: KeyEvent) -> Action {
+    match &tab.phase {
         ExecutionPhase::Running { .. } => {
             // Container window maximized: Esc minimizes instead of going to command box.
-            if app.container_window == ContainerWindowState::Maximized {
+            if tab.container_window == ContainerWindowState::Maximized {
                 if key.code == KeyCode::Esc {
-                    app.container_window = ContainerWindowState::Minimized;
+                    tab.container_window = ContainerWindowState::Minimized;
                     return Action::None;
                 }
                 // All other keys forwarded to the PTY for full interactivity.
@@ -83,29 +106,29 @@ fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
             }
 
             // Container window minimized: outer window is in focus for scrolling.
-            if app.container_window == ContainerWindowState::Minimized {
+            if tab.container_window == ContainerWindowState::Minimized {
                 match key.code {
                     KeyCode::Char('c') => {
-                        app.container_window = ContainerWindowState::Maximized;
+                        tab.container_window = ContainerWindowState::Maximized;
                         return Action::None;
                     }
                     KeyCode::Up => {
-                        let max = app.output_lines.len();
-                        if app.scroll_offset < max {
-                            app.scroll_offset = app.scroll_offset.saturating_add(1);
+                        let max = tab.output_lines.len();
+                        if tab.scroll_offset < max {
+                            tab.scroll_offset = tab.scroll_offset.saturating_add(1);
                         }
                     }
                     KeyCode::Down => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                        tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
                     }
                     KeyCode::Char('b') => {
-                        app.scroll_offset = app.output_lines.len();
+                        tab.scroll_offset = tab.output_lines.len();
                     }
                     KeyCode::Char('e') => {
-                        app.scroll_offset = 0;
+                        tab.scroll_offset = 0;
                     }
                     KeyCode::Esc => {
-                        app.focus = Focus::CommandBox;
+                        tab.focus = Focus::CommandBox;
                     }
                     _ => {}
                 }
@@ -114,7 +137,7 @@ fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
 
             // No container window: original behavior.
             if key.code == KeyCode::Esc {
-                app.focus = Focus::CommandBox;
+                tab.focus = Focus::CommandBox;
                 return Action::None;
             }
             // Forward all other keys to the PTY.
@@ -126,33 +149,33 @@ fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
             match key.code {
                 KeyCode::Up => {
                     // Cap at total lines so we don't scroll past the beginning.
-                    let max = app.output_lines.len();
-                    if app.scroll_offset < max {
-                        app.scroll_offset = app.scroll_offset.saturating_add(1);
+                    let max = tab.output_lines.len();
+                    if tab.scroll_offset < max {
+                        tab.scroll_offset = tab.scroll_offset.saturating_add(1);
                     }
                 }
                 KeyCode::Down => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                    tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
                 }
                 KeyCode::Char('b') => {
                     // Jump to the beginning (oldest output).
-                    app.scroll_offset = app.output_lines.len();
+                    tab.scroll_offset = tab.output_lines.len();
                 }
                 KeyCode::Char('e') => {
                     // Jump to the end (newest output).
-                    app.scroll_offset = 0;
+                    tab.scroll_offset = 0;
                 }
                 KeyCode::Esc => {
-                    app.focus = Focus::CommandBox;
+                    tab.focus = Focus::CommandBox;
                 }
                 _ => {
                     // Any other key refocuses the command box.
-                    app.focus = Focus::CommandBox;
+                    tab.focus = Focus::CommandBox;
                 }
             }
         }
         ExecutionPhase::Idle => {
-            app.focus = Focus::CommandBox;
+            tab.focus = Focus::CommandBox;
         }
     }
     Action::None
@@ -160,51 +183,62 @@ fn handle_window_key(app: &mut App, key: KeyEvent) -> Action {
 
 // --- Command input box key handling ---
 
-fn handle_input_key(app: &mut App, key: KeyEvent) -> Action {
-    // Ctrl+C or 'q' with empty input → quit confirm.
+fn handle_input_key(tab: &mut TabState, key: KeyEvent, num_tabs: usize) -> Action {
+    // Ctrl+C → close tab (if multiple tabs open) or quit confirm (single tab).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.dialog = Dialog::QuitConfirm;
+        if num_tabs > 1 {
+            tab.dialog = Dialog::CloseTabConfirm;
+        } else {
+            tab.dialog = Dialog::QuitConfirm;
+        }
         return Action::None;
     }
-    if key.code == KeyCode::Char('q') && app.input.is_empty() {
-        app.dialog = Dialog::QuitConfirm;
+
+    // Up arrow navigates to the execution window regardless of phase.
+    if key.code == KeyCode::Up {
+        if !tab.output_lines.is_empty() {
+            tab.focus = Focus::ExecutionWindow;
+        }
+        return Action::None;
+    }
+
+    // When a command is running, the command box is view-only (block editing input).
+    if matches!(tab.phase, ExecutionPhase::Running { .. }) {
+        return Action::None;
+    }
+
+    if key.code == KeyCode::Char('q') && tab.input.is_empty() {
+        tab.dialog = Dialog::QuitConfirm;
         return Action::None;
     }
 
     // Shift+Enter → insert newline.
     if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
-        app.input.insert(app.cursor_col, '\n');
-        app.cursor_col += 1;
-        app.suggestions = autocomplete_suggestions(&app.input);
+        tab.input.insert(tab.cursor_col, '\n');
+        tab.cursor_col += 1;
+        tab.suggestions = autocomplete_suggestions(&tab.input);
         return Action::None;
     }
 
     // Enter → submit command.
     if key.code == KeyCode::Enter {
-        let cmd = app.input.trim().to_string();
-        app.input.clear();
-        app.cursor_col = 0;
-        app.suggestions.clear();
-        app.input_error = None;
+        let cmd = tab.input.trim().to_string();
+        tab.input.clear();
+        tab.cursor_col = 0;
+        tab.suggestions.clear();
+        tab.input_error = None;
         return Action::Submit(cmd);
     }
 
-    // Arrow keys: move cursor or refocus window.
+    // Arrow keys: move cursor.
     match key.code {
         KeyCode::Left => {
-            app.cursor_col = app.cursor_col.saturating_sub(1);
+            tab.cursor_col = tab.cursor_col.saturating_sub(1);
             return Action::None;
         }
         KeyCode::Right => {
-            if app.cursor_col < app.input.len() {
-                app.cursor_col += 1;
-            }
-            return Action::None;
-        }
-        KeyCode::Up => {
-            // If the window has content, click into it for scrolling.
-            if !app.output_lines.is_empty() {
-                app.focus = Focus::ExecutionWindow;
+            if tab.cursor_col < tab.input.len() {
+                tab.cursor_col += 1;
             }
             return Action::None;
         }
@@ -212,27 +246,27 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> Action {
     }
 
     // Backspace.
-    if key.code == KeyCode::Backspace && app.cursor_col > 0 {
-        app.cursor_col -= 1;
-        app.input.remove(app.cursor_col);
-        app.suggestions = autocomplete_suggestions(&app.input);
-        app.input_error = None;
+    if key.code == KeyCode::Backspace && tab.cursor_col > 0 {
+        tab.cursor_col -= 1;
+        tab.input.remove(tab.cursor_col);
+        tab.suggestions = autocomplete_suggestions(&tab.input);
+        tab.input_error = None;
         return Action::None;
     }
 
     // Delete.
-    if key.code == KeyCode::Delete && app.cursor_col < app.input.len() {
-        app.input.remove(app.cursor_col);
-        app.suggestions = autocomplete_suggestions(&app.input);
+    if key.code == KeyCode::Delete && tab.cursor_col < tab.input.len() {
+        tab.input.remove(tab.cursor_col);
+        tab.suggestions = autocomplete_suggestions(&tab.input);
         return Action::None;
     }
 
     // Regular character.
     if let KeyCode::Char(c) = key.code {
-        app.input.insert(app.cursor_col, c);
-        app.cursor_col += 1;
-        app.suggestions = autocomplete_suggestions(&app.input);
-        app.input_error = None;
+        tab.input.insert(tab.cursor_col, c);
+        tab.cursor_col += 1;
+        tab.suggestions = autocomplete_suggestions(&tab.input);
+        tab.input_error = None;
     }
 
     Action::None
@@ -240,52 +274,99 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> Action {
 
 // --- Dialog handlers ---
 
-fn handle_quit_confirm(app: &mut App, key: KeyEvent) -> Action {
+fn handle_quit_confirm(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::QuitConfirmed;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
         }
         _ => {}
     }
     Action::None
 }
 
+fn handle_close_tab_confirm(tab: &mut TabState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('1') => {
+            tab.dialog = Dialog::None;
+            Action::CloseCurrentTab
+        }
+        KeyCode::Char('2') => {
+            tab.dialog = Dialog::None;
+            Action::QuitConfirmed
+        }
+        KeyCode::Char('3') | KeyCode::Esc => {
+            tab.dialog = Dialog::None;
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+fn handle_new_tab_directory(tab: &mut TabState, key: KeyEvent, mut input: String) -> Action {
+    match key.code {
+        KeyCode::Enter => {
+            tab.dialog = Dialog::None;
+            let path = if input.trim().is_empty() {
+                tab.cwd.clone()
+            } else {
+                PathBuf::from(input.trim())
+            };
+            Action::NewTabDirectoryChosen(path)
+        }
+        KeyCode::Esc => {
+            tab.dialog = Dialog::None;
+            Action::None
+        }
+        KeyCode::Backspace => {
+            input.pop();
+            tab.dialog = Dialog::NewTabDirectory { input };
+            Action::None
+        }
+        KeyCode::Char(c) => {
+            input.push(c);
+            tab.dialog = Dialog::NewTabDirectory { input };
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
 fn handle_mount_scope(
-    app: &mut App,
+    tab: &mut TabState,
     key: KeyEvent,
     git_root: PathBuf,
     cwd: PathBuf,
 ) -> Action {
     match key.code {
         KeyCode::Char('r') | KeyCode::Char('R') => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::MountScopeChosen(git_root);
         }
         KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Enter => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::MountScopeChosen(cwd);
         }
         KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Command cancelled.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Command cancelled.".into());
         }
         _ => {}
     }
     Action::None
 }
 
-fn handle_agent_auth(app: &mut App, key: KeyEvent) -> Action {
+fn handle_agent_auth(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::AuthAccepted;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::AuthDeclined;
         }
         _ => {}
@@ -293,29 +374,29 @@ fn handle_agent_auth(app: &mut App, key: KeyEvent) -> Action {
     Action::None
 }
 
-fn handle_new_kind_select(app: &mut App, key: KeyEvent) -> Action {
+fn handle_new_kind_select(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('1') | KeyCode::Char('f') | KeyCode::Char('F') => {
-            app.dialog = Dialog::NewTitleInput {
+            tab.dialog = Dialog::NewTitleInput {
                 kind: WorkItemKind::Feature,
                 title: String::new(),
             };
         }
         KeyCode::Char('2') | KeyCode::Char('b') | KeyCode::Char('B') => {
-            app.dialog = Dialog::NewTitleInput {
+            tab.dialog = Dialog::NewTitleInput {
                 kind: WorkItemKind::Bug,
                 title: String::new(),
             };
         }
         KeyCode::Char('3') | KeyCode::Char('t') | KeyCode::Char('T') => {
-            app.dialog = Dialog::NewTitleInput {
+            tab.dialog = Dialog::NewTitleInput {
                 kind: WorkItemKind::Task,
                 title: String::new(),
             };
         }
         KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Command cancelled.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Command cancelled.".into());
         }
         _ => {}
     }
@@ -323,7 +404,7 @@ fn handle_new_kind_select(app: &mut App, key: KeyEvent) -> Action {
 }
 
 fn handle_new_title_input(
-    app: &mut App,
+    tab: &mut TabState,
     key: KeyEvent,
     kind: WorkItemKind,
     mut title: String,
@@ -334,23 +415,23 @@ fn handle_new_title_input(
             if trimmed.is_empty() {
                 return Action::None;
             }
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::NewWorkItem {
                 kind,
                 title: trimmed,
             };
         }
         KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Command cancelled.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Command cancelled.".into());
         }
         KeyCode::Backspace => {
             title.pop();
-            app.dialog = Dialog::NewTitleInput { kind, title };
+            tab.dialog = Dialog::NewTitleInput { kind, title };
         }
         KeyCode::Char(c) => {
             title.push(c);
-            app.dialog = Dialog::NewTitleInput { kind, title };
+            tab.dialog = Dialog::NewTitleInput { kind, title };
         }
         _ => {}
     }
@@ -359,15 +440,15 @@ fn handle_new_title_input(
 
 // --- Claws dialog handlers ---
 
-fn handle_claws_has_forked(app: &mut App, key: KeyEvent) -> Action {
+fn handle_claws_has_forked(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
-            app.claws_wizard_already_forked = true;
-            app.dialog = Dialog::ClawsReadyUsernameInput { username: String::new() };
+            tab.claws_wizard_already_forked = true;
+            tab.dialog = Dialog::ClawsReadyUsernameInput { username: String::new() };
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some(
+            tab.dialog = Dialog::None;
+            tab.input_error = Some(
                 "Please fork nanoclaw at github.com/qwibitai/nanoclaw, \
                  then run 'claws ready' again."
                     .into(),
@@ -378,44 +459,44 @@ fn handle_claws_has_forked(app: &mut App, key: KeyEvent) -> Action {
     Action::None
 }
 
-fn handle_claws_username_input(app: &mut App, key: KeyEvent, mut username: String) -> Action {
+fn handle_claws_username_input(tab: &mut TabState, key: KeyEvent, mut username: String) -> Action {
     match key.code {
         KeyCode::Enter => {
             let trimmed = username.trim().to_string();
             if trimmed.is_empty() {
                 return Action::None;
             }
-            app.claws_wizard_username = Some(trimmed);
-            app.dialog = Dialog::ClawsReadySetupExplain;
+            tab.claws_wizard_username = Some(trimmed);
+            tab.dialog = Dialog::ClawsReadySetupExplain;
         }
         KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Command cancelled.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Command cancelled.".into());
         }
         KeyCode::Backspace => {
             username.pop();
-            app.dialog = Dialog::ClawsReadyUsernameInput { username };
+            tab.dialog = Dialog::ClawsReadyUsernameInput { username };
         }
         KeyCode::Char(c) => {
             username.push(c);
-            app.dialog = Dialog::ClawsReadyUsernameInput { username };
+            tab.dialog = Dialog::ClawsReadyUsernameInput { username };
         }
         _ => {}
     }
     Action::None
 }
 
-fn handle_claws_docker_socket_warning(app: &mut App, key: KeyEvent) -> Action {
+fn handle_claws_docker_socket_warning(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
-            app.dialog = Dialog::None;
-            if let Some(tx) = app.claws_docker_accept_response_tx.take() {
+            tab.dialog = Dialog::None;
+            if let Some(tx) = tab.claws_docker_accept_response_tx.take() {
                 let _ = tx.send(true);
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            if let Some(tx) = app.claws_docker_accept_response_tx.take() {
+            tab.dialog = Dialog::None;
+            if let Some(tx) = tab.claws_docker_accept_response_tx.take() {
                 let _ = tx.send(false);
             }
         }
@@ -424,57 +505,57 @@ fn handle_claws_docker_socket_warning(app: &mut App, key: KeyEvent) -> Action {
     Action::None
 }
 
-fn handle_claws_setup_explain(app: &mut App, key: KeyEvent) -> Action {
+fn handle_claws_setup_explain(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::ClawsReadyProceed;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Setup cancelled.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Setup cancelled.".into());
         }
         _ => {}
     }
     Action::None
 }
 
-fn handle_claws_offer_start(app: &mut App, key: KeyEvent) -> Action {
+fn handle_claws_offer_start(tab: &mut TabState, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
-            app.dialog = Dialog::None;
+            tab.dialog = Dialog::None;
             return Action::ClawsReadyStartContainer;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2') | KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            app.input_error = Some("Container not started.".into());
+            tab.dialog = Dialog::None;
+            tab.input_error = Some("Container not started.".into());
         }
         _ => {}
     }
     Action::None
 }
 
-fn handle_claws_sudo_confirm(app: &mut App, key: KeyEvent, mut password: String) -> Action {
+fn handle_claws_sudo_confirm(tab: &mut TabState, key: KeyEvent, mut password: String) -> Action {
     match key.code {
         KeyCode::Enter => {
-            app.dialog = Dialog::None;
-            if let Some(tx) = app.claws_sudo_response_tx.take() {
+            tab.dialog = Dialog::None;
+            if let Some(tx) = tab.claws_sudo_response_tx.take() {
                 let _ = tx.send(Some(password));
             }
         }
         KeyCode::Esc => {
-            app.dialog = Dialog::None;
-            if let Some(tx) = app.claws_sudo_response_tx.take() {
+            tab.dialog = Dialog::None;
+            if let Some(tx) = tab.claws_sudo_response_tx.take() {
                 let _ = tx.send(None);
             }
         }
         KeyCode::Backspace => {
             password.pop();
-            app.dialog = Dialog::ClawsReadySudoConfirm { password };
+            tab.dialog = Dialog::ClawsReadySudoConfirm { password };
         }
         KeyCode::Char(c) => {
             password.push(c);
-            app.dialog = Dialog::ClawsReadySudoConfirm { password };
+            tab.dialog = Dialog::ClawsReadySudoConfirm { password };
         }
         _ => {}
     }
@@ -668,78 +749,82 @@ mod tests {
         assert_eq!(key_to_bytes(&key), Some(vec![3]));
     }
 
+    fn new_app() -> App {
+        App::new(std::path::PathBuf::new())
+    }
+
     #[test]
     fn arrow_up_scrolls_in_done_state_with_window_focused() {
-        let mut app = App::new();
+        let mut app = new_app();
         for i in 0..50 {
-            app.output_lines.push(format!("line {}", i));
+            app.active_tab_mut().output_lines.push(format!("line {}", i));
         }
-        app.phase = ExecutionPhase::Done { command: "ready".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.scroll_offset = 0;
+        app.active_tab_mut().phase = ExecutionPhase::Done { command: "ready".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().scroll_offset = 0;
 
         let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         let action = handle_key(&mut app, key);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.scroll_offset, 1, "Up should increment scroll_offset");
-        assert_eq!(app.focus, Focus::ExecutionWindow, "Focus should stay on window");
+        assert_eq!(app.active_tab().scroll_offset, 1, "Up should increment scroll_offset");
+        assert_eq!(app.active_tab().focus, Focus::ExecutionWindow, "Focus should stay on window");
 
         // Press Down to go back.
         let key = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
         let action = handle_key(&mut app, key);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.scroll_offset, 0, "Down should decrement scroll_offset");
+        assert_eq!(app.active_tab().scroll_offset, 0, "Down should decrement scroll_offset");
     }
 
     // --- Container window input tests ---
 
     #[test]
     fn esc_minimizes_container_window_when_maximized() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.container_window = ContainerWindowState::Maximized;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         let action = handle_key(&mut app, key);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.container_window, ContainerWindowState::Minimized);
+        assert_eq!(app.active_tab().container_window, ContainerWindowState::Minimized);
         // Focus stays on ExecutionWindow (outer window), not CommandBox
-        assert_eq!(app.focus, Focus::ExecutionWindow);
+        assert_eq!(app.active_tab().focus, Focus::ExecutionWindow);
     }
 
     #[test]
     fn c_key_restores_container_window_when_minimized() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.container_window = ContainerWindowState::Minimized;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
 
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
         let action = handle_key(&mut app, key);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.container_window, ContainerWindowState::Maximized);
+        assert_eq!(app.active_tab().container_window, ContainerWindowState::Maximized);
     }
 
     #[test]
     fn esc_from_minimized_outer_window_goes_to_command_box() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.container_window = ContainerWindowState::Minimized;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         let action = handle_key(&mut app, key);
         assert!(matches!(action, Action::None));
-        assert_eq!(app.focus, Focus::CommandBox);
+        assert_eq!(app.active_tab().focus, Focus::CommandBox);
     }
 
     #[test]
     fn keys_forwarded_to_pty_when_container_maximized() {
-        let mut app = App::new();
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.container_window = ContainerWindowState::Maximized;
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
 
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
         let action = handle_key(&mut app, key);
@@ -748,31 +833,31 @@ mod tests {
 
     #[test]
     fn arrow_keys_scroll_outer_when_container_minimized() {
-        let mut app = App::new();
+        let mut app = new_app();
         for i in 0..50 {
-            app.output_lines.push(format!("line {}", i));
+            app.active_tab_mut().output_lines.push(format!("line {}", i));
         }
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::ExecutionWindow;
-        app.container_window = ContainerWindowState::Minimized;
-        app.scroll_offset = 0;
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
+        app.active_tab_mut().scroll_offset = 0;
 
         let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         handle_key(&mut app, key);
-        assert_eq!(app.scroll_offset, 1, "Up should scroll outer window when container minimized");
+        assert_eq!(app.active_tab().scroll_offset, 1, "Up should scroll outer window when container minimized");
     }
 
     #[test]
     fn up_arrow_from_command_box_focuses_outer_regardless_of_container_state() {
-        let mut app = App::new();
-        app.output_lines.push("some output".into());
-        app.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        app.focus = Focus::CommandBox;
-        app.container_window = ContainerWindowState::Minimized;
+        let mut app = new_app();
+        app.active_tab_mut().output_lines.push("some output".into());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::CommandBox;
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
 
         let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         handle_key(&mut app, key);
-        assert_eq!(app.focus, Focus::ExecutionWindow);
+        assert_eq!(app.active_tab().focus, Focus::ExecutionWindow);
     }
 
     #[test]
@@ -793,94 +878,94 @@ mod tests {
 
     #[test]
     fn arrow_up_from_command_box_focuses_window_then_scrolls() {
-        let mut app = App::new();
+        let mut app = new_app();
         for i in 0..50 {
-            app.output_lines.push(format!("line {}", i));
+            app.active_tab_mut().output_lines.push(format!("line {}", i));
         }
-        app.phase = ExecutionPhase::Done { command: "ready".into() };
-        app.focus = Focus::CommandBox;
-        app.scroll_offset = 0;
+        app.active_tab_mut().phase = ExecutionPhase::Done { command: "ready".into() };
+        app.active_tab_mut().focus = Focus::CommandBox;
+        app.active_tab_mut().scroll_offset = 0;
 
         // First Up: should move focus to ExecutionWindow but NOT scroll.
         let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         handle_key(&mut app, key);
-        assert_eq!(app.focus, Focus::ExecutionWindow);
-        assert_eq!(app.scroll_offset, 0, "First Up only focuses, doesn't scroll");
+        assert_eq!(app.active_tab().focus, Focus::ExecutionWindow);
+        assert_eq!(app.active_tab().scroll_offset, 0, "First Up only focuses, doesn't scroll");
 
         // Second Up: now that we're in ExecutionWindow, should scroll.
         let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
         handle_key(&mut app, key);
-        assert_eq!(app.focus, Focus::ExecutionWindow);
-        assert_eq!(app.scroll_offset, 1, "Second Up should scroll");
+        assert_eq!(app.active_tab().focus, Focus::ExecutionWindow);
+        assert_eq!(app.active_tab().scroll_offset, 1, "Second Up should scroll");
     }
 
     #[test]
     fn sudo_confirm_dialog_enter_sends_password_and_clears_dialog() {
-        let mut app = App::new();
-        app.dialog = Dialog::ClawsReadySudoConfirm { password: "s3cr3t".to_string() };
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::ClawsReadySudoConfirm { password: "s3cr3t".to_string() };
         let (tx, mut rx) = tokio::sync::oneshot::channel::<Option<String>>();
-        app.claws_sudo_response_tx = Some(tx);
+        app.active_tab_mut().claws_sudo_response_tx = Some(tx);
 
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
         handle_key(&mut app, key);
 
-        assert_eq!(app.dialog, Dialog::None);
-        assert!(app.claws_sudo_response_tx.is_none());
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+        assert!(app.active_tab().claws_sudo_response_tx.is_none());
         assert_eq!(rx.try_recv().unwrap(), Some("s3cr3t".to_string()));
     }
 
     #[test]
     fn sudo_confirm_dialog_esc_sends_none_and_clears_dialog() {
-        let mut app = App::new();
-        app.dialog = Dialog::ClawsReadySudoConfirm { password: "abc".to_string() };
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::ClawsReadySudoConfirm { password: "abc".to_string() };
         let (tx, mut rx) = tokio::sync::oneshot::channel::<Option<String>>();
-        app.claws_sudo_response_tx = Some(tx);
+        app.active_tab_mut().claws_sudo_response_tx = Some(tx);
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         handle_key(&mut app, key);
 
-        assert_eq!(app.dialog, Dialog::None);
+        assert_eq!(app.active_tab().dialog, Dialog::None);
         assert_eq!(rx.try_recv().unwrap(), None);
     }
 
     #[test]
     fn sudo_confirm_dialog_char_appends_to_password() {
-        let mut app = App::new();
-        app.dialog = Dialog::ClawsReadySudoConfirm { password: String::new() };
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::ClawsReadySudoConfirm { password: String::new() };
         let (tx, _rx) = tokio::sync::oneshot::channel::<Option<String>>();
-        app.claws_sudo_response_tx = Some(tx);
+        app.active_tab_mut().claws_sudo_response_tx = Some(tx);
 
         for c in "pass".chars() {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
             handle_key(&mut app, key);
         }
-        assert_eq!(app.dialog, Dialog::ClawsReadySudoConfirm { password: "pass".to_string() });
+        assert_eq!(app.active_tab().dialog, Dialog::ClawsReadySudoConfirm { password: "pass".to_string() });
     }
 
     #[test]
     fn sudo_confirm_dialog_backspace_removes_last_char() {
-        let mut app = App::new();
-        app.dialog = Dialog::ClawsReadySudoConfirm { password: "abc".to_string() };
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::ClawsReadySudoConfirm { password: "abc".to_string() };
         let (tx, _rx) = tokio::sync::oneshot::channel::<Option<String>>();
-        app.claws_sudo_response_tx = Some(tx);
+        app.active_tab_mut().claws_sudo_response_tx = Some(tx);
 
         let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty());
         handle_key(&mut app, key);
 
-        assert_eq!(app.dialog, Dialog::ClawsReadySudoConfirm { password: "ab".to_string() });
+        assert_eq!(app.active_tab().dialog, Dialog::ClawsReadySudoConfirm { password: "ab".to_string() });
     }
 
     #[test]
     fn sudo_confirm_dialog_enter_with_empty_password_sends_some_empty() {
-        let mut app = App::new();
-        app.dialog = Dialog::ClawsReadySudoConfirm { password: String::new() };
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::ClawsReadySudoConfirm { password: String::new() };
         let (tx, mut rx) = tokio::sync::oneshot::channel::<Option<String>>();
-        app.claws_sudo_response_tx = Some(tx);
+        app.active_tab_mut().claws_sudo_response_tx = Some(tx);
 
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
         handle_key(&mut app, key);
 
-        assert_eq!(app.dialog, Dialog::None);
+        assert_eq!(app.active_tab().dialog, Dialog::None);
         // Empty password is allowed (e.g. NOPASSWD sudo configs).
         assert_eq!(rx.try_recv().unwrap(), Some(String::new()));
     }
