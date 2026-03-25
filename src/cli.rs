@@ -101,8 +101,12 @@ pub enum Command {
 /// Subcommands for `amux claws`.
 #[derive(Subcommand)]
 pub enum ClawsAction {
-    /// Set up and ensure the nanoclaw container is running.
+    /// First-time setup: fork/clone nanoclaw, build the image, and launch the container.
+    Init,
+    /// Check whether the nanoclaw container is running and show status.
     Ready,
+    /// Attach to the running nanoclaw container for a freeform chat session.
+    Chat,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -551,5 +555,60 @@ mod tests {
             Command::Claws { action } => assert!(matches!(action, ClawsAction::Ready)),
             _ => panic!("expected claws"),
         }
+    }
+
+    #[test]
+    fn claws_init_parsed() {
+        let cli = parse(&["amux", "claws", "init"]);
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Claws { action: ClawsAction::Init }
+        ));
+    }
+
+    #[test]
+    fn claws_init_is_init_action() {
+        let cli = parse(&["amux", "claws", "init"]);
+        match cli.command.unwrap() {
+            Command::Claws { action } => assert!(matches!(action, ClawsAction::Init)),
+            _ => panic!("expected claws"),
+        }
+    }
+
+    #[test]
+    fn claws_chat_parsed() {
+        let cli = parse(&["amux", "claws", "chat"]);
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Claws { action: ClawsAction::Chat }
+        ));
+    }
+
+    #[test]
+    fn claws_chat_is_chat_action() {
+        let cli = parse(&["amux", "claws", "chat"]);
+        match cli.command.unwrap() {
+            Command::Claws { action } => assert!(matches!(action, ClawsAction::Chat)),
+            _ => panic!("expected claws"),
+        }
+    }
+
+    #[test]
+    fn claws_actions_are_distinct() {
+        let init = parse(&["amux", "claws", "init"]);
+        let ready = parse(&["amux", "claws", "ready"]);
+        let chat = parse(&["amux", "claws", "chat"]);
+        assert!(matches!(
+            init.command.unwrap(),
+            Command::Claws { action: ClawsAction::Init }
+        ));
+        assert!(matches!(
+            ready.command.unwrap(),
+            Command::Claws { action: ClawsAction::Ready }
+        ));
+        assert!(matches!(
+            chat.command.unwrap(),
+            Command::Claws { action: ClawsAction::Chat }
+        ));
     }
 }

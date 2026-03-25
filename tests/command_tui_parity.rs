@@ -1858,3 +1858,424 @@ async fn new_fails_when_explicit_cwd_has_no_git_repo() {
         msg
     );
 }
+
+// ---------------------------------------------------------------------------
+// 45. Claws command expansion: CLI parsing for init, ready, chat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_claws_init_parsed() {
+    use amux::cli::{Cli, ClawsAction, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["amux", "claws", "init"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Claws { action } => assert!(matches!(action, ClawsAction::Init)),
+        _ => panic!("Expected Claws command"),
+    }
+}
+
+#[test]
+fn cli_claws_ready_parity() {
+    use amux::cli::{Cli, ClawsAction, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["amux", "claws", "ready"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Claws { action } => assert!(matches!(action, ClawsAction::Ready)),
+        _ => panic!("Expected Claws command"),
+    }
+}
+
+#[test]
+fn cli_claws_chat_parsed() {
+    use amux::cli::{Cli, ClawsAction, Command};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["amux", "claws", "chat"]).unwrap();
+    match cli.command.unwrap() {
+        Command::Claws { action } => assert!(matches!(action, ClawsAction::Chat)),
+        _ => panic!("Expected Claws command"),
+    }
+}
+
+#[test]
+fn cli_claws_init_ready_chat_are_distinct_actions() {
+    use amux::cli::{Cli, ClawsAction, Command};
+    use clap::Parser;
+
+    let extract = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command.unwrap() {
+            Command::Claws { action } => action,
+            _ => panic!("expected Claws"),
+        }
+    };
+
+    assert!(matches!(extract(&["amux", "claws", "init"]), ClawsAction::Init));
+    assert!(matches!(extract(&["amux", "claws", "ready"]), ClawsAction::Ready));
+    assert!(matches!(extract(&["amux", "claws", "chat"]), ClawsAction::Chat));
+}
+
+// ---------------------------------------------------------------------------
+// 46. Claws: run_claws_ready returns Ok with message when nanoclaw not installed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn claws_ready_not_installed_suggests_init() {
+    use amux::commands::claws;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink = amux::commands::output::OutputSink::Channel(tx);
+
+    let tmp = TempDir::new().unwrap();
+    std::env::set_var("HOME", tmp.path());
+
+    let result = claws::run_claws_ready(&sink).await;
+
+    std::env::remove_var("HOME");
+
+    assert!(result.is_ok(), "run_claws_ready should not error when not installed");
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("claws init")),
+        "Expected message suggesting 'claws init', got: {:?}",
+        messages
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 47. Claws: run_claws_chat errors with informative message when not installed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn claws_chat_not_installed_returns_error() {
+    use amux::commands::claws;
+
+    let tmp = TempDir::new().unwrap();
+    std::env::set_var("HOME", tmp.path());
+
+    let result = claws::run_claws_chat().await;
+
+    std::env::remove_var("HOME");
+
+    assert!(result.is_err(), "run_claws_chat should error when nanoclaw not installed");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("claws init"),
+        "Error should mention 'claws init', got: {}",
+        msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 48. Claws: run_claws_chat errors when container is not running
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn claws_chat_container_not_running_returns_error() {
+    use amux::commands::claws;
+
+    let tmp = TempDir::new().unwrap();
+    let nanoclaw_dir = tmp.path().join(".nanoclaw");
+    std::fs::create_dir_all(&nanoclaw_dir).unwrap();
+    std::fs::write(
+        nanoclaw_dir.join(".amux.json"),
+        r#"{"nanoclawContainerID": "definitely-not-a-real-container-id"}"#,
+    ).unwrap();
+
+    std::env::set_var("HOME", tmp.path());
+
+    let result = claws::run_claws_chat().await;
+
+    std::env::remove_var("HOME");
+
+    assert!(result.is_err(), "run_claws_chat should error when container is not running");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("claws ready"),
+        "Error should suggest 'claws ready', got: {}",
+        msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 49. Claws: NanoclawConfig serializes and deserializes correctly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nanoclaw_config_roundtrip() {
+    use amux::commands::claws::NanoclawConfig;
+
+    let config = NanoclawConfig {
+        nanoclaw_container_id: Some("abc123def456".to_string()),
+    };
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(json.contains("nanoclawContainerID"), "JSON key should be camelCase");
+    assert!(json.contains("abc123def456"));
+
+    let parsed: NanoclawConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.nanoclaw_container_id, Some("abc123def456".to_string()));
+}
+
+#[test]
+fn nanoclaw_config_default_has_no_container_id() {
+    use amux::commands::claws::NanoclawConfig;
+
+    let config = NanoclawConfig::default();
+    assert!(config.nanoclaw_container_id.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 50. Claws: autocomplete suggests init, ready, and chat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn autocomplete_claws_space_shows_all_three_subcommands() {
+    let sug = autocomplete_suggestions("claws ");
+    assert!(
+        sug.iter().any(|s| s.contains("init")),
+        "Expected 'init' in claws suggestions, got: {:?}",
+        sug
+    );
+    assert!(
+        sug.iter().any(|s| s.contains("ready")),
+        "Expected 'ready' in claws suggestions, got: {:?}",
+        sug
+    );
+    assert!(
+        sug.iter().any(|s| s.contains("chat")),
+        "Expected 'chat' in claws suggestions, got: {:?}",
+        sug
+    );
+}
+
+#[test]
+fn autocomplete_claws_init_hint_describes_setup() {
+    let sug = autocomplete_suggestions("claws ");
+    let init_hint = sug.iter().find(|s| s.starts_with("claws init"));
+    assert!(init_hint.is_some(), "Expected 'claws init' hint, got: {:?}", sug);
+    let hint = init_hint.unwrap();
+    assert!(
+        hint.contains("setup") || hint.contains("clone") || hint.contains("first"),
+        "Init hint should describe setup purpose, got: {}",
+        hint
+    );
+}
+
+#[test]
+fn autocomplete_claws_chat_hint_describes_attach() {
+    let sug = autocomplete_suggestions("claws ");
+    let chat_hint = sug.iter().find(|s| s.starts_with("claws chat"));
+    assert!(chat_hint.is_some(), "Expected 'claws chat' hint, got: {:?}", sug);
+    let hint = chat_hint.unwrap();
+    assert!(
+        hint.contains("attach") || hint.contains("chat") || hint.contains("container"),
+        "Chat hint should describe attach purpose, got: {}",
+        hint
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 51. Claws: tab color is purple for claws init, ready, and chat commands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_color_claws_init_command_is_magenta() {
+    use amux::tui::state::{App, ExecutionPhase};
+    use ratatui::style::Color;
+
+    let mut app = App::new(std::path::PathBuf::new());
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws init".to_string() };
+    assert_eq!(
+        app.active_tab().tab_color(),
+        Color::Magenta,
+        "claws init command should show magenta tab"
+    );
+}
+
+#[test]
+fn tab_color_claws_chat_command_is_magenta() {
+    use amux::tui::state::{App, ExecutionPhase};
+    use ratatui::style::Color;
+
+    let mut app = App::new(std::path::PathBuf::new());
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws chat".to_string() };
+    assert_eq!(
+        app.active_tab().tab_color(),
+        Color::Magenta,
+        "claws chat command should show magenta tab"
+    );
+}
+
+#[test]
+fn tab_color_claws_ready_still_magenta() {
+    use amux::tui::state::{App, ExecutionPhase};
+    use ratatui::style::Color;
+
+    let mut app = App::new(std::path::PathBuf::new());
+    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws ready".to_string() };
+    assert_eq!(
+        app.active_tab().tab_color(),
+        Color::Magenta,
+        "claws ready command should show magenta tab"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 52. Claws: nanoclaw path and utility functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nanoclaw_path_uses_home_directory() {
+    use amux::commands::claws::nanoclaw_path;
+
+    let path = nanoclaw_path();
+    assert!(
+        path.ends_with(".nanoclaw"),
+        "nanoclaw_path should end with .nanoclaw, got: {:?}",
+        path
+    );
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    assert!(
+        path.starts_with(&home),
+        "nanoclaw_path should be under HOME ({}), got: {:?}",
+        home,
+        path
+    );
+}
+
+#[test]
+fn nanoclaw_path_str_matches_path() {
+    use amux::commands::claws::{nanoclaw_path, nanoclaw_path_str};
+
+    let path = nanoclaw_path();
+    let path_str = nanoclaw_path_str();
+    assert_eq!(
+        path.to_string_lossy().as_ref(),
+        path_str.as_str(),
+        "nanoclaw_path_str should match nanoclaw_path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 53. Claws: print_claws_summary output contains all status rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn print_claws_summary_outputs_all_rows() {
+    use amux::commands::claws::{ClawsSummary, print_claws_summary};
+    use amux::commands::ready::StepStatus;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink = amux::commands::output::OutputSink::Channel(tx);
+
+    let summary = ClawsSummary {
+        nanoclaw_cloned: StepStatus::Ok("exists".into()),
+        docker_daemon: StepStatus::Ok("running".into()),
+        nanoclaw_image: StepStatus::Ok("built".into()),
+        nanoclaw_container: StepStatus::Ok("running".into()),
+    };
+
+    print_claws_summary(&sink, &summary);
+
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let joined = messages.join("\n");
+    assert!(joined.contains("Nanoclaw"), "Summary should include Nanoclaw row");
+    assert!(joined.contains("Docker"), "Summary should include Docker daemon row");
+    assert!(joined.contains("Container"), "Summary should include Container row");
+}
+
+// ---------------------------------------------------------------------------
+// 54. Claws: audit container has amux- container name and carries audit prompt
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audit_container_name_has_amux_prefix() {
+    // The audit container must have an amux- name so it is identifiable in docker ps.
+    let name = amux::docker::generate_container_name();
+    assert!(
+        name.starts_with("amux-"),
+        "Audit container name must have amux- prefix, got: {}",
+        name
+    );
+}
+
+#[test]
+fn build_run_args_pty_at_path_includes_name_and_prompt() {
+    use amux::commands::ready::audit_entrypoint;
+    use amux::docker;
+
+    let nanoclaw_str = "/home/user/.nanoclaw";
+    let agent_name = "claude";
+    let container_name = docker::generate_container_name();
+    let entrypoint = audit_entrypoint(agent_name);
+    let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
+
+    let args = docker::build_run_args_pty_at_path(
+        amux::commands::claws::NANOCLAW_IMAGE_TAG,
+        nanoclaw_str,
+        nanoclaw_str,
+        nanoclaw_str,
+        &entrypoint_refs,
+        &[],
+        Some(&container_name),
+        None,
+        false,
+    );
+
+    // Container name must appear.
+    assert!(
+        args.contains(&container_name),
+        "Args must include container name; args: {:?}",
+        args
+    );
+    assert!(
+        args.iter().any(|a| a == "--name"),
+        "Args must include --name flag; args: {:?}",
+        args
+    );
+
+    // Audit prompt must be in the entrypoint args.
+    assert!(
+        args.iter().any(|a| a.contains("scan this project")),
+        "Audit entrypoint must carry the audit prompt; args: {:?}",
+        args
+    );
+
+    // Mount must use nanoclaw path on both sides (not /workspace).
+    let mount_arg = format!("{}:{}", nanoclaw_str, nanoclaw_str);
+    assert!(
+        args.contains(&mount_arg),
+        "Mount must use identical host and container paths; args: {:?}",
+        args
+    );
+
+    // Must be foreground (--rm -it), not detached (-d).
+    assert!(args.contains(&"--rm".to_string()), "Must include --rm");
+    assert!(args.contains(&"-it".to_string()), "Must include -it (interactive+tty)");
+    assert!(!args.contains(&"-d".to_string()), "Must NOT include -d (detached)");
+}
+
+#[test]
+fn claws_audit_ctx_carries_prompt_via_audit_entrypoint() {
+    use amux::commands::ready::{audit_entrypoint, AUDIT_PROMPT};
+
+    // Verify that audit_entrypoint includes the audit prompt for every supported agent.
+    for agent in &["claude", "codex", "opencode"] {
+        let args = audit_entrypoint(agent);
+        assert!(
+            args.iter().any(|a| a.contains("scan this project")),
+            "audit_entrypoint({}) must carry audit prompt: {:?}",
+            agent,
+            args
+        );
+        // The prompt should match the canonical AUDIT_PROMPT constant.
+        assert!(
+            args.iter().any(|a| a == AUDIT_PROMPT),
+            "audit_entrypoint({}) must include the full AUDIT_PROMPT; args: {:?}",
+            agent,
+            args
+        );
+    }
+}

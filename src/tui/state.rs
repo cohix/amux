@@ -1,3 +1,4 @@
+use crate::commands::claws::ClawsAuditCtx;
 use crate::commands::ready::{ReadyContext, ReadyOptions, ReadySummary};
 use crate::docker;
 use crate::tui::pty::PtySession;
@@ -100,8 +101,14 @@ pub enum PendingCommand {
 pub enum ClawsPhase {
     /// Not running a claws workflow.
     Inactive,
-    /// Non-interactive setup (clone + image build + container start) is running.
+    /// Container start-only task is running (used by `claws ready` when container stopped).
     Setup,
+    /// Initial image build (pre-audit) text task is running.
+    PreAudit,
+    /// Audit agent PTY container window is open.
+    Audit,
+    /// Post-audit image rebuild + container launch text task is running.
+    PostAudit,
 }
 
 /// State of the container overlay window.
@@ -285,6 +292,11 @@ pub struct TabState {
     pub claws_docker_accept_request_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Sends the user's docker-socket acceptance (true = accepted, false = declined) to the build task.
     pub claws_docker_accept_response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// Context produced by the pre-audit background task, consumed to launch the audit PTY.
+    /// Also stored across the Audit phase so the post-audit task can access env_vars etc.
+    pub claws_audit_ctx: Option<ClawsAuditCtx>,
+    /// Receives the audit context from the pre-audit background task.
+    pub claws_audit_ctx_rx: Option<tokio::sync::oneshot::Receiver<ClawsAuditCtx>>,
 }
 
 impl TabState {
@@ -331,6 +343,8 @@ impl TabState {
             claws_sudo_response_tx: None,
             claws_docker_accept_request_rx: None,
             claws_docker_accept_response_tx: None,
+            claws_audit_ctx: None,
+            claws_audit_ctx_rx: None,
             last_output_time: None,
         }
     }
@@ -736,6 +750,14 @@ impl TabState {
         if let Some(ref mut rx) = self.claws_container_id_rx {
             if let Ok(id) = rx.try_recv() {
                 self.claws_container_id = Some(id);
+            }
+        }
+
+        // Check for audit context from the pre-audit background task.
+        if let Some(ref mut rx) = self.claws_audit_ctx_rx {
+            if let Ok(ctx) = rx.try_recv() {
+                self.claws_audit_ctx = Some(ctx);
+                self.claws_audit_ctx_rx = None;
             }
         }
 

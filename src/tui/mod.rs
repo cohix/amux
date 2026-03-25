@@ -219,7 +219,7 @@ async fn handle_action(app: &mut App, action: Action) {
         }
 
         Action::ClawsReadyStartContainer => {
-            launch_claws_start_container(app).await;
+            launch_claws_start_container_status_only(app).await;
         }
 
         Action::CreateTab => {
@@ -350,12 +350,18 @@ async fn execute_command(app: &mut App, cmd: &str) {
 
         "claws" => {
             match parts.get(1) {
+                Some(&"init") => {
+                    show_claws_init_start(app).await;
+                }
                 Some(&"ready") => {
-                    app.active_tab_mut().pending_command = PendingCommand::ClawsReady;
-                    show_claws_ready_start(app).await;
+                    show_claws_ready_status(app).await;
+                }
+                Some(&"chat") => {
+                    launch_claws_chat_attach(app).await;
                 }
                 _ => {
-                    app.active_tab_mut().input_error = Some("Usage: claws ready".into());
+                    app.active_tab_mut().input_error =
+                        Some("Usage: claws <init|ready|chat>".into());
                 }
             }
         }
@@ -1003,17 +1009,34 @@ fn spawn_stats_poller(
     rx
 }
 
-/// Determine what to show when `claws ready` is entered.
+/// Determine what to show when `claws init` is entered.
 ///
-/// - Nanoclaw not installed → first-run wizard (HasForked dialog)
-/// - Nanoclaw installed, container running → show status in output
+/// Always starts the first-run wizard (HasForked dialog), regardless of
+/// whether nanoclaw is already installed.
+async fn show_claws_init_start(app: &mut App) {
+    app.active_tab_mut().dialog = Dialog::ClawsReadyHasForked;
+}
+
+/// Determine what to show when `claws ready` is entered (status-only, no wizard).
+///
+/// - Nanoclaw not installed → show error suggesting `claws init`
+/// - Nanoclaw installed, container running → show status table
 /// - Nanoclaw installed, container stopped → OfferStart dialog
-async fn show_claws_ready_start(app: &mut App) {
+async fn show_claws_ready_status(app: &mut App) {
     let nanoclaw_dir = claws::nanoclaw_path();
 
     if !nanoclaw_dir.exists() {
-        // First run: start the wizard.
-        app.active_tab_mut().dialog = Dialog::ClawsReadyHasForked;
+        // Not installed — show error message.
+        app.active_tab_mut().start_command("claws ready".to_string());
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        app.active_tab_mut().exit_rx = Some(exit_rx);
+        let tx = app.active_tab().output_tx.clone();
+        spawn_text_command(tx, exit_tx, |sink| async move {
+            sink.println(
+                "nanoclaw is not installed. Run 'claws init' to set up nanoclaw.",
+            );
+            Ok(())
+        });
         return;
     }
 
@@ -1022,7 +1045,7 @@ async fn show_claws_ready_start(app: &mut App) {
         Ok(config) => {
             if let Some(ref id) = config.nanoclaw_container_id {
                 if docker::is_container_running(id) {
-                    // Container is running — show status.
+                    // Container is running — show status table.
                     app.active_tab_mut().start_command("claws ready".to_string());
                     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
                     app.active_tab_mut().exit_rx = Some(exit_rx);
@@ -1044,7 +1067,7 @@ async fn show_claws_ready_start(app: &mut App) {
                     return;
                 }
             }
-            // Container not running or no saved ID.
+            // Container not running or no saved ID — offer to start.
             app.active_tab_mut().dialog = Dialog::ClawsReadyOfferStart;
         }
         Err(_) => {
@@ -1053,10 +1076,48 @@ async fn show_claws_ready_start(app: &mut App) {
     }
 }
 
-/// Launch the claws first-run setup as a text command (TUI mode).
+/// Attach to the running nanoclaw container for a freeform chat session (TUI mode).
 ///
-/// Clones the repo and sets up the container. After the text phase completes,
-/// `check_claws_continuation` attaches the agent via PTY.
+/// If the container is not running, shows an error suggesting `claws ready`.
+async fn launch_claws_chat_attach(app: &mut App) {
+    let nanoclaw_dir = claws::nanoclaw_path();
+
+    if !nanoclaw_dir.exists() {
+        app.active_tab_mut().input_error = Some(
+            "nanoclaw is not installed. Run 'claws init' to set up nanoclaw.".into(),
+        );
+        return;
+    }
+
+    let config = match claws::load_nanoclaw_config() {
+        Ok(c) => c,
+        Err(_) => {
+            app.active_tab_mut().input_error = Some(
+                "Failed to load nanoclaw config. Run 'claws ready' to check status.".into(),
+            );
+            return;
+        }
+    };
+
+    let container_id = match config.nanoclaw_container_id {
+        Some(id) if docker::is_container_running(&id) => id,
+        _ => {
+            app.active_tab_mut().input_error = Some(
+                "nanoclaw container is not running. Run 'claws ready' to start it.".into(),
+            );
+            return;
+        }
+    };
+
+    app.active_tab_mut().start_command("claws chat".to_string());
+    launch_claws_exec(app, container_id).await;
+}
+
+/// Phase 1 of the claws init wizard (TUI mode): clone + initial image build.
+///
+/// Runs the clone and pre-audit image build as a background text command. When it
+/// completes successfully, `check_claws_continuation` detects `ClawsPhase::PreAudit`
+/// and launches the audit agent via PTY container window.
 async fn launch_claws_ready(app: &mut App) {
     let username = app.active_tab().claws_wizard_username.clone();
 
@@ -1069,7 +1130,7 @@ async fn launch_claws_ready(app: &mut App) {
     let env_vars = credentials.env_vars;
 
     // Prepare sanitized host config (same as `chat`/`implement` auto-configuration).
-    // Stored in tab.host_settings so the temp dir outlives the background setup task
+    // Stored in tab.host_settings so the temp dir outlives all phases of the wizard
     // and remains valid through the subsequent PTY exec session.
     app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
     // A path-only view is moved into the closure; the actual TempDir lives in the tab.
@@ -1077,30 +1138,24 @@ async fn launch_claws_ready(app: &mut App) {
         docker::HostSettings::from_paths(hs.config_path.clone(), hs.claude_dir_path.clone())
     });
 
-    app.active_tab_mut().claws_phase = ClawsPhase::Setup;
-    app.active_tab_mut().start_command("claws ready".to_string());
+    app.active_tab_mut().claws_phase = ClawsPhase::PreAudit;
+    app.active_tab_mut().start_command("claws init".to_string());
 
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     app.active_tab_mut().exit_rx = Some(exit_rx);
-    let (container_tx, container_rx) = tokio::sync::oneshot::channel::<String>();
-    app.active_tab_mut().claws_container_id_rx = Some(container_rx);
     let tx = app.active_tab().output_tx.clone();
+
+    // Channel: pre-audit task → TUI — delivers ClawsAuditCtx when initial build succeeds.
+    let (audit_ctx_tx, audit_ctx_rx) =
+        tokio::sync::oneshot::channel::<claws::ClawsAuditCtx>();
+    app.active_tab_mut().claws_audit_ctx_rx = Some(audit_ctx_rx);
 
     // Channels for the background task to request sudo permission when the clone
     // destination ($HOME/.nanoclaw) is not writable by the current user.
-    // The response carries Option<String>: Some(password) = user accepted with their
-    // sudo password, None = user declined.
     let (sudo_request_tx, sudo_request_rx) = tokio::sync::oneshot::channel::<()>();
     let (sudo_response_tx, sudo_response_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     app.active_tab_mut().claws_sudo_request_rx = Some(sudo_request_rx);
     app.active_tab_mut().claws_sudo_response_tx = Some(sudo_response_tx);
-
-    // Channels for the background task to request docker socket acceptance after the
-    // image rebuild completes. The response carries bool: true = accepted, false = declined.
-    let (docker_accept_request_tx, docker_accept_request_rx) = tokio::sync::oneshot::channel::<()>();
-    let (docker_accept_response_tx, docker_accept_response_rx) = tokio::sync::oneshot::channel::<bool>();
-    app.active_tab_mut().claws_docker_accept_request_rx = Some(docker_accept_request_rx);
-    app.active_tab_mut().claws_docker_accept_response_tx = Some(docker_accept_response_tx);
 
     spawn_text_command(tx, exit_tx, move |sink| async move {
         if let Some(ref username) = username {
@@ -1133,33 +1188,139 @@ async fn launch_claws_ready(app: &mut App) {
             ..Default::default()
         };
 
-        // Phase 1: build image + run audit agent (no docker socket).
-        claws::build_nanoclaw_image(&sink, &env_vars, &mut summary, closure_host_settings.as_ref()).await?;
+        // Pre-audit: Docker check + Dockerfile.dev + initial image build.
+        let ctx = claws::build_nanoclaw_pre_audit(
+            &sink,
+            env_vars,
+            &mut summary,
+            closure_host_settings.as_ref(),
+        ).await?;
 
-        // Signal the TUI to show the docker socket warning dialog (after image rebuild).
+        sink.println("Audit agent launching in container window...");
+        let _ = audit_ctx_tx.send(ctx);
+        Ok(())
+    });
+}
+
+/// Phase 2 of the claws init wizard (TUI mode): launch audit agent as PTY container window.
+///
+/// Called by `check_claws_continuation` after the pre-audit text task completes.
+fn launch_claws_audit(app: &mut App, ctx: claws::ClawsAuditCtx) {
+    let container_name = docker::generate_container_name();
+    let entrypoint = ready::audit_entrypoint(&ctx.agent_name);
+    let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
+
+    let docker_args = docker::build_run_args_pty_at_path(
+        claws::NANOCLAW_IMAGE_TAG,
+        &ctx.nanoclaw_str,
+        &ctx.nanoclaw_str,
+        &ctx.nanoclaw_str,
+        &entrypoint_refs,
+        &ctx.env_vars,
+        Some(&container_name),
+        app.active_tab().host_settings.as_ref(),
+        false, // audit container: no docker socket access
+    );
+    let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
+
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows);
+    let size = PtySize {
+        rows: inner_rows,
+        cols: inner_cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    // Store ctx for post-audit phase (needs env_vars, nanoclaw_str, etc.).
+    app.active_tab_mut().claws_audit_ctx = Some(ctx.clone());
+    app.active_tab_mut().claws_phase = ClawsPhase::Audit;
+    app.active_tab_mut().continue_command("claws init (audit)".to_string());
+
+    let display_name = state::agent_display_name(&ctx.agent_name).to_string();
+    app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
+
+    match PtySession::spawn("docker", &docker_str_refs, size) {
+        Ok((session, pty_rx)) => {
+            app.active_tab_mut().pty = Some(session);
+            app.active_tab_mut().pty_rx = Some(pty_rx);
+            app.active_tab_mut().stats_rx = Some(spawn_stats_poller(container_name));
+        }
+        Err(e) => {
+            app.active_tab_mut().push_output(format!("Failed to launch audit container: {}", e));
+            app.active_tab_mut().finish_command(1);
+        }
+    }
+}
+
+/// Phase 3 of the claws init wizard (TUI mode): post-audit image rebuild + container launch.
+///
+/// Called by `check_claws_continuation` after the audit PTY container exits.
+async fn launch_claws_init_post_audit(app: &mut App) {
+    let ctx = match app.active_tab_mut().claws_audit_ctx.take() {
+        Some(ctx) => ctx,
+        None => {
+            app.active_tab_mut().push_output(
+                "Internal error: missing audit context for post-audit phase.".to_string(),
+            );
+            app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+            return;
+        }
+    };
+
+    // Path-only clone of host_settings for the background closure.
+    let closure_host_settings = app.active_tab().host_settings.as_ref().map(|hs| {
+        docker::HostSettings::from_paths(hs.config_path.clone(), hs.claude_dir_path.clone())
+    });
+
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    let tx = app.active_tab().output_tx.clone();
+
+    // Channel: container ID sent back to TUI after launch succeeds.
+    let (container_tx, container_rx) = tokio::sync::oneshot::channel::<String>();
+    app.active_tab_mut().claws_container_id_rx = Some(container_rx);
+
+    // Channels for docker socket acceptance dialog.
+    let (docker_accept_request_tx, docker_accept_request_rx) = tokio::sync::oneshot::channel::<()>();
+    let (docker_accept_response_tx, docker_accept_response_rx) = tokio::sync::oneshot::channel::<bool>();
+    app.active_tab_mut().claws_docker_accept_request_rx = Some(docker_accept_request_rx);
+    app.active_tab_mut().claws_docker_accept_response_tx = Some(docker_accept_response_tx);
+
+    app.active_tab_mut().claws_phase = ClawsPhase::PostAudit;
+    app.active_tab_mut().continue_command("claws init".to_string());
+
+    spawn_text_command(tx, exit_tx, move |sink| async move {
+        let mut summary = claws::ClawsSummary::default();
+
+        // Rebuild image with audit-updated Dockerfile.dev.
+        claws::rebuild_nanoclaw_post_audit(&sink, &ctx, &mut summary).await?;
+
+        // Signal the TUI to show the docker socket warning dialog.
         if docker_accept_request_tx.send(()).is_err() {
             anyhow::bail!("Docker socket warning channel closed unexpectedly.");
         }
-        // Block until the user accepts or declines in the dialog.
         if !docker_accept_response_rx.await.unwrap_or(false) {
             anyhow::bail!("Docker socket access declined. Cannot launch nanoclaw container.");
         }
 
-        // Phase 2: launch background container with docker socket.
-        let container_id =
-            claws::launch_nanoclaw_container(&sink, &env_vars, &mut summary, closure_host_settings.as_ref()).await?;
+        // Launch background nanoclaw container with docker socket.
+        let container_id = claws::launch_nanoclaw_container(
+            &sink,
+            &ctx.env_vars,
+            &mut summary,
+            closure_host_settings.as_ref(),
+        ).await?;
         let _ = container_tx.send(container_id);
         Ok(())
     });
 }
 
-/// Launch the claws container start for a subsequent run (TUI mode).
+/// Start the nanoclaw container in the background for `claws ready` (TUI mode).
 ///
-/// Starts the background container with a direct host bind mount for
-/// `$HOME/.nanoclaw` and sends the container ID to
-/// `check_claws_continuation` for the PTY attach.
-async fn launch_claws_start_container(app: &mut App) {
-    // Resolve credentials using the same auto-passthrough as other containers.
+/// Starts the container detached without attaching — the user can run
+/// `claws chat` afterwards to attach. Used by the `ClawsReadyOfferStart` dialog.
+async fn launch_claws_start_container_status_only(app: &mut App) {
     let agent_name = {
         let config = load_repo_config(&claws::nanoclaw_path()).unwrap_or_default();
         config.agent.unwrap_or_else(|| "claude".to_string())
@@ -1167,8 +1328,6 @@ async fn launch_claws_start_container(app: &mut App) {
     let credentials = agent_keychain_credentials(&agent_name);
     let env_vars = credentials.env_vars;
 
-    // Prepare sanitized host config. Stored in tab so TempDir outlives the
-    // background setup task and remains valid through the PTY exec session.
     app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name);
     let closure_host_settings = app.active_tab().host_settings.as_ref().map(|hs| {
         docker::HostSettings::from_paths(hs.config_path.clone(), hs.claude_dir_path.clone())
@@ -1179,10 +1338,9 @@ async fn launch_claws_start_container(app: &mut App) {
 
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     app.active_tab_mut().exit_rx = Some(exit_rx);
-    let (container_tx, container_rx) = tokio::sync::oneshot::channel::<String>();
-    app.active_tab_mut().claws_container_id_rx = Some(container_rx);
     let tx = app.active_tab().output_tx.clone();
 
+    // No container_id channel — start only, no attach.
     spawn_text_command(tx, exit_tx, move |sink| async move {
         let nanoclaw_str = claws::nanoclaw_path_str();
         let container_name = docker::generate_container_name();
@@ -1210,35 +1368,94 @@ async fn launch_claws_start_container(app: &mut App) {
         config.nanoclaw_container_id = Some(container_id.clone());
         claws::save_nanoclaw_config(&config)?;
 
-        let _ = container_tx.send(container_id);
+        sink.println("nanoclaw container started. Run 'claws chat' to attach.");
         Ok(())
     });
 }
 
-/// Check if the claws setup phase just completed and attach to the container.
+/// Check if the claws workflow phase just completed and advance to the next phase.
 async fn check_claws_continuation(app: &mut App) {
-    if app.active_tab().claws_phase != ClawsPhase::Setup {
-        return;
-    }
+    let phase = app.active_tab().claws_phase.clone();
+    match phase {
+        ClawsPhase::Inactive => {}
 
-    if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
-        let tab = app.active_tab_mut();
-        tab.claws_phase = ClawsPhase::Inactive;
-        tab.claws_container_id = None;
-        tab.claws_container_id_rx = None;
-        return;
-    }
+        ClawsPhase::Setup => {
+            // Container start-only (claws ready with stopped container). No PTY attach.
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.claws_phase = ClawsPhase::Inactive;
+                tab.claws_container_id = None;
+                tab.claws_container_id_rx = None;
+                return;
+            }
+            // Container ID is delivered via tick() into claws_container_id.
+            if let Some(container_id) = app.active_tab_mut().claws_container_id.take() {
+                app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+                app.active_tab_mut().claws_container_id_rx = None;
+                launch_claws_exec(app, container_id).await;
+            } else {
+                // Start-only completed (no attach needed).
+                let tab = app.active_tab_mut();
+                tab.claws_phase = ClawsPhase::Inactive;
+                tab.claws_container_id_rx = None;
+            }
+        }
 
-    // Container ID is delivered via tick() into claws_container_id.
-    if let Some(container_id) = app.active_tab_mut().claws_container_id.take() {
-        app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
-        app.active_tab_mut().claws_container_id_rx = None;
-        launch_claws_exec(app, container_id).await;
-    } else {
-        // Setup completed but no container ID — error path.
-        let tab = app.active_tab_mut();
-        tab.claws_phase = ClawsPhase::Inactive;
-        tab.claws_container_id_rx = None;
+        ClawsPhase::PreAudit => {
+            // Pre-audit text task finished. If it failed, abort the wizard.
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.claws_phase = ClawsPhase::Inactive;
+                tab.claws_audit_ctx = None;
+                tab.claws_audit_ctx_rx = None;
+                return;
+            }
+            // Audit context should have arrived via tick() by now.
+            if let Some(ctx) = app.active_tab_mut().claws_audit_ctx.take() {
+                launch_claws_audit(app, ctx);
+            } else {
+                app.active_tab_mut().push_output(
+                    "Internal error: pre-audit completed but no audit context received.".to_string(),
+                );
+                app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+            }
+        }
+
+        ClawsPhase::Audit => {
+            // Audit PTY finished. If it failed, abort.
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.claws_phase = ClawsPhase::Inactive;
+                tab.claws_audit_ctx = None;
+                return;
+            }
+            // Launch post-audit: image rebuild + docker accept + container launch.
+            launch_claws_init_post_audit(app).await;
+        }
+
+        ClawsPhase::PostAudit => {
+            // Post-audit text task finished. If it failed, abort.
+            if matches!(app.active_tab().phase, state::ExecutionPhase::Error { .. }) {
+                let tab = app.active_tab_mut();
+                tab.claws_phase = ClawsPhase::Inactive;
+                tab.claws_container_id = None;
+                tab.claws_container_id_rx = None;
+                return;
+            }
+            // Container ID is delivered via tick() into claws_container_id.
+            if let Some(container_id) = app.active_tab_mut().claws_container_id.take() {
+                app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+                app.active_tab_mut().claws_container_id_rx = None;
+                launch_claws_exec(app, container_id).await;
+            } else {
+                // Post-audit completed but no container ID.
+                app.active_tab_mut().push_output(
+                    "Internal error: post-audit completed but no container ID received.".to_string(),
+                );
+                app.active_tab_mut().claws_phase = ClawsPhase::Inactive;
+                app.active_tab_mut().claws_container_id_rx = None;
+            }
+        }
     }
 }
 
@@ -1278,7 +1495,7 @@ async fn launch_claws_exec(app: &mut App, container_id: String) {
     let container_name = format!("nanoclaw-{}", &container_id[..container_id.len().min(12)]);
     let display_name = state::agent_display_name(&agent_name).to_string();
 
-    app.active_tab_mut().continue_command("claws ready (attached)".to_string());
+    app.active_tab_mut().continue_command("claws chat".to_string());
     app.active_tab_mut().start_container(container_name.clone(), display_name, inner_cols, inner_rows);
 
     match PtySession::spawn("docker", &exec_str_refs, size) {

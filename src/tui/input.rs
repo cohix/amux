@@ -454,7 +454,7 @@ fn handle_claws_has_forked(tab: &mut TabState, key: KeyEvent) -> Action {
             tab.dialog = Dialog::None;
             tab.input_error = Some(
                 "Please fork nanoclaw at github.com/qwibitai/nanoclaw, \
-                 then run 'claws ready' again."
+                 then run 'claws init' again."
                     .into(),
             );
         }
@@ -627,7 +627,9 @@ fn flag_suggestions_for(cmd: &str, _typed: &str) -> Vec<String> {
             "new  (creates a new work item from template)".into(),
         ],
         "claws" => vec![
-            "claws ready  (set up and ensure nanoclaw container is running)".into(),
+            "claws init   (first-time setup: clone, build image, launch container)".into(),
+            "claws ready  (check status; start container if stopped)".into(),
+            "claws chat   (attach to running nanoclaw container)".into(),
         ],
         _ => vec![],
     }

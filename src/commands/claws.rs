@@ -162,22 +162,68 @@ fn print_claws_row(out: &OutputSink, label: &str, status: &StepStatus) {
 /// Command-mode entry point.
 pub async fn run(action: ClawsAction) -> Result<()> {
     match action {
+        ClawsAction::Init => run_claws_init(&OutputSink::Stdout).await,
         ClawsAction::Ready => run_claws_ready(&OutputSink::Stdout).await,
+        ClawsAction::Chat => run_claws_chat().await,
     }
 }
 
-/// Core logic for `amux claws ready` — shared between CLI and TUI.
+/// Entry point for `amux claws init` — runs the first-time setup wizard.
+pub async fn run_claws_init(out: &OutputSink) -> Result<()> {
+    let mut summary = ClawsSummary::default();
+    run_first_time_wizard(out, &mut summary).await?;
+    print_claws_summary(out, &summary);
+    Ok(())
+}
+
+/// Entry point for `amux claws ready` — status-only check, no first-run wizard.
+///
+/// If nanoclaw is not installed, suggests running `claws init`.
+/// If nanoclaw is installed but the container is not running, interactively
+/// offers to start it in the background.
 pub async fn run_claws_ready(out: &OutputSink) -> Result<()> {
     let nanoclaw_dir = nanoclaw_path();
-    let mut summary = ClawsSummary::default();
 
     if !nanoclaw_dir.exists() {
-        run_first_time_wizard(out, &mut summary).await?;
-    } else {
-        run_subsequent_check(out, &mut summary).await?;
+        out.println("nanoclaw is not installed. Run 'amux claws init' to set up nanoclaw.");
+        return Ok(());
     }
 
+    let mut summary = ClawsSummary::default();
+    run_subsequent_check(out, &mut summary).await?;
     print_claws_summary(out, &summary);
+    Ok(())
+}
+
+/// Entry point for `amux claws chat` — attaches to the running nanoclaw container.
+///
+/// The nanoclaw container must already be running (started via `claws init` or
+/// `claws ready`). Attaches interactively with a freeform agent chat session.
+pub async fn run_claws_chat() -> Result<()> {
+    let nanoclaw_dir = nanoclaw_path();
+
+    if !nanoclaw_dir.exists() {
+        bail!("nanoclaw is not installed. Run 'amux claws init' to set up nanoclaw.");
+    }
+
+    let config = load_nanoclaw_config().unwrap_or_default();
+    let container_id = match config.nanoclaw_container_id {
+        Some(id) if docker::is_container_running(&id) => id,
+        _ => {
+            bail!(
+                "nanoclaw container is not running. \
+                 Run 'amux claws ready' to start it."
+            );
+        }
+    };
+
+    let agent_name = {
+        let cfg = load_repo_config(&nanoclaw_path()).unwrap_or_default();
+        cfg.agent.unwrap_or_else(|| "claude".to_string())
+    };
+    let credentials = agent_keychain_credentials(&agent_name);
+
+    attach_to_nanoclaw(&container_id, &agent_name, &credentials.env_vars)?;
     Ok(())
 }
 
@@ -454,21 +500,28 @@ fn is_nanoclaw_parent_permission_denied() -> bool {
     }
 }
 
-/// Phase 1 of the first-run setup: build the nanoclaw image and run the Dockerfile.dev audit.
+/// Context produced by the pre-audit phase, needed by the audit and post-audit phases.
+#[derive(Clone)]
+pub struct ClawsAuditCtx {
+    pub nanoclaw_str: String,
+    pub agent_name: String,
+    /// Agent credentials forwarded into the audit container.
+    pub env_vars: Vec<(String, String)>,
+    /// Absolute path to Dockerfile.dev inside the nanoclaw repo.
+    pub dockerfile_str: String,
+}
+
+/// Phase 1 of the first-run setup: Docker check, Dockerfile.dev init, initial image build.
 ///
-/// Checks the Docker daemon, ensures Dockerfile.dev exists, builds an initial image,
-/// runs the audit agent in the foreground WITHOUT docker socket access (the audit only
-/// needs to read and modify Dockerfile.dev), then rebuilds the image with the updated
-/// Dockerfile.dev.
-///
-/// The caller is responsible for showing the docker-socket warning and obtaining user
-/// acceptance before calling `launch_nanoclaw_container`.
-pub async fn build_nanoclaw_image(
+/// Does NOT run the audit agent. Returns a `ClawsAuditCtx` the caller uses to launch
+/// the audit (interactively in CLI mode, via PTY container window in TUI mode) and then
+/// call `rebuild_nanoclaw_post_audit`.
+pub async fn build_nanoclaw_pre_audit(
     out: &OutputSink,
-    env_vars: &[(String, String)],
+    env_vars: Vec<(String, String)>,
     summary: &mut ClawsSummary,
     host_settings: Option<&docker::HostSettings>,
-) -> Result<()> {
+) -> Result<ClawsAuditCtx> {
     let nanoclaw_dir = nanoclaw_path();
     let nanoclaw_str = nanoclaw_path_str();
 
@@ -484,9 +537,8 @@ pub async fn build_nanoclaw_image(
 
     // Determine agent name from nanoclaw repo config (default to claude).
     let config = load_repo_config(&nanoclaw_dir).unwrap_or_default();
-    let agent_name_owned = config.agent.unwrap_or_else(|| "claude".to_string());
-    let agent_name = agent_name_owned.as_str();
-    let agent = agent_from_str(agent_name);
+    let agent_name = config.agent.unwrap_or_else(|| "claude".to_string());
+    let agent = agent_from_str(&agent_name);
 
     // Ensure Dockerfile.dev exists in the nanoclaw repo.
     out.print("Checking Dockerfile.dev in nanoclaw... ");
@@ -506,64 +558,72 @@ pub async fn build_nanoclaw_image(
     .context("Failed to build nanoclaw Docker image")?;
     out.println(format!("Image {} built successfully.", NANOCLAW_IMAGE_TAG));
 
-    // Run the Dockerfile.dev audit agent in the foreground so it can scan the nanoclaw
-    // repo and update Dockerfile.dev with every tool needed. The audit container does NOT
-    // need docker socket access — it only reads and modifies Dockerfile.dev.
-    // Host path and container path are identical so file references match.
-    // CLI: inherited stdio (user interacts directly). TUI: captured, streamed through sink.
-    let entrypoint = audit_entrypoint(agent_name);
-    let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
-    out.println("Running Dockerfile.dev audit agent...");
-    match out {
-        OutputSink::Stdout => {
-            docker::run_container_at_path(
-                NANOCLAW_IMAGE_TAG,
-                &nanoclaw_str,
-                &nanoclaw_str,
-                &nanoclaw_str,
-                &entrypoint_refs,
-                env_vars,
-                host_settings,
-                false, // audit container: no docker socket access
-            )
-            .context("Nanoclaw Dockerfile.dev audit container failed")?;
-        }
-        _ => {
-            let audit_output = docker::run_container_captured_at_path(
-                NANOCLAW_IMAGE_TAG,
-                &nanoclaw_str,
-                &nanoclaw_str,
-                &nanoclaw_str,
-                &entrypoint_refs,
-                env_vars,
-                host_settings,
-                false, // audit container: no docker socket access
-            )
-            .context("Nanoclaw Dockerfile.dev audit container failed")?;
-            for line in audit_output.lines() {
-                out.println(line);
-            }
-        }
-    }
+    let _ = host_settings; // not needed for initial build; caller passes to audit container
+    Ok(ClawsAuditCtx { nanoclaw_str, agent_name, env_vars, dockerfile_str })
+}
 
-    // Rebuild the nanoclaw image with the audit-updated Dockerfile.dev.
+/// Phase 3 of the first-run setup: rebuild the nanoclaw image after the audit agent has
+/// updated Dockerfile.dev.
+pub async fn rebuild_nanoclaw_post_audit(
+    out: &OutputSink,
+    ctx: &ClawsAuditCtx,
+    summary: &mut ClawsSummary,
+) -> Result<()> {
     out.println(format!(
         "Rebuilding image {} with updated Dockerfile.dev...",
         NANOCLAW_IMAGE_TAG
     ));
-    let out_clone2 = out.clone();
+    let out_clone = out.clone();
+    let nanoclaw_str = ctx.nanoclaw_str.clone();
+    let dockerfile_str = ctx.dockerfile_str.clone();
     docker::build_image_streaming(
         NANOCLAW_IMAGE_TAG,
         &dockerfile_str,
         &nanoclaw_str,
         false,
-        |line| { out_clone2.println(line); },
+        |line| { out_clone.println(line); },
     )
     .context("Failed to rebuild nanoclaw Docker image after audit")?;
     out.println(format!("Image {} rebuilt successfully.", NANOCLAW_IMAGE_TAG));
     summary.nanoclaw_image = StepStatus::Ok("built".into());
-
     Ok(())
+}
+
+/// Phase 1+2+3 combined for CLI mode: build initial image, run audit interactively
+/// (inherited stdio, foreground, with an `amux-` container name), then rebuild.
+///
+/// The caller is responsible for showing the docker-socket warning and obtaining user
+/// acceptance before calling `launch_nanoclaw_container`.
+pub async fn build_nanoclaw_image(
+    out: &OutputSink,
+    env_vars: &[(String, String)],
+    summary: &mut ClawsSummary,
+    host_settings: Option<&docker::HostSettings>,
+) -> Result<()> {
+    let ctx = build_nanoclaw_pre_audit(out, env_vars.to_vec(), summary, host_settings).await?;
+
+    // Run the Dockerfile.dev audit agent in the foreground (CLI: inherited stdio).
+    // The audit container does NOT need docker socket access — it only reads and
+    // modifies Dockerfile.dev. Host path and container path are identical so that
+    // file references inside the agent match the host filesystem.
+    let container_name = docker::generate_container_name();
+    let entrypoint = audit_entrypoint(&ctx.agent_name);
+    let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
+    out.println("Running Dockerfile.dev audit agent...");
+    docker::run_container_at_path(
+        NANOCLAW_IMAGE_TAG,
+        &ctx.nanoclaw_str,
+        &ctx.nanoclaw_str,
+        &ctx.nanoclaw_str,
+        &entrypoint_refs,
+        &ctx.env_vars,
+        host_settings,
+        false, // audit container: no docker socket access
+        Some(&container_name),
+    )
+    .context("Nanoclaw Dockerfile.dev audit container failed")?;
+
+    rebuild_nanoclaw_post_audit(out, &ctx, summary).await
 }
 
 /// Phase 2 of the first-run setup: launch the nanoclaw background container.

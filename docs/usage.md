@@ -47,7 +47,9 @@ amux chat
 amux chat --plan
 amux chat --allow-docker
 amux new
+amux claws init
 amux claws ready
+amux claws chat
 ```
 
 ---
@@ -361,58 +363,106 @@ section for details on how each agent's plan mode is activated.
 
 ---
 
-### `amux claws ready`
+### `amux claws` — Persistent nanoclaw agent management
 
-Sets up and manages a persistent nanoclaw agent container — a machine-global
-installation of [nanoclaw](https://github.com/qwibitai/nanoclaw) that runs a
-background agent accessible from anywhere on the machine.
+The `claws` commands manage a persistent nanoclaw agent container — a
+machine-global installation of [nanoclaw](https://github.com/qwibitai/nanoclaw)
+that runs a background agent accessible from anywhere on the machine.
 
 Unlike `implement` and `chat` (per-project, ephemeral containers), the nanoclaw
-container is persistent and machine-global. It lives at `/usr/local/nanoclaw`
+container is persistent and machine-global. It lives at `$HOME/.nanoclaw`
 and survives across `amux` sessions.
 
-#### First-run wizard
+All `claws` subcommands show as **purple/magenta** tabs in the TUI.
 
-On the first run, `amux claws ready` guides you through:
+---
+
+### `amux claws init`
+
+Runs the first-time setup wizard to install and launch nanoclaw.
 
 1. **Fork check** — asks whether you have already forked nanoclaw on GitHub.
    - **Yes** — prompts for your GitHub username and clones
-     `github.com/<username>/nanoclaw` to `/usr/local/nanoclaw`.
+     `github.com/<username>/nanoclaw` to `$HOME/.nanoclaw`.
    - **No** — offers to fork and clone using the GitHub CLI (`gh repo fork`).
      If you decline, provides manual instructions.
 2. **Docker daemon** — verifies the Docker daemon is running.
 3. **Dockerfile setup** — writes or verifies `Dockerfile.dev` inside the
    nanoclaw repo and builds the `amux-nanoclaw:latest` image.
-4. **Docker socket warning** — explains (and requires explicit acceptance) that
+4. **Agent audit** — runs the Dockerfile.dev audit agent in a foreground,
+   interactive, prompted container (no Docker socket) to configure nanoclaw's
+   toolchain. The container is named with an `amux-` prefix and runs `--rm -it`.
+   In the **TUI**, the audit opens in the tab's container window exactly like
+   `chat` or `implement`. In **command mode**, it inherits stdin/stdout.
+5. **Docker socket warning** — explains (and requires explicit acceptance) that
    the nanoclaw container will be mounted to the host Docker socket, granting
    elevated access identical to `--allow-docker`.
-5. **`/setup` explanation** — reminds you to run `/setup` inside the agent
-   after launching, and requires explicit acceptance before proceeding.
-6. **Container launch** — creates a Docker named volume (`amux-nanoclaw-vol`),
-   starts the container in the background, waits for it to reach running state,
-   and saves the container ID to `/usr/local/nanoclaw/.aspec.json`.
-7. **Attach** — attaches to the running container and launches the configured
+6. **`/setup` explanation** — reminds you to run `/setup` inside the agent
+   after launching, and requires explicit acceptance before proceeding (CLI
+   only; the TUI shows this as a dialog during the wizard).
+7. **Container launch** — starts the nanoclaw container in the background
+   (`-d`, detached), waits for it to reach running state, and saves the
+   container ID to `$HOME/.nanoclaw/.amux.json`.
+8. **Attach** — attaches to the running container and launches the configured
    code agent interactively (identical to `amux chat`).
 
-#### Subsequent runs
+In the **TUI**, the wizard is presented via modal dialogs, and the audit agent
+runs in the tab's PTY container window. In **command mode**, the wizard runs
+interactively on stdin.
 
-On subsequent runs, `claws ready` checks whether the saved container is still
-running:
+**Examples**
 
-- **Container running** — shows a summary table and exits immediately.
-- **Container stopped** — offers to restart it. If accepted, starts the
-  container and attaches the agent. Reminds you to run `/setup` if needed.
+```sh
+amux claws init    # run first-time setup wizard
+```
 
-#### Agent session behavior
+---
 
-Once attached, the experience is identical to `amux chat`:
+### `amux claws ready`
 
-- In **command mode**, stdin/stdout/stderr are fully connected.
-- In **TUI mode**, the container window opens with full keyboard passthrough.
+Checks whether the nanoclaw container is running and shows a status table.
+Does **not** run the first-time wizard.
+
+- **Nanoclaw not installed** (`$HOME/.nanoclaw` missing) — prints a message
+  suggesting `amux claws init` and exits without error.
+- **Container running** — shows a status summary table and exits immediately.
+- **Container stopped** — interactively offers to start the container in the
+  background (`-d`). If accepted, starts it and saves the new container ID.
+  Use `claws chat` afterwards to attach.
+
+**Examples**
+
+```sh
+amux claws ready    # check status; start container if stopped
+```
+
+---
+
+### `amux claws chat`
+
+Attaches to the running nanoclaw container for a freeform agent chat session.
+
+- If nanoclaw is not installed → error, suggests `claws init`.
+- If the container is not running → error, suggests `claws ready`.
+- If the container is running → attaches interactively (identical to `amux chat`).
+
+In the **TUI**, the container window opens with full keyboard passthrough. In
+**command mode**, stdin/stdout/stderr are fully connected to the agent.
+
+**Agent session behavior**
+
 - Press **Ctrl+C** to detach from the agent — the container **continues
-  running in the background**. The next `claws ready` will re-attach.
+  running in the background**. Run `claws chat` again to re-attach.
 
-#### Authentication
+**Examples**
+
+```sh
+amux claws chat    # attach to running nanoclaw container
+```
+
+---
+
+#### Authentication (all claws commands)
 
 The nanoclaw container is auto-authenticated using the same keychain
 passthrough as `chat` and `implement` — no manual login required.
@@ -421,23 +471,16 @@ passthrough as `chat` and `implement` — no manual login required.
 
 The nanoclaw container always mounts the host Docker socket. This is required
 for nanoclaw to manage Docker containers on your behalf. A warning is shown and
-explicit acceptance is required on first run.
+explicit acceptance is required during `claws init`.
 
 #### Configuration
 
-The container ID is stored at `/usr/local/nanoclaw/.aspec.json`:
+The container ID is stored at `$HOME/.nanoclaw/.amux.json`:
 
 ```json
 {
   "nanoclawContainerID": "abc123..."
 }
-```
-
-#### Examples
-
-```sh
-amux claws ready    # first run: full wizard
-amux claws ready    # subsequent run: check status or re-attach
 ```
 
 ---

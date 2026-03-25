@@ -586,6 +586,9 @@ pub fn run_container(
 /// stdin, stdout, and stderr are inherited so the user can interact with the container
 /// directly. Use this when the working path inside the container is not `/workspace`
 /// (e.g. the nanoclaw audit container which operates in `$HOME/.nanoclaw`).
+///
+/// When `container_name` is Some, `--name <name>` is added so the container is
+/// identifiable in `docker ps` output.
 pub fn run_container_at_path(
     image: &str,
     host_path: &str,
@@ -595,16 +598,25 @@ pub fn run_container_at_path(
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
+    container_name: Option<&str>,
 ) -> Result<()> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
         "-it".into(),
+    ];
+
+    if let Some(name) = container_name {
+        args.push("--name".into());
+        args.push(name.into());
+    }
+
+    args.extend_from_slice(&[
         "-v".into(),
         format!("{}:{}", host_path, container_path),
         "-w".into(),
         working_dir.into(),
-    ];
+    ]);
 
     if let Some(settings) = host_settings {
         append_settings_mounts(&mut args, settings);
@@ -844,6 +856,51 @@ pub fn build_run_args_pty_display(
         append_docker_socket_mount_args(&mut args);
     }
     append_env_args_display(&mut args, env_vars);
+    append_entrypoint(&mut args, image, entrypoint);
+    args
+}
+
+/// Builds PTY `docker run` args where the container path matches the host path.
+///
+/// Like `build_run_args_pty` but mounts `host_path` to `container_path` (instead
+/// of `/workspace`) and sets `working_dir` explicitly. Use this for agents that must
+/// reference files by their absolute host path (e.g. the nanoclaw audit container).
+pub fn build_run_args_pty_at_path(
+    image: &str,
+    host_path: &str,
+    container_path: &str,
+    working_dir: &str,
+    entrypoint: &[&str],
+    env_vars: &[(String, String)],
+    container_name: Option<&str>,
+    host_settings: Option<&HostSettings>,
+    allow_docker: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-it".into(),
+    ];
+
+    if let Some(name) = container_name {
+        args.push("--name".into());
+        args.push(name.into());
+    }
+
+    args.extend_from_slice(&[
+        "-v".into(),
+        format!("{}:{}", host_path, container_path),
+        "-w".into(),
+        working_dir.into(),
+    ]);
+
+    if let Some(settings) = host_settings {
+        append_settings_mounts(&mut args, settings);
+    }
+    if allow_docker {
+        append_docker_socket_mount_args(&mut args);
+    }
+    append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
 }
