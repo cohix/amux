@@ -31,7 +31,7 @@ const GIT_SSH_ACCEPT_NEW: &str = "core.sshCommand=ssh -o StrictHostKeyChecking=a
 /// via `Dockerfile.nanoclaw` and does not require agent modification.
 const CLAWS_INIT_AUDIT_PROMPT: &str = "\
 You have two jobs that can be performed in parallel: \n\
-/n/
+\n\
 First, evaluate the nanoclaw source code to determine how containers communicate with each other \
 over the network. Modify the codebase so that all network traffic gets configured to be \
 container-to-container rather than container-to-host. The `host.docker.internal` route should \
