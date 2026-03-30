@@ -106,9 +106,16 @@ See the [Getting Started Guide](docs/getting-started.md) for a full walkthrough.
 
 ## Installation
 
-### From releases
+```sh
+curl -s https://prettysmart.dev/install/amux.sh | sh
+```
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
+That's it. The installer detects your platform and puts `amux` on your `PATH`.
+
+<details>
+<summary>Other installation options</summary>
+
+**From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
 
 | Platform | Binary |
 |----------|--------|
@@ -118,15 +125,15 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 | macOS (Apple Silicon) | `amux-macos-arm64` |
 | Windows (x86_64) | `amux-windows-amd64.exe` |
 
-### From source
-
-Requires Rust 1.94+ and make:
+**From source** — requires Rust 1.94+ and make:
 
 ```sh
 git clone https://github.com/prettysmartdev/amux.git
 cd amux
 sudo make install
 ```
+
+</details>
 
 ---
 

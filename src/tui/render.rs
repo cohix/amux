@@ -133,9 +133,15 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!(" {} ", project)
         };
 
+        let borders = if is_active {
+            Borders::TOP | Borders::LEFT | Borders::RIGHT
+        } else {
+            Borders::ALL
+        };
+
         let block = Block::default()
             .title(Span::styled(title_text, title_style))
-            .borders(Borders::ALL)
+            .borders(borders)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
 
@@ -1365,6 +1371,76 @@ mod tests {
             exec_border == "╭" || exec_border == "─" || exec_border == " ",
             "Exec window border or space should start at row 3. Got: '{}'",
             exec_border
+        );
+    }
+
+    #[test]
+    fn single_tab_renders_without_panic() {
+        // With exactly one tab (active_tab_idx == 0), the tab bar must render
+        // without any out-of-bounds access and the active tab must use the
+        // open-bottom (no bottom border) style.
+        let mut app = new_app();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Must not panic.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // The active tab occupies columns 0..20, rows 0..3.
+        // With Borders::TOP | LEFT | RIGHT (no bottom), row 2 of the tab area
+        // should NOT contain a horizontal border character at the bottom line.
+        // Row 0 is the top border (╭ … ╮), row 2 is the bottom of the tab block.
+        // For an active tab, the bottom row should be blank (space), not "─".
+        let bottom_left = buf[(0, 2)].symbol().to_string();
+        assert_ne!(
+            bottom_left, "╰",
+            "Active tab bottom-left corner should not appear (no bottom border). Got: '{}'",
+            bottom_left
+        );
+        // The top border should still be present.
+        let top_left = buf[(0, 0)].symbol().to_string();
+        assert!(
+            top_left == "╭" || top_left == "─",
+            "Active tab top border should be present. Got: '{}'",
+            top_left
+        );
+    }
+
+    #[test]
+    fn active_tab_has_no_bottom_border_inactive_tabs_do() {
+        // With two tabs, the active tab suppresses its bottom border while the
+        // inactive tab retains its full border (Borders::ALL).
+        let mut app = new_app();
+        // Add a second tab by pushing a new TabState.
+        let second = crate::tui::state::TabState::new(std::path::PathBuf::new());
+        app.tabs.push(second);
+        assert_eq!(app.tabs.len(), 2);
+        app.active_tab_idx = 0; // first tab is active
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Tab width is 20. Active tab: cols 0..20. Inactive tab: cols 20..40.
+        // Row 2 is the bottom row of the 3-row tab area.
+        // Active tab (col 0, row 2): no bottom border → should not be "╰".
+        let active_bottom_left = buf[(0, 2)].symbol().to_string();
+        assert_ne!(
+            active_bottom_left, "╰",
+            "Active tab must not have a bottom-left corner. Got: '{}'",
+            active_bottom_left
+        );
+
+        // Inactive tab (col 20, row 2): should have a bottom border "╰".
+        let inactive_bottom_left = buf[(20, 2)].symbol().to_string();
+        assert_eq!(
+            inactive_bottom_left, "╰",
+            "Inactive tab must have a bottom-left corner. Got: '{}'",
+            inactive_bottom_left
         );
     }
 }

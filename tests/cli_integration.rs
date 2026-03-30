@@ -94,14 +94,14 @@ fn implement_help_shows_non_interactive_flag() {
 #[test]
 fn new_help_shows_subcommand() {
     let output = amux()
-        .args(["--help"])
+        .args(["specs", "--help"])
         .output()
         .expect("failed to run amux");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("new"),
-        "help should mention 'new' subcommand"
+        "specs --help should mention 'new' subcommand"
     );
 }
 

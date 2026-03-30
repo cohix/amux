@@ -14,24 +14,31 @@
 
 ## Installation
 
-### From GitHub Releases (recommended)
+```sh
+curl -s https://prettysmart.dev/install/amux.sh | sh
+```
 
-Download the latest binary for your platform from the [Releases page](https://github.com/prettysmartdev/amux/releases), make it executable, and move it onto your `PATH`:
+The installer detects your platform and installs `amux` to `/usr/local/bin`.
+
+<details>
+<summary>Other installation options</summary>
+
+**From GitHub Releases** — download the binary for your platform from the [Releases page](https://github.com/prettysmartdev/amux/releases), make it executable, and move it onto your `PATH`:
 
 ```sh
 chmod +x amux-*
 mv amux-* /usr/local/bin/amux
 ```
 
-### From source
-
-Requires Rust 1.94+ and make:
+**From source** — requires Rust 1.94+ and make:
 
 ```sh
 git clone https://github.com/prettysmartdev/amux.git
 cd amux
 make install    # builds and installs to /usr/local/bin/amux
 ```
+
+</details>
 
 ---
 

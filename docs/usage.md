@@ -10,10 +10,10 @@ Every agent action runs inside a Docker container — never directly on your mac
 ## Installation
 
 ```sh
-make install          # builds and installs to /usr/local/bin/amux
-# or specify a different path:
-INSTALL_PATH=~/bin make install
+curl -s https://prettysmart.dev/install/amux.sh | sh
 ```
+
+See the [Getting Started guide](getting-started.md) for other installation options.
 
 ---
 
@@ -824,6 +824,8 @@ independent project context (working directory, command, container).
 - Project name (folder name of the tab's working directory, ≤14 characters)
 - Subcommand currently running (or last run), truncated if needed
 - Arrow `➡` in the active tab's title
+
+**Active tab appearance** — the active tab renders with its bottom border suppressed, making it appear to open into the content area below (like a raised tab in a physical tabbed folder). Inactive tabs retain a full closed border, visually receding so focus is drawn to the active one. This visual distinction works regardless of the tab's assigned colour.
 
 **Tab colours** reflect the state of each tab's current command:
 

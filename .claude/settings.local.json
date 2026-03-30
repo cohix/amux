@@ -11,7 +11,9 @@
       "Bash(xxd)",
       "Bash(python3:*)",
       "Bash(chmod:*)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(./target/debug/deps/amux-*)",
+      "Bash(--help)"
     ]
   }
 }
