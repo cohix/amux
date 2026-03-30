@@ -936,7 +936,7 @@ fn draw_interview_summary_dialog(
 
     // Render footer
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("  Ctrl+Enter to submit", Style::default().fg(Color::Green)),
+        Span::styled("  Ctrl+S / Ctrl+Enter to submit", Style::default().fg(Color::Green)),
         Span::raw("  ·  "),
         Span::styled("Esc to cancel", Style::default().fg(Color::DarkGray)),
     ]));

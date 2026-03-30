@@ -506,8 +506,10 @@ fn handle_new_interview_summary(
     mut summary: String,
     mut cursor_pos: usize,
 ) -> Action {
-    // Ctrl+Enter → submit.
-    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Ctrl+Enter or Ctrl+S → submit.
+    let is_submit = (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+        || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if is_submit {
         let trimmed = summary.trim().to_string();
         if !trimmed.is_empty() {
             tab.dialog = Dialog::None;

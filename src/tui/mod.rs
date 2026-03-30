@@ -22,7 +22,11 @@ use crate::tui::render::calculate_container_inner_size;
 use crate::tui::state::{App, ClawsPhase, ContainerWindowState, Dialog, PendingCommand, ReadyPhase};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+        KeyEventKind, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -44,12 +48,23 @@ pub async fn run(startup_flags: StartupReadyFlags) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Enable keyboard enhancement so that modifiers on special keys (e.g. Ctrl+Enter)
+    // are reported as distinct events. This is a best-effort push: terminals that do
+    // not support the Kitty keyboard protocol will silently ignore it.
+    let keyboard_enhanced = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(&mut terminal, startup_flags).await;
 
     // Always restore the terminal, even on error.
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
