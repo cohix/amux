@@ -20,6 +20,56 @@ Think of it like tmux, but agents: tabs, terminal emulator, multiple parallel se
 
 ---
 
+## Installation
+
+```sh
+curl -s https://prettysmart.dev/install/amux.sh | sh
+```
+
+That's it. The installer detects your platform and puts `amux` on your `PATH`.
+
+<details>
+<summary>Other installation options</summary>
+
+**From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
+
+| Platform | Binary |
+|----------|--------|
+| Linux (x86_64) | `amux-linux-amd64` |
+| Linux (ARM64) | `amux-linux-arm64` |
+| macOS (Intel) | `amux-macos-amd64` |
+| macOS (Apple Silicon) | `amux-macos-arm64` |
+| Windows (x86_64) | `amux-windows-amd64.exe` |
+
+**From source** — requires Rust 1.94+ and make:
+
+```sh
+git clone https://github.com/prettysmartdev/amux.git
+cd amux
+sudo make install
+```
+
+</details>
+
+---
+
+## Quick Start
+
+```sh
+# 1. Initialize your repo (only once)
+amux init
+
+# 2. Open the TUI and start an agent session
+amux
+
+# 3. Then run an amux command (starts an agent chat session)
+chat
+```
+
+See the [Getting Started Guide](docs/getting-started.md) for a full walkthrough. All commands are available directly via the CLI in addition to the TUI.
+
+---
+
 ## Why `amux`?
 
 Running agents one at a time is a waste. Running them directly on your machine is risky. `amux` solves both:
@@ -84,56 +134,6 @@ The nanoclaw container:
 - Your code agent is automatically configured and authenticated with secure copies of config files and OAuth tokens from your host installation.
 - `amux` itself is a statically compiled Rust binary — memory-safe and unmodifiable by agents
 - Every Docker command is printed in full before execution so you can see exactly what runs
-
----
-
-## Quick Start
-
-```sh
-# 1. Initialize your repo (only once)
-amux init
-
-# 2. Open the TUI and start an agent session
-amux
-
-# 3. Then run an amux command (starts an agent chat session)
-chat
-```
-
-See the [Getting Started Guide](docs/getting-started.md) for a full walkthrough. All commands are available directly via the CLI in addition to the TUI.
-
----
-
-## Installation
-
-```sh
-curl -s https://prettysmart.dev/install/amux.sh | sh
-```
-
-That's it. The installer detects your platform and puts `amux` on your `PATH`.
-
-<details>
-<summary>Other installation options</summary>
-
-**From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
-
-| Platform | Binary |
-|----------|--------|
-| Linux (x86_64) | `amux-linux-amd64` |
-| Linux (ARM64) | `amux-linux-arm64` |
-| macOS (Intel) | `amux-macos-amd64` |
-| macOS (Apple Silicon) | `amux-macos-arm64` |
-| Windows (x86_64) | `amux-windows-amd64.exe` |
-
-**From source** — requires Rust 1.94+ and make:
-
-```sh
-git clone https://github.com/prettysmartdev/amux.git
-cd amux
-sudo make install
-```
-
-</details>
 
 ---
 
