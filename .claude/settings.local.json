@@ -16,7 +16,8 @@
       "Bash(--help)",
       "Bash(gh run:*)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(grep -n \"quit_confirm\\\\|close_tab_confirm\\\\|QuitConfirm\\\\|CloseTabConfirm\" /workspace/tests/*.rs)"
     ]
   }
 }

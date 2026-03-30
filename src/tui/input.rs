@@ -322,35 +322,34 @@ fn handle_input_key(tab: &mut TabState, key: KeyEvent, num_tabs: usize) -> Actio
 // --- Dialog handlers ---
 
 fn handle_quit_confirm(tab: &mut TabState, key: KeyEvent) -> Action {
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            tab.dialog = Dialog::None;
-            return Action::QuitConfirmed;
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            tab.dialog = Dialog::None;
-        }
-        _ => {}
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        tab.dialog = Dialog::None;
+        return Action::QuitConfirmed;
+    }
+    if key.code == KeyCode::Esc {
+        tab.dialog = Dialog::None;
     }
     Action::None
 }
 
 fn handle_close_tab_confirm(tab: &mut TabState, key: KeyEvent) -> Action {
-    match key.code {
-        KeyCode::Char('1') => {
-            tab.dialog = Dialog::None;
-            Action::CloseCurrentTab
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => {
+                tab.dialog = Dialog::None;
+                return Action::QuitConfirmed;
+            }
+            KeyCode::Char('t') => {
+                tab.dialog = Dialog::None;
+                return Action::CloseCurrentTab;
+            }
+            _ => {}
         }
-        KeyCode::Char('2') => {
-            tab.dialog = Dialog::None;
-            Action::QuitConfirmed
-        }
-        KeyCode::Char('3') | KeyCode::Esc => {
-            tab.dialog = Dialog::None;
-            Action::None
-        }
-        _ => Action::None,
     }
+    if key.code == KeyCode::Esc {
+        tab.dialog = Dialog::None;
+    }
+    Action::None
 }
 
 fn handle_new_tab_directory(tab: &mut TabState, key: KeyEvent, mut input: String) -> Action {

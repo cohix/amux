@@ -677,8 +677,8 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
 
     let (title, body) = match &tab.dialog {
         Dialog::CloseTabConfirm => (
-            " Close Tab? ",
-            "  1) Close this tab\n  2) Exit amux\n  3) Cancel\n\n  [1/2/3 or Esc]  ".to_string(),
+            " Ctrl+C pressed ",
+            " Press ctrl-c again to quit amux, ctrl-t to close the current tab, or esc to cancel  ".to_string(),
         ),
         Dialog::NewTabDirectory { input } => (
             " New Tab — Working Directory ",
@@ -688,8 +688,8 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
             ),
         ),
         Dialog::QuitConfirm => (
-            " Quit amux? ",
-            "  Are you sure you want to quit? [y/n]  ".to_string(),
+            " Ctrl+C pressed ",
+            " Press ctrl-c again to quit amux, or esc to cancel  ".to_string(),
         ),
         Dialog::MountScope { git_root, cwd } => (
             " Mount Scope ",
