@@ -23,7 +23,18 @@
       "Read(//usr/local/bin/**)",
       "Bash(grep -iE \"^lsp$|\"\"lsp\"\"|lspEnabled|suppressLsp|hasLsp|disableLsp|lsp_enabled|install.*lsp|lsp.*install\")",
       "Bash(grep -rn claws_chat_container_not_running /workspace --include=*.rs)",
-      "Bash(grep -rn claws_chat /workspace --include=*.rs)"
+      "Bash(grep -rn claws_chat /workspace --include=*.rs)",
+      "Bash(rustc --version)",
+      "Bash(RUSTFLAGS=\"-D warnings\" cargo build)",
+      "Bash(grep -v \"^$\\\\| $\")",
+      "Bash(ls /workspace/rust-toolchain*)",
+      "Bash(curl -sf --max-time 5 \"https://api.github.com/\")",
+      "Bash(curl -sf --max-time 5 \"https://api.github.com/\" -v)",
+      "Bash(curl -s --max-time 5 \"https://api.github.com/\")",
+      "Bash(curl --version)",
+      "Bash(curl -sf --max-time 5 https://api.github.com/)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(done)"
     ]
   }
 }

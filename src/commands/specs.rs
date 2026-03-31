@@ -185,6 +185,7 @@ pub async fn run_new_with_sink(
 
     // Open the work item file in VS Code after the agent finishes.
     let work_item_path = find_work_item(&git_root, number).ok();
+    #[cfg(not(test))]
     if is_vscode_terminal() {
         if let Some(path) = work_item_path {
             open_in_vscode(&path);

@@ -74,6 +74,7 @@ pub async fn run_with_sink(
     out.println(format!("Created work item: {}", file_path.display()));
 
     // Try to open in VS Code if running inside the VS Code terminal.
+    #[cfg(not(test))]
     if is_vscode_terminal() {
         open_in_vscode(&file_path);
         out.println(format!("Opened {} in VS Code.", filename));

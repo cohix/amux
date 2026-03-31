@@ -25,8 +25,16 @@ use amux::commands::ready::{
 use amux::commands::{init, new, ready};
 use amux::tui::input::{autocomplete_suggestions, closest_subcommand};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
 use tokio::sync::mpsc::unbounded_channel;
+
+/// Mutex to serialize tests that mutate the global HOME environment variable.
+///
+/// `std::env::set_var` / `remove_var` are not thread-safe when other threads
+/// are running.  Any test that sets HOME must hold this lock for its entire
+/// duration so the env mutation is never observed by a concurrent test.
+static HOME_MUTEX: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // 1. init output via sink matches the expected lines
@@ -1929,6 +1937,7 @@ async fn claws_ready_not_installed_suggests_init() {
     let sink = amux::commands::output::OutputSink::Channel(tx);
 
     let tmp = TempDir::new().unwrap();
+    let _guard = HOME_MUTEX.lock().unwrap();
     std::env::set_var("HOME", tmp.path());
 
     let result = claws::run_claws_ready(&sink).await;
@@ -1953,6 +1962,7 @@ async fn claws_chat_not_installed_returns_error() {
     use amux::commands::claws;
 
     let tmp = TempDir::new().unwrap();
+    let _guard = HOME_MUTEX.lock().unwrap();
     std::env::set_var("HOME", tmp.path());
 
     let result = claws::run_claws_chat().await;
@@ -1984,6 +1994,7 @@ async fn claws_chat_container_not_running_returns_error() {
         r#"{"nanoclawContainerID": "definitely-not-a-real-container-id"}"#,
     ).unwrap();
 
+    let _guard = HOME_MUTEX.lock().unwrap();
     std::env::set_var("HOME", tmp.path());
 
     let result = claws::run_claws_chat().await;
