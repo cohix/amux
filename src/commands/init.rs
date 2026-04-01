@@ -217,6 +217,7 @@ pub async fn run_with_sink(
                 host_settings.as_ref(),
                 false,
                 None,
+                None,
             ) {
                 Ok(_) => {
                     summary.audit = StepStatus::Ok("completed".into());

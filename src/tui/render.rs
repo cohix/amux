@@ -830,6 +830,17 @@ or n or 2 (or Esc) to cancel.  ".to_string(),
                 if error.len() > 60 { &error[..60] } else { error.as_str() }
             ),
         ),
+        Dialog::WorktreeMergePrompt { branch, had_error, .. } => (
+            " Worktree: Merge or Discard? ",
+            format!(
+                "  Branch '{}' {}.\n\n  \
+                 [m/y] Merge into current branch\n  \
+                 [d]   Discard (delete branch + worktree)\n  \
+                 [s/Esc] Keep worktree branch as-is  ",
+                branch,
+                if *had_error { "finished with errors" } else { "completed" }
+            ),
+        ),
         Dialog::None => return,
         // NewInterviewSummary is handled by the early return above — this arm is unreachable.
         Dialog::NewInterviewSummary { .. } => return,

@@ -338,7 +338,7 @@ fn autocomplete_implement_shows_non_interactive_flag() {
 #[test]
 fn agent_env_vars_passed_to_container() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-test".into())];
-    let args = amux::docker::build_run_args("img", "/repo", &[], &env, None, false, None);
+    let args = amux::docker::build_run_args("img", "/repo", &[], &env, None, false, None, None);
     assert!(args.contains(&"-e".to_string()));
     assert!(args.contains(&"ANTHROPIC_API_KEY=sk-test".to_string()));
 }
@@ -346,7 +346,7 @@ fn agent_env_vars_passed_to_container() {
 #[test]
 fn display_args_mask_env_var_values() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-secret".into())];
-    let args = amux::docker::build_run_args_display("img", "/repo", &[], &env, None, false, None);
+    let args = amux::docker::build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
     assert!(
         args.contains(&"ANTHROPIC_API_KEY=***".to_string()),
         "Display args must mask env var values, got: {:?}",
@@ -804,13 +804,13 @@ fn agent_display_names() {
 #[test]
 fn pty_args_container_name() {
     let args = amux::docker::build_run_args_pty(
-        "img", "/repo", &[], &[], Some("amux-test-42"), None, false,
+        "img", "/repo", &[], &[], Some("amux-test-42"), None, false, None,
     );
     assert!(args.contains(&"--name".to_string()));
     assert!(args.contains(&"amux-test-42".to_string()));
 
     let args_no_name = amux::docker::build_run_args_pty(
-        "img", "/repo", &[], &[], None, None, false,
+        "img", "/repo", &[], &[], None, None, false, None,
     );
     assert!(!args_no_name.contains(&"--name".to_string()));
 }
@@ -919,7 +919,7 @@ fn agent_credentials_default_is_empty() {
 #[test]
 fn docker_args_without_settings_has_workspace_mount_only() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-test".into())];
-    let args = amux::docker::build_run_args("img", "/repo", &[], &env, None, false, None);
+    let args = amux::docker::build_run_args("img", "/repo", &[], &env, None, false, None, None);
     // Without host_settings or allow_docker, only the workspace mount should be present.
     let volume_mounts: Vec<&String> = args.windows(2)
         .filter(|w| w[0] == "-v")
@@ -937,7 +937,7 @@ fn docker_args_without_settings_has_workspace_mount_only() {
 #[test]
 fn docker_display_args_mask_secrets() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-secret".into())];
-    let args = amux::docker::build_run_args_display("img", "/repo", &[], &env, None, false, None);
+    let args = amux::docker::build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
     assert!(args.contains(&"ANTHROPIC_API_KEY=***".to_string()), "API key should be masked");
     assert!(!args.iter().any(|a| a.contains("sk-ant-oat01-secret")), "Secret must not appear");
 }
@@ -1027,8 +1027,8 @@ fn chat_and_implement_share_docker_args() {
     let chat_ep_refs: Vec<&str> = chat_ep.iter().map(String::as_str).collect();
     let impl_ep_refs: Vec<&str> = impl_ep.iter().map(String::as_str).collect();
 
-    let chat_args = amux::docker::build_run_args("img", "/repo", &chat_ep_refs, &[], None, false, None);
-    let impl_args = amux::docker::build_run_args("img", "/repo", &impl_ep_refs, &[], None, false, None);
+    let chat_args = amux::docker::build_run_args("img", "/repo", &chat_ep_refs, &[], None, false, None, None);
+    let impl_args = amux::docker::build_run_args("img", "/repo", &impl_ep_refs, &[], None, false, None, None);
 
     // Both should start with the same Docker flags.
     assert_eq!(chat_args[0], impl_args[0]); // "run"
@@ -1085,9 +1085,9 @@ fn autocomplete_chat_shows_hints() {
 fn pending_command_chat_variant() {
     use amux::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true, plan: false, allow_docker: false });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false, mount_ssh: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false, mount_ssh: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: true, plan: false, allow_docker: false, mount_ssh: false });
     assert_ne!(cmd, PendingCommand::None);
 }
 
@@ -1429,18 +1429,18 @@ fn plan_false_does_not_add_flags() {
 fn pending_command_chat_plan_field() {
     use amux::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false, mount_ssh: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: true, allow_docker: false, mount_ssh: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false, mount_ssh: false });
 }
 
 #[test]
 fn pending_command_implement_plan_field() {
     use amux::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None };
-    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None });
-    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None });
+    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None, worktree: false, mount_ssh: false };
+    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None, worktree: false, mount_ssh: false });
+    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None, worktree: false, mount_ssh: false });
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,18 +1610,18 @@ fn cli_ready_allow_docker_with_refresh() {
 fn pending_command_chat_allow_docker_field() {
     use amux::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true };
-    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true });
-    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false });
+    let cmd = PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true, mount_ssh: false };
+    assert_eq!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: true, mount_ssh: false });
+    assert_ne!(cmd, PendingCommand::Chat { non_interactive: false, plan: false, allow_docker: false, mount_ssh: false });
 }
 
 #[test]
 fn pending_command_implement_allow_docker_field() {
     use amux::tui::state::PendingCommand;
 
-    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None };
-    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None });
-    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None });
+    let cmd = PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None, worktree: false, mount_ssh: false };
+    assert_eq!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None, worktree: false, mount_ssh: false });
+    assert_ne!(cmd, PendingCommand::Implement { work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None, worktree: false, mount_ssh: false });
 }
 
 #[test]
@@ -1652,6 +1652,7 @@ fn allow_docker_adds_socket_mount_to_implement_run_args() {
         None,
         true, // allow_docker
         None,
+        None,
     );
 
     #[cfg(not(target_os = "windows"))]
@@ -1680,6 +1681,7 @@ fn no_allow_docker_omits_socket_mount_from_implement_run_args() {
         &[],
         None,
         false, // allow_docker
+        None,
         None,
     );
 
@@ -2235,6 +2237,7 @@ fn build_run_args_pty_at_path_includes_name_and_prompt() {
         Some(&container_name),
         None,
         false,
+        None,
     );
 
     // Container name must appear.
@@ -2403,4 +2406,357 @@ fn workflow_set_container_id_overwrites_on_retry() {
     // Simulate retry: overwrite with new container ID.
     wf.set_container_id("plan", "amux-second-run".to_string());
     assert_eq!(wf.get_step("plan").unwrap().container_id.as_deref(), Some("amux-second-run"));
+}
+
+// ---------------------------------------------------------------------------
+// 28. SSH mount integration tests (work item 0030)
+// ---------------------------------------------------------------------------
+
+/// Verify that `run_agent_with_sink` with `mount_ssh: true` prints the SSH warning
+/// to the sink before any Docker call is made.
+#[tokio::test]
+async fn run_agent_with_sink_mount_ssh_emits_warning() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let original_home = std::env::var("HOME").ok();
+
+    // Create a fake HOME with a .ssh directory so the SSH check passes.
+    let fake_home = TempDir::new().unwrap();
+    let ssh_dir = fake_home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::env::set_var("HOME", fake_home.path());
+
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    // mount_override avoids the interactive stdin prompt.
+    let mount_path = PathBuf::from("/tmp");
+    let result = amux::commands::agent::run_agent_with_sink(
+        vec!["echo".to_string(), "hello".to_string()],
+        "test status",
+        &sink,
+        Some(mount_path),
+        vec![],
+        true, // non_interactive: use captured output, not inherited stdio
+        None,
+        false,
+        true, // mount_ssh = true
+        None,
+    )
+    .await;
+
+    // Restore HOME.
+    match original_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    // The function may succeed or fail (docker may not be available);
+    // we only care that the SSH warning was sent to the sink before any docker call.
+    let _ = result;
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("--mount-ssh")),
+        "Expected SSH warning in output, got: {:?}",
+        messages
+    );
+}
+
+/// Verify that `run_agent_with_sink` with `mount_ssh: false` does NOT emit an SSH warning.
+#[tokio::test]
+async fn run_agent_with_sink_no_mount_ssh_no_warning() {
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let mount_path = PathBuf::from("/tmp");
+    let result = amux::commands::agent::run_agent_with_sink(
+        vec!["echo".to_string(), "hello".to_string()],
+        "test status",
+        &sink,
+        Some(mount_path),
+        vec![],
+        true, // non_interactive: use captured output, not inherited stdio
+        None,
+        false,
+        false, // mount_ssh = false
+        None,
+    )
+    .await;
+
+    let _ = result;
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !messages.iter().any(|m| m.contains("--mount-ssh")),
+        "Did not expect SSH warning in output, got: {:?}",
+        messages
+    );
+}
+
+/// Verify that `run_agent_with_sink` with `mount_ssh: true` includes the `.ssh`
+/// mount in the Docker display command printed to the sink.
+#[tokio::test]
+async fn run_agent_with_sink_mount_ssh_display_cmd_includes_ssh_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let original_home = std::env::var("HOME").ok();
+
+    let fake_home = TempDir::new().unwrap();
+    let ssh_dir = fake_home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::env::set_var("HOME", fake_home.path());
+
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let mount_path = PathBuf::from("/tmp");
+    let result = amux::commands::agent::run_agent_with_sink(
+        vec!["echo".to_string()],
+        "test status",
+        &sink,
+        Some(mount_path),
+        vec![],
+        true, // non_interactive: use captured output, not inherited stdio
+        None,
+        false,
+        true, // mount_ssh = true
+        None,
+    )
+    .await;
+
+    match original_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let _ = result;
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+    // The "$ docker run ..." line should include the .ssh mount path.
+    let docker_cmd_line = messages.iter().find(|m| m.starts_with("$ docker run"));
+    assert!(
+        docker_cmd_line.is_some(),
+        "Expected a '$ docker run' line in output, got: {:?}",
+        messages
+    );
+    assert!(
+        docker_cmd_line.unwrap().contains("/.ssh"),
+        "Expected /.ssh in docker display command, got: {}",
+        docker_cmd_line.unwrap()
+    );
+}
+
+/// Verify that `run_agent_with_sink` with `mount_ssh: false` does NOT include
+/// the `.ssh` mount in the Docker display command.
+#[tokio::test]
+async fn run_agent_with_sink_no_mount_ssh_display_cmd_excludes_ssh_path() {
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let mount_path = PathBuf::from("/tmp");
+    let result = amux::commands::agent::run_agent_with_sink(
+        vec!["echo".to_string()],
+        "test status",
+        &sink,
+        Some(mount_path),
+        vec![],
+        true, // non_interactive: use captured output, not inherited stdio
+        None,
+        false,
+        false, // mount_ssh = false
+        None,
+    )
+    .await;
+
+    let _ = result;
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+    // The "$ docker run ..." line must NOT contain .ssh.
+    let docker_cmd_line = messages.iter().find(|m| m.starts_with("$ docker run"));
+    if let Some(cmd) = docker_cmd_line {
+        assert!(
+            !cmd.contains("/.ssh"),
+            "Did not expect /.ssh in docker display command: {}",
+            cmd
+        );
+    }
+    // If there's no docker run line (e.g. failed before that), that's fine —
+    // it just means mount_ssh was false and ssh logic was skipped entirely.
+}
+
+/// Verify that `run_agent_with_sink` with `mount_ssh: true` but no `~/.ssh` directory
+/// returns an error without reaching Docker.
+#[tokio::test]
+async fn run_agent_with_sink_mount_ssh_missing_ssh_dir_errors() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let original_home = std::env::var("HOME").ok();
+
+    // Fake HOME with NO .ssh directory.
+    let fake_home = TempDir::new().unwrap();
+    std::env::set_var("HOME", fake_home.path());
+
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let mount_path = PathBuf::from("/tmp");
+    let result = amux::commands::agent::run_agent_with_sink(
+        vec!["echo".to_string()],
+        "test status",
+        &sink,
+        Some(mount_path),
+        vec![],
+        true, // non_interactive: use captured output, not inherited stdio
+        None,
+        false,
+        true, // mount_ssh = true, but ~/.ssh does not exist
+        None,
+    )
+    .await;
+
+    match original_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    assert!(result.is_err(), "Expected error when ~/.ssh does not exist");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(".ssh") || err.contains("ssh"),
+        "Error should mention .ssh or ssh, got: {}",
+        err
+    );
+
+    // No SSH warning should have been emitted (error happened before the warning).
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !messages.iter().any(|m| m.contains("--allow-ssh")),
+        "SSH warning should not appear when .ssh dir is missing: {:?}",
+        messages
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 29. Git worktree unit tests (work item 0030)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worktree_path_structure() {
+    let path = amux::git::worktree_path(std::path::Path::new("/projects/myrepo"), 30).unwrap();
+    let home = dirs::home_dir().unwrap();
+    let expected = home
+        .join(".amux")
+        .join("worktrees")
+        .join("myrepo")
+        .join("0030");
+    assert_eq!(path, expected);
+}
+
+#[test]
+fn worktree_branch_name_format() {
+    assert_eq!(amux::git::worktree_branch_name(30), "amux/work-item-0030");
+    assert_eq!(amux::git::worktree_branch_name(1), "amux/work-item-0001");
+}
+
+// ---------------------------------------------------------------------------
+// 30. End-to-end: SSH warning in implement/chat output (work item 0030)
+//     These tests require docker and a real git repo; run with `--ignored`.
+// ---------------------------------------------------------------------------
+
+/// E2E: `amux implement 0001 --mount-ssh` displays the SSH warning and includes
+/// the SSH mount in the Docker command shown to the user.
+///
+/// Requires: git repo, Docker daemon, and a Dockerfile.dev image.
+#[tokio::test]
+#[ignore]
+async fn e2e_implement_mount_ssh_displays_warning_and_docker_mount() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let original_home = std::env::var("HOME").ok();
+
+    let fake_home = TempDir::new().unwrap();
+    let ssh_dir = fake_home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::env::set_var("HOME", fake_home.path());
+
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let cwd = std::env::current_dir().unwrap();
+    let _ = amux::commands::implement::run_with_sink(
+        1,
+        &sink,
+        Some(cwd.clone()),
+        vec![],
+        false,
+        false,
+        None,
+        false,
+        false, // worktree
+        true,  // mount_ssh
+    )
+    .await;
+
+    match original_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("--mount-ssh")),
+        "Expected SSH warning in implement output: {:?}",
+        messages
+    );
+    let docker_line = messages.iter().find(|m| m.starts_with("$ docker run"));
+    assert!(
+        docker_line.map(|l| l.contains("/.ssh")).unwrap_or(false),
+        "Expected /.ssh in docker command: {:?}",
+        messages
+    );
+}
+
+/// E2E: `amux chat --mount-ssh` displays the SSH warning and includes
+/// the SSH mount in the Docker command shown to the user.
+///
+/// Requires: git repo, Docker daemon, and a Dockerfile.dev image.
+#[tokio::test]
+#[ignore]
+async fn e2e_chat_mount_ssh_displays_warning_and_docker_mount() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let original_home = std::env::var("HOME").ok();
+
+    let fake_home = TempDir::new().unwrap();
+    let ssh_dir = fake_home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::env::set_var("HOME", fake_home.path());
+
+    let (tx, mut rx) = unbounded_channel::<String>();
+    let sink = OutputSink::Channel(tx);
+
+    let cwd = std::env::current_dir().unwrap();
+    let _ = amux::commands::chat::run_with_sink(
+        &sink,
+        Some(cwd),
+        vec![],
+        false,
+        false,
+        None,
+        false,
+        true, // mount_ssh
+    )
+    .await;
+
+    match original_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("--allow-ssh")),
+        "Expected SSH warning in chat output: {:?}",
+        messages
+    );
+    let docker_line = messages.iter().find(|m| m.starts_with("$ docker run"));
+    assert!(
+        docker_line.map(|l| l.contains("/.ssh")).unwrap_or(false),
+        "Expected /.ssh in docker command: {:?}",
+        messages
+    );
 }

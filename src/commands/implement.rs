@@ -21,10 +21,32 @@ pub async fn run(
     plan: bool,
     allow_docker: bool,
     workflow_path: Option<&Path>,
+    worktree: bool,
+    mount_ssh: bool,
 ) -> Result<()> {
     let work_item = parse_work_item(work_item_str)?;
     let git_root = find_git_root().context("Not inside a Git repository")?;
-    let mount_path = confirm_mount_scope_stdin(&git_root)?;
+
+    // Worktree pre-checks.
+    if worktree {
+        crate::git::git_version_check()?;
+        if crate::git::is_detached_head(&git_root) {
+            eprintln!(
+                "WARNING: You are in detached HEAD state. The worktree branch will be created \
+                 from the current commit. Consider checking out a branch first."
+            );
+        }
+    }
+
+    let (mount_path, worktree_branch) = if worktree {
+        let wt_path = crate::git::worktree_path(&git_root, work_item)?;
+        let branch = crate::git::worktree_branch_name(work_item);
+        let wt_path = prepare_worktree_cmd(&git_root, &wt_path, &branch)?;
+        (wt_path, Some(branch))
+    } else {
+        (confirm_mount_scope_stdin(&git_root)?, None)
+    };
+
     let credentials = resolve_auth(&git_root, agent_name(&git_root)?)?;
     let config = load_repo_config(&git_root)?;
     let agent = config.agent.as_deref().unwrap_or("claude");
@@ -38,19 +60,24 @@ pub async fn run(
         } else {
             std::env::current_dir().unwrap_or_else(|_| git_root.clone()).join(wf_path)
         };
-        return run_workflow(
+        let result = run_workflow(
             work_item,
             &resolved_wf,
             &git_root,
-            mount_path,
+            mount_path.clone(),
             credentials.env_vars,
             agent,
             host_settings,
             non_interactive,
             plan,
             allow_docker,
+            mount_ssh,
         )
         .await;
+        if let Some(ref branch) = worktree_branch {
+            let _ = post_run_merge_prompt_stdin(&git_root, &mount_path, branch);
+        }
+        return result;
     }
 
     let entrypoint = if non_interactive {
@@ -67,18 +94,25 @@ pub async fn run(
         work_item_path.display()
     );
 
-    run_agent_with_sink(
+    let result = run_agent_with_sink(
         entrypoint,
         &status,
         &OutputSink::Stdout,
-        Some(mount_path),
+        Some(mount_path.clone()),
         credentials.env_vars.clone(),
         non_interactive,
         host_settings.as_ref(),
         allow_docker,
+        mount_ssh,
         None,
     )
-    .await
+    .await;
+
+    if let Some(ref branch) = worktree_branch {
+        let _ = post_run_merge_prompt_stdin(&git_root, &mount_path, branch);
+    }
+
+    result
 }
 
 /// Core logic shared between command mode and TUI mode.
@@ -89,6 +123,8 @@ pub async fn run(
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
 /// `plan`: when true, launch agent in plan (read-only) mode.
 /// `allow_docker`: when true, mount the host Docker daemon socket into the container.
+/// `worktree`: when true, the worktree has already been set up; `mount_override` is the worktree path.
+/// `mount_ssh`: when true, mount the host `~/.ssh` directory read-only into the container.
 pub async fn run_with_sink(
     work_item: u32,
     out: &OutputSink,
@@ -98,6 +134,8 @@ pub async fn run_with_sink(
     plan: bool,
     host_settings: Option<&docker::HostSettings>,
     allow_docker: bool,
+    worktree: bool,
+    mount_ssh: bool,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let config = load_repo_config(&git_root)?;
@@ -117,6 +155,11 @@ pub async fn run_with_sink(
         work_item_path.display()
     );
 
+    // `worktree` is handled by the TUI directly (launch_implement creates the worktree
+    // and sets mount_override before calling run_with_sink). The flag is accepted here
+    // for signature consistency but no extra action is needed.
+    let _ = worktree;
+
     run_agent_with_sink(
         entrypoint,
         &status,
@@ -126,6 +169,7 @@ pub async fn run_with_sink(
         non_interactive,
         host_settings,
         allow_docker,
+        mount_ssh,
         None,
     )
     .await
@@ -307,6 +351,7 @@ async fn run_workflow(
     non_interactive: bool,
     plan: bool,
     allow_docker: bool,
+    mount_ssh: bool,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -417,6 +462,7 @@ async fn run_workflow(
             non_interactive,
             host_settings.as_ref(),
             allow_docker,
+            mount_ssh,
             Some(container_name),
         )
         .await;
@@ -540,6 +586,73 @@ fn resolve_resume_or_restart(
 
     println!("Resuming previous workflow run.");
     Ok(existing)
+}
+
+// ─── Worktree helpers (command mode) ─────────────────────────────────────────
+
+/// Prepare (or reuse) a worktree at `wt_path` on `branch` using stdin prompts.
+///
+/// If the worktree directory already exists the user is prompted to resume or
+/// recreate it.  Otherwise the worktree is created fresh.
+fn prepare_worktree_cmd(git_root: &Path, wt_path: &PathBuf, branch: &str) -> Result<PathBuf> {
+    use std::io::{BufRead, Write};
+    if wt_path.exists() {
+        println!("Worktree already exists at {}.", wt_path.display());
+        print!("[r]esume / [R]ecreate? ");
+        std::io::stdout().flush()?;
+        let stdin = std::io::stdin();
+        let answer = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
+        if answer.trim() == "R" {
+            crate::git::remove_worktree(git_root, wt_path)?;
+            crate::git::create_worktree(git_root, wt_path, branch)?;
+        }
+        // 'r' or any other key: reuse existing worktree
+    } else {
+        crate::git::create_worktree(git_root, wt_path, branch)?;
+    }
+    Ok(wt_path.clone())
+}
+
+/// After the container (or workflow) completes, ask the user whether to merge,
+/// discard, or keep the worktree branch.
+fn post_run_merge_prompt_stdin(git_root: &Path, wt_path: &Path, branch: &str) -> Result<()> {
+    use std::io::{BufRead, Write};
+    println!(
+        "\nWorktree branch `{}` is ready. Merge into current branch? [y/n/s(kip-and-keep)]",
+        branch
+    );
+    print!("> ");
+    std::io::stdout().flush()?;
+    let stdin = std::io::stdin();
+    let answer = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
+    match answer.trim().to_lowercase().as_str() {
+        "y" | "yes" | "m" | "merge" => match crate::git::merge_branch(git_root, branch) {
+            Ok(()) => {
+                let _ = crate::git::remove_worktree(git_root, wt_path);
+                let _ = crate::git::delete_branch(git_root, branch);
+                println!("Merged and cleaned up worktree.");
+            }
+            Err(e) => {
+                eprintln!("Merge failed with conflicts: {}", e);
+                eprintln!(
+                    "Resolve manually in `{}`, then run:\n  git branch -d {} && git worktree remove {}",
+                    git_root.display(),
+                    branch,
+                    wt_path.display()
+                );
+            }
+        },
+        "n" | "no" | "d" | "discard" => {
+            let _ = crate::git::remove_worktree(git_root, wt_path);
+            let _ = crate::git::delete_branch(git_root, branch);
+            println!("Worktree discarded.");
+        }
+        _ => {
+            // 's', 'skip', or any other input: skip and keep
+            println!("Worktree kept at: {}", wt_path.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

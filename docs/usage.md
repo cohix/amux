@@ -44,9 +44,12 @@ amux implement 0001
 amux implement 0001 --plan
 amux implement 0001 --allow-docker
 amux implement 0001 --workflow aspec/workflows/implement-feature.md
+amux implement 0001 --worktree
+amux implement 0001 --worktree --mount-ssh
 amux chat
 amux chat --plan
 amux chat --allow-docker
+amux chat --mount-ssh
 amux new
 amux specs new
 amux specs new --interview
@@ -250,13 +253,15 @@ Launches the dev container to implement a work item.
 amux implement 0001    # implements aspec/work-items/0001-*.md
 amux implement 0003    # implements aspec/work-items/0003-*.md
 amux implement 0027 --workflow aspec/workflows/implement-feature.md
+amux implement 0030 --worktree
+amux implement 0030 --worktree --mount-ssh
 ```
 
 The work item number is a 4-digit identifier (e.g. `0001`). Both `0001` and
 `1` are accepted as input.
 
 - Finds the matching work item file in `aspec/work-items/`
-- Prompts to confirm the Docker mount scope (Git root vs CWD) on first run
+- Prompts to confirm the Docker mount scope (Git root vs CWD) on first run (skipped when `--worktree` is used)
 - Passes host agent credentials into the container automatically (see [Agent Auth](#agent-authentication))
 - Launches a container with the configured agent
 
@@ -268,8 +273,12 @@ The work item number is a 4-digit identifier (e.g. `0001`). Both `0001` and
 | `--plan` | Run the agent in plan mode (read-only, no file modifications) |
 | `--allow-docker` | Mount the host Docker daemon socket into the container (see [Docker Socket Access](#docker-socket-access)) |
 | `--workflow=<path>` | Path to a workflow Markdown file for multi-step execution (see [Workflows](workflows.md)) |
+| `--worktree` | Run in an isolated Git worktree under `~/.amux/worktrees/` (see [Worktree Isolation](#worktree-isolation)) |
+| `--mount-ssh` | Mount host `~/.ssh` read-only into the container (see [SSH Key Mounting](#ssh-key-mounting)) |
 
 When `--workflow` is provided, amux runs the work item through a series of agent steps defined in the workflow file, pausing between each step for your review. State is persisted so interrupted workflows can be resumed.
+
+When `--worktree` is provided, the agent runs against an isolated Git worktree instead of your main working tree. After the agent finishes you are prompted to merge, discard, or keep the worktree branch.
 
 **Interactive Mode (default)**
 
@@ -317,7 +326,7 @@ depends on the agent:
 
 ---
 
-### `amux chat [--non-interactive] [--plan] [--allow-docker]`
+### `amux chat [--non-interactive] [--plan] [--allow-docker] [--mount-ssh]`
 
 Starts a freeform chat session with the configured agent in a container.
 
@@ -329,6 +338,7 @@ amux chat                      # start interactive chat
 amux chat --non-interactive    # start in non-interactive mode
 amux chat --plan               # start in plan mode (read-only)
 amux chat --allow-docker       # start with Docker daemon access in container
+amux chat --mount-ssh          # start with host ~/.ssh mounted read-only
 ```
 
 - Prompts to confirm the Docker mount scope (Git root vs CWD) if needed
@@ -342,6 +352,7 @@ amux chat --allow-docker       # start with Docker daemon access in container
 | `--non-interactive` | Run the agent in print/non-interactive mode |
 | `--plan` | Run the agent in plan mode (read-only, no file modifications) |
 | `--allow-docker` | Mount the host Docker daemon socket into the container (see [Docker Socket Access](#docker-socket-access)) |
+| `--mount-ssh` | Mount host `~/.ssh` read-only into the container (see [SSH Key Mounting](#ssh-key-mounting)) |
 
 **Interactive Mode (default)**
 
@@ -884,10 +895,10 @@ ready --
   ready --refresh  ·  ready --build  ·  ready --no-cache  ·  ready --build --no-cache  ·  ready --non-interactive  ·  ready --refresh --non-interactive  ·  ready --refresh --allow-docker
 
 implement --
-  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive  ·  implement <NNNN> --plan  ·  implement <NNNN> --allow-docker
+  implement <NNNN>  e.g. implement 0001  ·  implement <NNNN> --non-interactive  ·  implement <NNNN> --plan  ·  implement <NNNN> --allow-docker  ·  implement <NNNN> --worktree  ·  implement <NNNN> --mount-ssh
 
 chat --
-  chat  (start a freeform agent session)  ·  chat --non-interactive  ·  chat --plan  ·  chat --allow-docker
+  chat  (start a freeform agent session)  ·  chat --non-interactive  ·  chat --plan  ·  chat --allow-docker  ·  chat --mount-ssh
 
 status --
   status         (show all running agents and nanoclaw containers)
@@ -1060,6 +1071,183 @@ the work item requires it. This is an intentional capability escalation —
 amux implement 0005 --allow-docker    # implement a work item that needs Docker
 amux chat --allow-docker              # start a chat session with Docker access
 amux ready --refresh --allow-docker   # run audit with Docker access in container
+```
+
+---
+
+## Worktree Isolation
+
+The `--worktree` flag on `amux implement` runs the agent against an isolated
+Git worktree instead of your main working tree. The worktree is a separate
+checkout of your repository stored in `~/.amux/worktrees/<repo>/<NNNN>/`, so
+the agent's changes are completely isolated from your current branch until you
+decide to merge them.
+
+### Why use it
+
+- The agent can make large changes without risking unstable commits landing on
+  your working branch mid-implementation
+- You can review the full diff in one place before it touches your main tree
+- If the agent's output isn't what you wanted, discard it with a single key
+  press — no `git reset` required
+- Works with `--workflow`: every step in the workflow operates in the same
+  isolated worktree, producing one coherent diff to review at the end
+
+### How it works
+
+1. amux verifies that `git` ≥ 2.5 is installed (required for worktree support)
+2. A branch named `amux/work-item-NNNN` is created from your current `HEAD`
+3. A worktree is checked out at `~/.amux/worktrees/<repo-name>/<NNNN>/`
+4. The agent container is launched with the worktree as its mounted directory
+5. After the agent finishes (success or error), a prompt asks what to do with
+   the branch
+
+### Post-run prompt (command mode)
+
+```
+Worktree branch `amux/work-item-0030` is ready. Merge into current branch? [y/n/s(kip-and-keep)]
+```
+
+| Key | Action |
+|-----|--------|
+| `y` | Merge the branch into the current branch (`git merge --no-ff`), then remove the worktree and delete the branch |
+| `n` | Discard — remove the worktree and delete the branch |
+| `s` | Skip — keep the worktree and branch as-is for manual review; prints the path |
+
+### Post-run dialog (TUI mode)
+
+After the container exits, a dialog appears:
+
+```
+╭─── Worktree: Merge or Discard? ───────────────────────╮
+│                                                        │
+│  Branch 'amux/work-item-0030' completed.               │
+│                                                        │
+│  [m/y] Merge into current branch                       │
+│  [d]   Discard (delete branch + worktree)              │
+│  [s/Esc] Keep worktree branch as-is                    │
+│                                                        │
+╰────────────────────────────────────────────────────────╯
+```
+
+If the container exited with an error the dialog notes it: "Branch
+`amux/work-item-0030` finished with errors." — you can still choose to merge
+partial progress.
+
+### Resuming an interrupted run
+
+If a worktree already exists at the target path (e.g. because the previous run
+was interrupted), amux detects it and prompts:
+
+```
+Worktree already exists at ~/.amux/worktrees/myrepo/0030.
+[r]esume — reuse existing worktree
+[R]ecreate — remove it and start fresh
+```
+
+### Merge conflicts
+
+If the merge fails due to conflicts, amux prints a recovery message and leaves
+the worktree in place:
+
+```
+Merge failed with conflicts — resolve manually in /path/to/repo,
+then run: git branch -d amux/work-item-0030 && git worktree remove ~/.amux/worktrees/myrepo/0030
+```
+
+### Edge cases
+
+| Situation | Behaviour |
+|-----------|-----------|
+| `git` < 2.5 installed | Error before launch: "git ≥ 2.5 is required for --worktree support" |
+| Detached HEAD state | Warning printed; worktree created from current commit; proceed |
+| Branch already exists, no worktree directory | Worktree created using existing branch (no `-b` flag) |
+| Merge conflict | Error printed with manual resolution instructions; worktree kept |
+| Combined with `--workflow` | All workflow-step containers use the same worktree |
+| Combined with `--mount-ssh` | Both flags apply independently; SSH mount added alongside worktree mount |
+
+### Worktree storage
+
+Worktrees are stored at `~/.amux/worktrees/<repo-name>/<NNNN>/`. The
+`<repo-name>` is the last component of the Git root path (e.g. `myproject`).
+Parent directories are created automatically.
+
+### Examples
+
+```sh
+amux implement 0030 --worktree                          # isolated run; prompt to merge after
+amux implement 0030 --worktree --workflow wf.md         # multi-step workflow in one worktree
+amux implement 0030 --worktree --mount-ssh              # worktree + SSH keys in container
+```
+
+---
+
+## SSH Key Mounting
+
+The `--mount-ssh` flag mounts your host `~/.ssh` directory read-only into the
+agent container, so the agent can authenticate with remote Git servers using
+your existing SSH keys.
+
+### When to use it
+
+Use `--mount-ssh` when your work item or chat session requires the agent to:
+
+- Clone private repositories over SSH
+- Push branches or tags to a remote
+- Run `git fetch` / `git pull` against SSH remotes
+- Authenticate with any other service that uses SSH keys
+
+### What happens
+
+Before launching the container, amux:
+
+1. Resolves `~/.ssh` using the platform home directory (cross-platform safe)
+2. Verifies the directory exists — if not, the command fails with a clear error:
+   ```
+   Host ~/.ssh directory not found; cannot use --mount-ssh
+   ```
+3. Prints a warning so you are aware of the mount:
+   ```
+   WARNING: --mount-ssh: mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.
+   ```
+4. Mounts the directory read-only into the container:
+   ```
+   -v /home/user/.ssh:/root/.ssh:ro
+   ```
+
+The `:ro` flag prevents the agent from modifying your host SSH keys.
+
+### Security notes
+
+- `~/.ssh` is **never** mounted unless `--mount-ssh` is explicitly passed. There
+  is no config file option — it must be an explicit per-invocation opt-in.
+- The mount is read-only: the agent can use your keys but cannot change them.
+- SSH key permissions must be correct on the host (`600` for private keys).
+  Docker bind mounts inherit host permissions; keys with loose permissions may
+  be rejected by `ssh` inside the container.
+- Only use `--mount-ssh` when you trust the agent image. A compromised image
+  could read your SSH keys during the run.
+
+### Combining flags
+
+`--mount-ssh` can be combined freely with any other flag:
+
+```sh
+amux implement 0030 --mount-ssh                      # SSH keys in implement container
+amux chat --mount-ssh                                # SSH keys in chat container
+amux implement 0030 --worktree --mount-ssh           # worktree isolation + SSH keys
+amux implement 0030 --mount-ssh --workflow wf.md     # every workflow-step container gets SSH keys
+amux implement 0030 --mount-ssh --allow-docker       # SSH keys + Docker socket
+```
+
+When used with `--workflow`, the SSH directory is mounted into **every**
+workflow-step container, not just the first.
+
+### Examples
+
+```sh
+amux implement 0030 --mount-ssh       # agent can push/pull over SSH
+amux chat --mount-ssh                 # freeform session with SSH access
 ```
 
 ---

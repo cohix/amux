@@ -368,6 +368,7 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
                 host_settings.as_ref(),
                 opts.allow_docker,
                 None,
+                None,
             )
             .context("Dockerfile audit container failed")?;
             for line in audit_output.lines() {
@@ -381,6 +382,7 @@ pub async fn run(refresh: bool, build: bool, no_cache: bool, non_interactive: bo
                 &ctx.env_vars,
                 host_settings.as_ref(),
                 opts.allow_docker,
+                None,
                 None,
             )
             .context("Dockerfile audit container failed")?;
@@ -659,6 +661,7 @@ pub async fn run_with_sink(
             &ctx.env_vars,
             host_settings,
             opts.allow_docker,
+            None,
             None,
         )
         .context("Dockerfile audit container failed")?;

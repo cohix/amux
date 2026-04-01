@@ -275,6 +275,14 @@ pub fn check_docker_socket() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Appends `-v <path>:/root/.ssh:ro` to the args if `ssh_dir` is `Some`.
+fn append_ssh_mount(args: &mut Vec<String>, ssh_dir: Option<&PathBuf>) {
+    if let Some(path) = ssh_dir {
+        args.push("-v".to_string());
+        args.push(format!("{}:/root/.ssh:ro", path.display()));
+    }
+}
+
 /// Appends the Docker daemon socket mount args to the list.
 ///
 /// On Linux/macOS: `-v /var/run/docker.sock:/var/run/docker.sock`
@@ -601,6 +609,7 @@ pub fn run_container_captured(
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
     container_name: Option<&str>,
+    ssh_dir: Option<PathBuf>,
 ) -> Result<(String, String)> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -622,11 +631,12 @@ pub fn run_container_captured(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
 
     let cmd_line = format_run_cmd(&build_run_args_display(
-        image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name,
+        image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name, ssh_dir.clone(),
     ));
 
     let output = Command::new("docker")
@@ -676,10 +686,11 @@ pub fn run_container(
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
     container_name: Option<&str>,
+    ssh_dir: Option<PathBuf>,
 ) -> Result<String> {
-    let args = build_run_args(image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name);
+    let args = build_run_args(image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name, ssh_dir.clone());
     let cmd_line = format_run_cmd(&build_run_args_display(
-        image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name,
+        image, host_path, entrypoint, env_vars, host_settings, allow_docker, container_name, ssh_dir,
     ));
 
     let status = Command::new("docker")
@@ -714,6 +725,7 @@ pub fn run_container_at_path(
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
     container_name: Option<&str>,
+    ssh_dir: Option<PathBuf>,
 ) -> Result<()> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -739,6 +751,7 @@ pub fn run_container_at_path(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
 
@@ -770,6 +783,7 @@ pub fn run_container_captured_at_path(
     env_vars: &[(String, String)],
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
+    ssh_dir: Option<PathBuf>,
 ) -> Result<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -786,6 +800,7 @@ pub fn run_container_captured_at_path(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
 
@@ -830,6 +845,7 @@ pub fn build_run_args(
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
     container_name: Option<&str>,
+    ssh_dir: Option<PathBuf>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -852,6 +868,7 @@ pub fn build_run_args(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
@@ -868,6 +885,7 @@ pub fn build_run_args_display(
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
     container_name: Option<&str>,
+    ssh_dir: Option<PathBuf>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -890,6 +908,7 @@ pub fn build_run_args_display(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args_display(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
@@ -916,6 +935,7 @@ pub fn build_run_args_pty(
     container_name: Option<&str>,
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
+    ssh_dir: Option<PathBuf>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -941,6 +961,7 @@ pub fn build_run_args_pty(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
@@ -957,6 +978,7 @@ pub fn build_run_args_pty_display(
     container_name: Option<&str>,
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
+    ssh_dir: Option<PathBuf>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -982,6 +1004,7 @@ pub fn build_run_args_pty_display(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args_display(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
@@ -1002,6 +1025,7 @@ pub fn build_run_args_pty_at_path(
     container_name: Option<&str>,
     host_settings: Option<&HostSettings>,
     allow_docker: bool,
+    ssh_dir: Option<PathBuf>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1027,6 +1051,7 @@ pub fn build_run_args_pty_at_path(
     if allow_docker {
         append_docker_socket_mount_args(&mut args);
     }
+    append_ssh_mount(&mut args, ssh_dir.as_ref());
     append_env_args(&mut args, env_vars);
     append_entrypoint(&mut args, image, entrypoint);
     args
@@ -1382,7 +1407,7 @@ mod tests {
     #[test]
     fn run_args_include_mount_and_workdir() {
         let args =
-            build_run_args("amux-dev:latest", "/repo", &["claude", "--print", "go"], &[], None, false, None);
+            build_run_args("amux-dev:latest", "/repo", &["claude", "--print", "go"], &[], None, false, None, None);
         assert!(args.contains(&"-v".to_string()));
         assert!(args.contains(&"/repo:/workspace".to_string()));
         assert!(args.contains(&"-w".to_string()));
@@ -1393,35 +1418,35 @@ mod tests {
 
     #[test]
     fn run_args_use_rm_and_interactive() {
-        let args = build_run_args("img", "/repo", &[], &[], None, false, None);
+        let args = build_run_args("img", "/repo", &[], &[], None, false, None, None);
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"-it".to_string()));
     }
 
     #[test]
     fn pty_args_include_interactive_flag() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false);
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false, None);
         assert!(args.contains(&"-it".to_string()));
         assert!(args.contains(&"--rm".to_string()));
     }
 
     #[test]
     fn pty_args_include_container_name_when_provided() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], Some("amux-test-123"), None, false);
+        let args = build_run_args_pty("img", "/repo", &[], &[], Some("amux-test-123"), None, false, None);
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"amux-test-123".to_string()));
     }
 
     #[test]
     fn pty_args_omit_name_when_none() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false);
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false, None);
         assert!(!args.contains(&"--name".to_string()));
     }
 
     #[test]
     fn env_vars_passed_to_run_args() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-test".into())];
-        let args = build_run_args("img", "/repo", &[], &env, None, false, None);
+        let args = build_run_args("img", "/repo", &[], &env, None, false, None, None);
         assert!(args.contains(&"-e".to_string()));
         assert!(args.contains(&"ANTHROPIC_API_KEY=sk-test".to_string()));
     }
@@ -1432,7 +1457,7 @@ mod tests {
             ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
             ("OPENAI_API_KEY".into(), "sk-oai".into()),
         ];
-        let args = build_run_args("img", "/repo", &[], &env, None, false, None);
+        let args = build_run_args("img", "/repo", &[], &env, None, false, None, None);
         let env_args: Vec<&String> = args
             .iter()
             .filter(|a| a.contains("_API_KEY="))
@@ -1448,7 +1473,7 @@ mod tests {
             ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
             ("OPENAI_API_KEY".into(), "sk-oai".into()),
         ];
-        let args = build_run_args_pty("img", "/repo", &[], &env, None, None, false);
+        let args = build_run_args_pty("img", "/repo", &[], &env, None, None, false, None);
         let env_args: Vec<&String> = args
             .iter()
             .filter(|a| a.contains("_API_KEY="))
@@ -1459,7 +1484,7 @@ mod tests {
     #[test]
     fn display_args_mask_env_values() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-secret-key".into())];
-        let args = build_run_args_display("img", "/repo", &[], &env, None, false, None);
+        let args = build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
         assert!(args.contains(&"ANTHROPIC_API_KEY=***".to_string()));
         assert!(!args.iter().any(|a| a.contains("sk-secret-key")));
     }
@@ -1467,7 +1492,7 @@ mod tests {
     #[test]
     fn pty_display_args_mask_env_values() {
         let env = vec![("OPENAI_API_KEY".into(), "sk-secret".into())];
-        let args = build_run_args_pty_display("img", "/repo", &[], &env, None, None, false);
+        let args = build_run_args_pty_display("img", "/repo", &[], &env, None, None, false, None);
         assert!(args.contains(&"OPENAI_API_KEY=***".to_string()));
         assert!(!args.iter().any(|a| a.contains("sk-secret")));
     }
@@ -1505,7 +1530,7 @@ mod tests {
     #[test]
     fn no_settings_mounts_when_none() {
         let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-test".into())];
-        let args = build_run_args("img", "/repo", &[], &env, None, false, None);
+        let args = build_run_args("img", "/repo", &[], &env, None, false, None, None);
         // Without host_settings or allow_docker, only the workspace mount should be present.
         let volume_mounts: Vec<&String> = args.iter()
             .zip(args.iter().skip(1))
@@ -1531,7 +1556,7 @@ mod tests {
             claude_dir_path: claude_dir_path.clone(),
         };
 
-        let args = build_run_args("img", "/repo", &["claude", "--print", "hi"], &[], Some(&hs), false, None);
+        let args = build_run_args("img", "/repo", &["claude", "--print", "hi"], &[], Some(&hs), false, None, None);
 
         // Should have bind mounts for .claude.json and .claude/
         let volume_mounts: Vec<&String> = args.windows(2)
@@ -1566,7 +1591,7 @@ mod tests {
             claude_dir_path,
         };
 
-        let args = build_run_args_display("img", "/repo", &["claude"], &[], Some(&hs), false, None);
+        let args = build_run_args_display("img", "/repo", &["claude"], &[], Some(&hs), false, None, None);
         assert!(args.iter().any(|a| a == "<settings>:/root/.claude.json"));
         assert!(args.iter().any(|a| a == "<settings>:/root/.claude"));
         assert!(!args.iter().any(|a| a.contains("secret")));
@@ -1649,7 +1674,7 @@ mod tests {
 
     #[test]
     fn format_run_cmd_produces_valid_string() {
-        let args = build_run_args("img", "/repo", &["echo", "hello"], &[], None, false, None);
+        let args = build_run_args("img", "/repo", &["echo", "hello"], &[], None, false, None, None);
         let cmd = format_run_cmd(&args);
         assert!(cmd.starts_with("docker run"));
         assert!(cmd.contains("/repo:/workspace"));
@@ -1724,7 +1749,7 @@ mod tests {
 
     #[test]
     fn allow_docker_adds_socket_mount_to_run_args() {
-        let args = build_run_args("img", "/repo", &[], &[], None, true, None);
+        let args = build_run_args("img", "/repo", &[], &[], None, true, None, None);
         // The docker socket should appear as a volume mount.
         let socket_path = docker_socket_path().to_string_lossy().to_string();
         let has_socket_mount = args.windows(2)
@@ -1735,7 +1760,7 @@ mod tests {
 
     #[test]
     fn no_allow_docker_does_not_add_socket_mount() {
-        let args = build_run_args("img", "/repo", &[], &[], None, false, None);
+        let args = build_run_args("img", "/repo", &[], &[], None, false, None, None);
         let socket_path = docker_socket_path().to_string_lossy().to_string();
         let has_socket_mount = args.iter().any(|a| a.contains(&socket_path));
         assert!(!has_socket_mount, "Without allow_docker, socket should not be mounted: {:?}", args);
@@ -1743,7 +1768,7 @@ mod tests {
 
     #[test]
     fn allow_docker_adds_socket_mount_to_pty_args() {
-        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, true);
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, true, None);
         let socket_path = docker_socket_path().to_string_lossy().to_string();
         let has_socket = args.iter().any(|a| a.contains(&socket_path));
         #[cfg(not(target_os = "windows"))]
@@ -1752,7 +1777,7 @@ mod tests {
 
     #[test]
     fn allow_docker_adds_socket_mount_to_display_args() {
-        let args = build_run_args_display("img", "/repo", &[], &[], None, true, None);
+        let args = build_run_args_display("img", "/repo", &[], &[], None, true, None, None);
         let socket_path = docker_socket_path().to_string_lossy().to_string();
         let has_socket = args.iter().any(|a| a.contains(&socket_path));
         #[cfg(not(target_os = "windows"))]
@@ -1761,7 +1786,7 @@ mod tests {
 
     #[test]
     fn allow_docker_adds_socket_mount_to_pty_display_args() {
-        let args = build_run_args_pty_display("img", "/repo", &[], &[], None, None, true);
+        let args = build_run_args_pty_display("img", "/repo", &[], &[], None, None, true, None);
         let socket_path = docker_socket_path().to_string_lossy().to_string();
         let has_socket = args.iter().any(|a| a.contains(&socket_path));
         #[cfg(not(target_os = "windows"))]
@@ -1834,7 +1859,7 @@ mod tests {
 
     #[test]
     fn allow_docker_socket_mount_appears_after_workspace_mount() {
-        let args = build_run_args("img", "/repo", &[], &[], None, true, None);
+        let args = build_run_args("img", "/repo", &[], &[], None, true, None, None);
         let socket_path = docker_socket_path().to_string_lossy().to_string();
 
         #[cfg(not(target_os = "windows"))]
@@ -1985,6 +2010,136 @@ mod tests {
             parsed[LSP_SETTINGS_KEY].as_bool(),
             Some(true),
             "LSP key should be true after prepare()"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SSH mount tests (work item 0030)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_run_args_display_with_ssh_dir_includes_ssh_mount() {
+        let ssh_path = PathBuf::from("/home/testuser/.ssh");
+        let args = build_run_args_display(
+            "img",
+            "/repo",
+            &[],
+            &[],
+            None,
+            false,
+            None,
+            Some(ssh_path.clone()),
+        );
+        let expected_mount = format!("{}:/root/.ssh:ro", ssh_path.display());
+        assert!(
+            args.contains(&"-v".to_string()),
+            "Expected -v flag in args: {:?}",
+            args
+        );
+        assert!(
+            args.contains(&expected_mount),
+            "Expected SSH mount '{}' in args: {:?}",
+            expected_mount,
+            args
+        );
+    }
+
+    #[test]
+    fn build_run_args_display_without_ssh_dir_excludes_ssh_mount() {
+        let args = build_run_args_display("img", "/repo", &[], &[], None, false, None, None);
+        assert!(
+            !args.iter().any(|a| a.contains("/.ssh")),
+            "Did not expect any /.ssh mount in args: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn build_run_args_with_ssh_dir_includes_ssh_mount() {
+        let ssh_path = PathBuf::from("/home/testuser/.ssh");
+        let args = build_run_args(
+            "img",
+            "/repo",
+            &[],
+            &[],
+            None,
+            false,
+            None,
+            Some(ssh_path.clone()),
+        );
+        let expected_mount = format!("{}:/root/.ssh:ro", ssh_path.display());
+        assert!(
+            args.contains(&expected_mount),
+            "Expected SSH mount '{}' in args: {:?}",
+            expected_mount,
+            args
+        );
+    }
+
+    #[test]
+    fn build_run_args_without_ssh_dir_excludes_ssh_mount() {
+        let args = build_run_args("img", "/repo", &[], &[], None, false, None, None);
+        assert!(
+            !args.iter().any(|a| a.contains("/.ssh")),
+            "Did not expect any /.ssh mount in args: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn build_run_args_pty_with_ssh_dir_includes_ssh_mount() {
+        let ssh_path = PathBuf::from("/home/testuser/.ssh");
+        let args = build_run_args_pty(
+            "img",
+            "/repo",
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            Some(ssh_path.clone()),
+        );
+        let expected_mount = format!("{}:/root/.ssh:ro", ssh_path.display());
+        assert!(
+            args.contains(&expected_mount),
+            "Expected SSH mount '{}' in PTY args: {:?}",
+            expected_mount,
+            args
+        );
+    }
+
+    #[test]
+    fn build_run_args_pty_without_ssh_dir_excludes_ssh_mount() {
+        let args = build_run_args_pty("img", "/repo", &[], &[], None, None, false, None);
+        assert!(
+            !args.iter().any(|a| a.contains("/.ssh")),
+            "Did not expect any /.ssh mount in PTY args: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn ssh_mount_is_read_only() {
+        let ssh_path = PathBuf::from("/home/testuser/.ssh");
+        let args = build_run_args_display(
+            "img",
+            "/repo",
+            &[],
+            &[],
+            None,
+            false,
+            None,
+            Some(ssh_path.clone()),
+        );
+        // Find the value after the -v flag that refers to .ssh
+        let ssh_arg = args
+            .windows(2)
+            .find(|w| w[0] == "-v" && w[1].contains("/.ssh"))
+            .map(|w| w[1].clone());
+        assert!(ssh_arg.is_some(), "Expected -v /.ssh mount in args: {:?}", args);
+        assert!(
+            ssh_arg.unwrap().ends_with(":ro"),
+            "SSH mount must be read-only (:ro)"
         );
     }
 }

@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod config;
 mod docker;
+mod git;
 mod tui;
 mod workflow;
 

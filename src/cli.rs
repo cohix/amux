@@ -76,6 +76,14 @@ pub enum Command {
         /// in a single agent run with the current prompt, unchanged.
         #[arg(long)]
         workflow: Option<std::path::PathBuf>,
+
+        /// Run in an isolated Git worktree under ~/.amux/worktrees/.
+        #[arg(long)]
+        worktree: bool,
+
+        /// Mount host ~/.ssh read-only into the agent container.
+        #[arg(long)]
+        mount_ssh: bool,
     },
 
     /// Start a freeform chat session with the configured agent in a container.
@@ -91,6 +99,10 @@ pub enum Command {
         /// Mount the host Docker daemon socket into the agent container.
         #[arg(long)]
         allow_docker: bool,
+
+        /// Mount host ~/.ssh read-only into the agent container.
+        #[arg(long)]
+        mount_ssh: bool,
     },
 
     /// Manage work item specs (create, interview, amend).
@@ -750,5 +762,104 @@ mod tests {
             chat.command.unwrap(),
             Command::Claws { action: ClawsAction::Chat }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // --worktree flag (work item 0030)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn implement_worktree_flag_true() {
+        let cli = parse(&["amux", "implement", "0001", "--worktree"]);
+        match cli.command.unwrap() {
+            Command::Implement { worktree, .. } => assert!(worktree),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_worktree_flag_false_by_default() {
+        let cli = parse(&["amux", "implement", "0001"]);
+        match cli.command.unwrap() {
+            Command::Implement { worktree, .. } => assert!(!worktree),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_worktree_and_workflow_flags_together() {
+        let cli = parse(&["amux", "implement", "0001", "--worktree", "--workflow", "wf.md"]);
+        match cli.command.unwrap() {
+            Command::Implement { worktree, workflow, .. } => {
+                assert!(worktree);
+                assert_eq!(workflow, Some(std::path::PathBuf::from("wf.md")));
+            }
+            _ => panic!("expected implement"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // --mount-ssh flag (work item 0030)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chat_mount_ssh_flag_true() {
+        let cli = parse(&["amux", "chat", "--mount-ssh"]);
+        match cli.command.unwrap() {
+            Command::Chat { mount_ssh, .. } => assert!(mount_ssh),
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn chat_mount_ssh_default_false() {
+        let cli = parse(&["amux", "chat"]);
+        match cli.command.unwrap() {
+            Command::Chat { mount_ssh, .. } => assert!(!mount_ssh),
+            _ => panic!("expected chat"),
+        }
+    }
+
+    #[test]
+    fn implement_mount_ssh_flag_true() {
+        let cli = parse(&["amux", "implement", "0001", "--mount-ssh"]);
+        match cli.command.unwrap() {
+            Command::Implement { mount_ssh, .. } => assert!(mount_ssh),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_mount_ssh_default_false() {
+        let cli = parse(&["amux", "implement", "0001"]);
+        match cli.command.unwrap() {
+            Command::Implement { mount_ssh, .. } => assert!(!mount_ssh),
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_worktree_and_mount_ssh_flags_together() {
+        let cli = parse(&["amux", "implement", "0001", "--worktree", "--mount-ssh"]);
+        match cli.command.unwrap() {
+            Command::Implement { worktree, mount_ssh, .. } => {
+                assert!(worktree);
+                assert!(mount_ssh);
+            }
+            _ => panic!("expected implement"),
+        }
+    }
+
+    #[test]
+    fn implement_worktree_mount_ssh_and_workflow_together() {
+        let cli = parse(&["amux", "implement", "0001", "--worktree", "--mount-ssh", "--workflow", "wf.md"]);
+        match cli.command.unwrap() {
+            Command::Implement { worktree, mount_ssh, workflow, .. } => {
+                assert!(worktree);
+                assert!(mount_ssh);
+                assert_eq!(workflow, Some(std::path::PathBuf::from("wf.md")));
+            }
+            _ => panic!("expected implement"),
+        }
     }
 }

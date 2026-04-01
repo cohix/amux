@@ -5,6 +5,7 @@ pub mod state;
 
 use crate::cli::Agent;
 use crate::commands::auth::{agent_keychain_credentials, apply_auth_decision};
+use dirs;
 use crate::commands::chat::{chat_entrypoint, chat_entrypoint_non_interactive};
 use crate::commands::implement::{
     agent_entrypoint, agent_entrypoint_non_interactive, find_work_item, parse_work_item,
@@ -355,7 +356,89 @@ async fn handle_action(app: &mut App, action: Action) {
         Action::WorkflowNextInCurrentContainer => {
             advance_workflow_next_current_container(app).await;
         }
+
+        Action::WorktreeMerge => {
+            handle_worktree_merge(app).await;
+        }
+
+        Action::WorktreeDiscard => {
+            handle_worktree_discard(app).await;
+        }
+
+        Action::WorktreeSkip => {
+            handle_worktree_skip(app);
+        }
     }
+}
+
+/// Merge the worktree branch into the current HEAD and clean up the worktree.
+async fn handle_worktree_merge(app: &mut App) {
+    let (branch, wt_path, git_root) = match (
+        app.active_tab_mut().worktree_branch.take(),
+        app.active_tab_mut().worktree_active_path.take(),
+        app.active_tab_mut().worktree_git_root.take(),
+    ) {
+        (Some(b), Some(p), Some(r)) => (b, p, r),
+        _ => return,
+    };
+    let tx = app.active_tab().output_tx.clone();
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    spawn_text_command(tx, exit_tx, move |sink| async move {
+        match crate::git::merge_branch(&git_root, &branch) {
+            Ok(()) => {
+                sink.println(format!("Merged branch '{}' into current branch.", branch));
+                let _ = crate::git::remove_worktree(&git_root, &wt_path);
+                let _ = crate::git::delete_branch(&git_root, &branch);
+                sink.println("Worktree removed and branch deleted.".to_string());
+            }
+            Err(e) => {
+                sink.println(format!("Merge failed: {}. Worktree kept at {}.", e, wt_path.display()));
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Discard the worktree branch and remove the worktree directory.
+async fn handle_worktree_discard(app: &mut App) {
+    let (branch, wt_path, git_root) = match (
+        app.active_tab_mut().worktree_branch.take(),
+        app.active_tab_mut().worktree_active_path.take(),
+        app.active_tab_mut().worktree_git_root.take(),
+    ) {
+        (Some(b), Some(p), Some(r)) => (b, p, r),
+        _ => return,
+    };
+    let tx = app.active_tab().output_tx.clone();
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    app.active_tab_mut().exit_rx = Some(exit_rx);
+    spawn_text_command(tx, exit_tx, move |sink| async move {
+        match crate::git::remove_worktree(&git_root, &wt_path) {
+            Ok(()) => {
+                sink.println(format!("Worktree at {} removed.", wt_path.display()));
+                let _ = crate::git::delete_branch(&git_root, &branch);
+                sink.println(format!("Branch '{}' deleted.", branch));
+            }
+            Err(e) => {
+                sink.println(format!("Failed to remove worktree: {}", e));
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Keep the worktree branch as-is (no merge, no delete).
+fn handle_worktree_skip(app: &mut App) {
+    if let Some(path) = app.active_tab().worktree_active_path.clone() {
+        app.active_tab_mut().push_output(format!(
+            "Worktree kept at {}. Use 'git worktree list' to see active worktrees.",
+            path.display()
+        ));
+    }
+    app.active_tab_mut().worktree_branch = None;
+    app.active_tab_mut().worktree_active_path = None;
+    app.active_tab_mut().worktree_git_root = None;
 }
 
 /// Execute a command on a specific tab by index.
@@ -373,11 +456,13 @@ fn parse_ready_flags(parts: &[&str]) -> (bool, bool, bool, bool, bool) {
     (refresh, build, no_cache, non_interactive, allow_docker)
 }
 
-/// Parse flags from implement command parts, returning (non_interactive, plan, allow_docker, workflow_path).
-fn parse_implement_flags(parts: &[&str]) -> (bool, bool, bool, Option<std::path::PathBuf>) {
+/// Parse flags from implement command parts, returning (non_interactive, plan, allow_docker, workflow_path, worktree, mount_ssh).
+fn parse_implement_flags(parts: &[&str]) -> (bool, bool, bool, Option<std::path::PathBuf>, bool, bool) {
     let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
     let plan = parts.iter().any(|p| *p == "--plan");
     let allow_docker = parts.iter().any(|p| *p == "--allow-docker");
+    let worktree = parts.iter().any(|p| *p == "--worktree");
+    let mount_ssh = parts.iter().any(|p| *p == "--mount-ssh");
     // Accept --workflow=<path> or --workflow <path>
     let workflow = parts
         .iter()
@@ -395,15 +480,16 @@ fn parse_implement_flags(parts: &[&str]) -> (bool, bool, bool, Option<std::path:
                 .find(|w| w[0] == "--workflow")
                 .map(|w| std::path::PathBuf::from(w[1]))
         });
-    (non_interactive, plan, allow_docker, workflow)
+    (non_interactive, plan, allow_docker, workflow, worktree, mount_ssh)
 }
 
-/// Parse flags from chat command parts, returning (non_interactive, plan, allow_docker).
-fn parse_chat_flags(parts: &[&str]) -> (bool, bool, bool) {
+/// Parse flags from chat command parts, returning (non_interactive, plan, allow_docker, mount_ssh).
+fn parse_chat_flags(parts: &[&str]) -> (bool, bool, bool, bool) {
     let non_interactive = parts.iter().any(|p| *p == "--non-interactive");
     let plan = parts.iter().any(|p| *p == "--plan");
     let allow_docker = parts.iter().any(|p| *p == "--allow-docker");
-    (non_interactive, plan, allow_docker)
+    let mount_ssh = parts.iter().any(|p| *p == "--mount-ssh");
+    (non_interactive, plan, allow_docker, mount_ssh)
 }
 
 /// Parse and dispatch a command string entered by the user.
@@ -437,7 +523,7 @@ async fn execute_command(app: &mut App, cmd: &str) {
         }
 
         "implement" => {
-            let (non_interactive, plan, allow_docker, workflow) = parse_implement_flags(&parts);
+            let (non_interactive, plan, allow_docker, workflow, worktree, mount_ssh) = parse_implement_flags(&parts);
             // Filter out flags (and --workflow <path>) to find the work item number.
             let work_item: u32 = match parts.iter()
                 .skip(1)
@@ -448,17 +534,17 @@ async fn execute_command(app: &mut App, cmd: &str) {
                 Some(n) => n,
                 None => {
                     app.active_tab_mut().input_error =
-                        Some("Usage: implement <work-item-number> [--non-interactive] [--plan] [--allow-docker] [--workflow=<path>]".into());
+                        Some("Usage: implement <work-item-number> [--non-interactive] [--plan] [--allow-docker] [--workflow=<path>] [--worktree] [--mount-ssh]".into());
                     return;
                 }
             };
-            app.active_tab_mut().pending_command = PendingCommand::Implement { work_item, non_interactive, plan, allow_docker, workflow };
+            app.active_tab_mut().pending_command = PendingCommand::Implement { work_item, non_interactive, plan, allow_docker, workflow, worktree, mount_ssh };
             show_pre_command_dialogs(app).await;
         }
 
         "chat" => {
-            let (non_interactive, plan, allow_docker) = parse_chat_flags(&parts);
-            app.active_tab_mut().pending_command = PendingCommand::Chat { non_interactive, plan, allow_docker };
+            let (non_interactive, plan, allow_docker, mount_ssh) = parse_chat_flags(&parts);
+            app.active_tab_mut().pending_command = PendingCommand::Chat { non_interactive, plan, allow_docker, mount_ssh };
             show_pre_command_dialogs(app).await;
         }
 
@@ -580,11 +666,11 @@ async fn launch_pending_command(app: &mut App) {
             app.active_tab_mut().ready_opts = ReadyOptions { refresh, build, no_cache, non_interactive, allow_docker, auto_create_dockerfile: true };
             launch_ready(app).await;
         }
-        PendingCommand::Implement { work_item, non_interactive, plan, allow_docker, workflow } => {
-            launch_implement(app, work_item, non_interactive, plan, allow_docker, workflow).await;
+        PendingCommand::Implement { work_item, non_interactive, plan, allow_docker, workflow, worktree, mount_ssh } => {
+            launch_implement(app, work_item, non_interactive, plan, allow_docker, workflow, worktree, mount_ssh).await;
         }
-        PendingCommand::Chat { non_interactive, plan, allow_docker } => {
-            launch_chat(app, non_interactive, plan, allow_docker).await;
+        PendingCommand::Chat { non_interactive, plan, allow_docker, mount_ssh } => {
+            launch_chat(app, non_interactive, plan, allow_docker, mount_ssh).await;
         }
         PendingCommand::ClawsReady => {
             // Claws ready is launched directly from dialog actions (ClawsReadyProceed /
@@ -763,12 +849,14 @@ fn launch_ready_audit(app: &mut App) {
         Some(&container_name),
         app.active_tab().host_settings.as_ref(),
         allow_docker,
+        None,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
     // Use actual terminal dimensions for the PTY.
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+    let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
     let size = PtySize {
         rows: inner_rows,
         cols: inner_cols,
@@ -850,6 +938,7 @@ fn launch_ready_audit_captured(app: &mut App) {
             host_settings.as_ref(),
             allow_docker,
             None,
+            None,
         )?;
         for line in output.lines() {
             sink.println(line);
@@ -891,7 +980,7 @@ fn launch_ready_post_audit(app: &mut App) {
 }
 
 /// Actually spawn the docker container for `implement` via PTY.
-async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool, allow_docker: bool, workflow_path: Option<std::path::PathBuf>) {
+async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, plan: bool, allow_docker: bool, workflow_path: Option<std::path::PathBuf>, worktree: bool, mount_ssh: bool) {
     let tab_cwd = app.active_tab().cwd.clone();
     let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
@@ -909,7 +998,82 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
     let config = load_repo_config(&git_root).unwrap_or_default();
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
-    let mount_path = app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone());
+
+    // Resolve SSH dir if requested.
+    let ssh_dir: Option<std::path::PathBuf> = if mount_ssh {
+        match dirs::home_dir() {
+            Some(home) => {
+                let ssh = home.join(".ssh");
+                if ssh.exists() {
+                    app.active_tab_mut().push_output(
+                        "WARNING: --mount-ssh: mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.".to_string(),
+                    );
+                    Some(ssh)
+                } else {
+                    app.active_tab_mut().push_output("Error: host ~/.ssh directory not found; cannot use --mount-ssh.".to_string());
+                    app.active_tab_mut().finish_command(1);
+                    return;
+                }
+            }
+            None => {
+                app.active_tab_mut().push_output("Error: cannot resolve home directory.".to_string());
+                app.active_tab_mut().finish_command(1);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Set up worktree if requested; otherwise use pending mount path.
+    let mount_path = if worktree {
+        // Validate git version.
+        if let Err(e) = crate::git::git_version_check() {
+            app.active_tab_mut().push_output(format!("Error: {}", e));
+            app.active_tab_mut().finish_command(1);
+            return;
+        }
+        // Warn if HEAD is detached — the worktree branch will be cut from a detached commit.
+        if crate::git::is_detached_head(&git_root) {
+            app.active_tab_mut().push_output(
+                "WARNING: You are in detached HEAD state. The worktree branch will be created \
+                 from the current commit. Consider checking out a branch first so the merge \
+                 prompt has a target branch."
+                    .to_string(),
+            );
+        }
+        let wt_path = match crate::git::worktree_path(&git_root, work_item) {
+            Ok(p) => p,
+            Err(e) => {
+                app.active_tab_mut().push_output(format!("Error creating worktree path: {}", e));
+                app.active_tab_mut().finish_command(1);
+                return;
+            }
+        };
+        let branch = crate::git::worktree_branch_name(work_item);
+        // If worktree already exists, reuse it; otherwise create it.
+        if wt_path.exists() {
+            app.active_tab_mut().push_output(format!("Resuming existing worktree at {}", wt_path.display()));
+        } else {
+            if let Err(e) = crate::git::create_worktree(&git_root, &wt_path, &branch) {
+                app.active_tab_mut().push_output(format!("Error creating worktree: {}", e));
+                app.active_tab_mut().finish_command(1);
+                return;
+            }
+            app.active_tab_mut().push_output(format!("Created worktree at {} (branch: {})", wt_path.display(), branch));
+        }
+        // Store worktree info in tab for post-completion dialog.
+        app.active_tab_mut().worktree_branch = Some(branch);
+        app.active_tab_mut().worktree_active_path = Some(wt_path.clone());
+        app.active_tab_mut().worktree_git_root = Some(git_root.clone());
+        wt_path
+    } else {
+        // Clear any stale worktree state.
+        app.active_tab_mut().worktree_branch = None;
+        app.active_tab_mut().worktree_active_path = None;
+        app.active_tab_mut().worktree_git_root = None;
+        app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone())
+    };
 
     // Auto-passthrough: always pass credentials from keychain if available.
     let credentials = agent_keychain_credentials(&agent_name);
@@ -918,6 +1082,11 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
     // Prepare host settings (sanitized config files in a temp dir).
     app.active_tab_mut().host_settings = docker::HostSettings::prepare(&agent_name)
         .or_else(|| docker::HostSettings::prepare_minimal(&agent_name));
+
+    // Persist launch context so workflow step-advancement functions can reuse identical settings.
+    app.active_tab_mut().workflow_ssh_dir = ssh_dir.clone();
+    app.active_tab_mut().workflow_mount_path = Some(mount_path.clone());
+    app.active_tab_mut().workflow_allow_docker = allow_docker;
 
     // If a workflow is specified, initialise/load its state and derive the step prompt.
     let effective_entrypoint: Vec<String>;
@@ -993,9 +1162,9 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker, None)
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker, None, ssh_dir.clone())
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker)
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker, ssh_dir.clone())
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
@@ -1043,6 +1212,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
                 host_settings.as_ref(),
                 allow_docker,
                 None,
+                ssh_dir.clone(),
             )?;
             for line in output.lines() {
                 sink.println(line);
@@ -1055,12 +1225,13 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker);
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker, ssh_dir.clone());
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+        let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+        let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
         let size = PtySize {
             rows: inner_rows,
             cols: inner_cols,
@@ -1088,7 +1259,7 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
 }
 
 /// Actually spawn the docker container for `chat` via PTY.
-async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_docker: bool) {
+async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_docker: bool, mount_ssh: bool) {
     let tab_cwd = app.active_tab().cwd.clone();
     let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
@@ -1101,6 +1272,32 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
     let config = load_repo_config(&git_root).unwrap_or_default();
     let agent_name = config.agent.as_deref().unwrap_or("claude").to_string();
     let mount_path = app.active_tab_mut().pending_mount_path.take().unwrap_or_else(|| git_root.clone());
+
+    // Resolve SSH dir if requested.
+    let ssh_dir: Option<std::path::PathBuf> = if mount_ssh {
+        match dirs::home_dir() {
+            Some(home) => {
+                let ssh = home.join(".ssh");
+                if ssh.exists() {
+                    app.active_tab_mut().push_output(
+                        "WARNING: --mount-ssh: mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.".to_string(),
+                    );
+                    Some(ssh)
+                } else {
+                    app.active_tab_mut().push_output("Error: host ~/.ssh directory not found; cannot use --mount-ssh.".to_string());
+                    app.active_tab_mut().finish_command(1);
+                    return;
+                }
+            }
+            None => {
+                app.active_tab_mut().push_output("Error: cannot resolve home directory.".to_string());
+                app.active_tab_mut().finish_command(1);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // Auto-passthrough: always pass credentials from keychain if available.
     let credentials = agent_keychain_credentials(&agent_name);
@@ -1124,9 +1321,9 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
 
     // Show the full Docker CLI command in the execution window (with masked env values).
     let display_args = if non_interactive {
-        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker, None)
+        docker::build_run_args_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, app.active_tab().host_settings.as_ref(), allow_docker, None, ssh_dir.clone())
     } else {
-        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker)
+        docker::build_run_args_pty_display(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker, ssh_dir.clone())
     };
     let cmd_display = docker::format_run_cmd(&display_args);
 
@@ -1175,6 +1372,7 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
                 host_settings.as_ref(),
                 allow_docker,
                 None,
+                ssh_dir.clone(),
             )?;
             for line in output.lines() {
                 sink.println(line);
@@ -1187,12 +1385,13 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
         print_interactive_notice(&sink, &agent_name);
 
         let docker_args =
-            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker);
+            docker::build_run_args_pty(&image_tag, mount_path.to_str().unwrap(), &entrypoint_refs, &env_vars, Some(&container_name), app.active_tab().host_settings.as_ref(), allow_docker, ssh_dir.clone());
         let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
         // Use actual terminal dimensions for the PTY.
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+        let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+        let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
         let size = PtySize {
             rows: inner_rows,
             cols: inner_cols,
@@ -1864,7 +2063,8 @@ async fn launch_claws_exec_audit(app: &mut App, container_id: String, ctx: claws
     let exec_str_refs: Vec<&str> = exec_args.iter().map(String::as_str).collect();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+    let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
     let size = PtySize {
         rows: inner_rows,
         cols: inner_cols,
@@ -1916,7 +2116,8 @@ async fn launch_claws_exec(app: &mut App, container_id: String) {
     let exec_str_refs: Vec<&str> = exec_args.iter().map(String::as_str).collect();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+    let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
     let size = PtySize {
         rows: inner_rows,
         cols: inner_cols,
@@ -2022,6 +2223,7 @@ async fn launch_specs_amend(app: &mut App, work_item: u32, allow_docker: bool) {
         Some(&container_name),
         app.active_tab().host_settings.as_ref(),
         allow_docker,
+        None,
     );
     let cmd_display = docker::format_run_cmd(&display_args);
 
@@ -2054,11 +2256,13 @@ async fn launch_specs_amend(app: &mut App, work_item: u32, allow_docker: bool) {
         Some(&container_name),
         app.active_tab().host_settings.as_ref(),
         allow_docker,
+        None,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+    let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
     let size = PtySize {
         rows: inner_rows,
         cols: inner_cols,
@@ -2124,6 +2328,7 @@ async fn launch_specs_interview_agent(
         Some(&container_name),
         app.active_tab().host_settings.as_ref(),
         allow_docker,
+        None,
     );
     let cmd_display = docker::format_run_cmd(&display_args);
 
@@ -2156,11 +2361,13 @@ async fn launch_specs_interview_agent(
         Some(&container_name),
         app.active_tab().host_settings.as_ref(),
         allow_docker,
+        None,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, 0);
+    let wf_strip_h = app.active_tab().workflow.as_ref().map(|wf| workflow_strip_height(wf)).unwrap_or(0);
+    let (inner_cols, inner_rows) = calculate_container_inner_size(term_cols, term_rows, wf_strip_h);
     let size = PtySize {
         rows: inner_rows,
         cols: inner_cols,
@@ -2330,7 +2537,7 @@ async fn check_workflow_step_completion(app: &mut App) {
 
 /// Launch the next ready workflow step (called after user confirms advancing).
 async fn launch_next_workflow_step(app: &mut App) {
-    let (wf_state, git_root, work_item, agent_name, allow_docker) = {
+    let (wf_state, git_root, work_item, agent_name, allow_docker, ssh_dir, mount_path) = {
         let tab = app.active_tab();
         let wf = match tab.workflow.clone() {
             Some(w) => w,
@@ -2342,7 +2549,17 @@ async fn launch_next_workflow_step(app: &mut App) {
         };
         let config = load_repo_config(&git_root).unwrap_or_default();
         let agent = config.agent.as_deref().unwrap_or("claude").to_string();
-        (wf, git_root, tab.workflow.as_ref().map(|w| w.work_item).unwrap_or(0), agent, false)
+        // Use the launch-time mount path (worktree or repo root) for all subsequent steps.
+        let mount_path = tab.workflow_mount_path.clone().unwrap_or_else(|| git_root.clone());
+        (
+            wf,
+            git_root,
+            tab.workflow.as_ref().map(|w| w.work_item).unwrap_or(0),
+            agent,
+            tab.workflow_allow_docker,
+            tab.workflow_ssh_dir.clone(),
+            mount_path,
+        )
     };
 
     let ready = wf_state.next_ready();
@@ -2384,12 +2601,13 @@ async fn launch_next_workflow_step(app: &mut App) {
 
     let docker_args = docker::build_run_args_pty(
         &image_tag,
-        git_root.to_str().unwrap_or("."),
+        mount_path.to_str().unwrap_or("."),
         &entrypoint_refs,
         &env_vars,
         Some(&container_name),
         host_settings_ref,
         allow_docker,
+        ssh_dir,
     );
     let docker_str_refs: Vec<&str> = docker_args.iter().map(String::as_str).collect();
 

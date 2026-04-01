@@ -30,9 +30,11 @@ pub async fn run(command: Command) -> Result<()> {
             plan,
             allow_docker,
             workflow,
-        } => implement::run(&work_item, non_interactive, plan, allow_docker, workflow.as_deref()).await,
-        Command::Chat { non_interactive, plan, allow_docker } => {
-            chat::run(non_interactive, plan, allow_docker).await
+            worktree,
+            mount_ssh,
+        } => implement::run(&work_item, non_interactive, plan, allow_docker, workflow.as_deref(), worktree, mount_ssh).await,
+        Command::Chat { non_interactive, plan, allow_docker, mount_ssh } => {
+            chat::run(non_interactive, plan, allow_docker, mount_ssh).await
         }
         Command::Claws { action } => claws::run(action).await,
         Command::Status { watch } => status::run(watch).await,

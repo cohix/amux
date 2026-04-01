@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 /// Command-mode entry point for `amux chat`.
-pub async fn run(non_interactive: bool, plan: bool, allow_docker: bool) -> Result<()> {
+pub async fn run(non_interactive: bool, plan: bool, allow_docker: bool, mount_ssh: bool) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let mount_path = confirm_mount_scope_stdin(&git_root)?;
     let credentials = resolve_auth(&git_root, agent_name(&git_root)?)?;
@@ -33,6 +33,7 @@ pub async fn run(non_interactive: bool, plan: bool, allow_docker: bool) -> Resul
         non_interactive,
         host_settings.as_ref(),
         allow_docker,
+        mount_ssh,
         None,
     )
     .await
@@ -45,6 +46,7 @@ pub async fn run(non_interactive: bool, plan: bool, allow_docker: bool) -> Resul
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
 /// `plan`: when true, launch agent in plan (read-only) mode.
 /// `allow_docker`: when true, mount the host Docker daemon socket into the container.
+/// `mount_ssh`: when true, mount the host `~/.ssh` directory read-only into the container.
 pub async fn run_with_sink(
     out: &OutputSink,
     mount_override: Option<PathBuf>,
@@ -53,6 +55,7 @@ pub async fn run_with_sink(
     plan: bool,
     host_settings: Option<&docker::HostSettings>,
     allow_docker: bool,
+    mount_ssh: bool,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
     let config = load_repo_config(&git_root)?;
@@ -73,6 +76,7 @@ pub async fn run_with_sink(
         non_interactive,
         host_settings,
         allow_docker,
+        mount_ssh,
         None,
     )
     .await

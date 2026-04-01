@@ -180,6 +180,7 @@ pub async fn run_new_with_sink(
         false,
         host_settings.as_ref(),
         false,
+        false,
         None,
     )
     .await?;
@@ -233,6 +234,7 @@ pub async fn run_amend(
         non_interactive,
         host_settings.as_ref(),
         allow_docker,
+        false,
         None,
     )
     .await
@@ -274,6 +276,7 @@ pub async fn run_with_sink_amend(
         non_interactive,
         host_settings,
         allow_docker,
+        false,
         None,
     )
     .await

@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Codex CLI from official GitHub releases
+RUN ARCH="$(dpkg --print-architecture)" && \
+    case "${ARCH}" in \
+        amd64) CODEX_ARCH="x86_64-unknown-linux-musl" ;; \
+        arm64) CODEX_ARCH="aarch64-unknown-linux-musl" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    curl -fsSL \
+        "https://github.com/openai/codex/releases/latest/download/codex-${CODEX_ARCH}.tar.gz" \
+        | tar xz -C /usr/local/bin "codex-${CODEX_ARCH}" && \
+    mv "/usr/local/bin/codex-${CODEX_ARCH}" /usr/local/bin/codex && \
+    chmod +x /usr/local/bin/codex
+
+WORKDIR /workspace

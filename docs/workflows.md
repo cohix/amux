@@ -84,6 +84,8 @@ Flags work identically to the regular `implement` command:
 | `--non-interactive` | Run each step's agent in print/non-interactive mode |
 | `--plan` | Launch each step's agent in plan (read-only) mode |
 | `--allow-docker` | Mount the host Docker socket into each step's container |
+| `--worktree` | Run all steps in an isolated Git worktree (see [Worktree Isolation](usage.md#worktree-isolation)) |
+| `--mount-ssh` | Mount host `~/.ssh` read-only into each step's container (see [SSH Key Mounting](usage.md#ssh-key-mounting)) |
 
 Between steps amux prints the step summary and prompts:
 

@@ -4,6 +4,7 @@ use crate::config::load_repo_config;
 use crate::docker;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use dirs;
 
 /// Shared logic for launching a containerized agent session.
 ///
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 /// `env_vars`: agent credential env vars to pass into the container.
 /// `non_interactive`: when true, launch agent in print/non-interactive mode.
 /// `allow_docker`: when true, mount the host Docker daemon socket into the container.
+/// `mount_ssh`: when true, mount the host `~/.ssh` directory read-only into the container.
 pub async fn run_agent_with_sink(
     entrypoint: Vec<String>,
     status_message: &str,
@@ -24,6 +26,7 @@ pub async fn run_agent_with_sink(
     non_interactive: bool,
     host_settings: Option<&docker::HostSettings>,
     allow_docker: bool,
+    mount_ssh: bool,
     container_name_override: Option<String>,
 ) -> Result<()> {
     let git_root = find_git_root().context("Not inside a Git repository")?;
@@ -50,6 +53,26 @@ pub async fn run_agent_with_sink(
         ));
     }
 
+    // If --allow-ssh, resolve ~/.ssh, validate it exists, and warn before launching.
+    let ssh_dir: Option<PathBuf> = if mount_ssh {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve home directory"))?;
+        let ssh = home.join(".ssh");
+        if !ssh.exists() {
+            anyhow::bail!("Host ~/.ssh directory not found; cannot use --mount-ssh");
+        }
+        out.println(
+            "WARNING: --mount-ssh: mounting host ~/.ssh into container (read-only). \
+             SSH keys with incorrect permissions may be rejected by git inside the container — \
+             verify host key permissions (e.g. chmod 600 ~/.ssh/id_*). \
+             Ensure you trust the agent image."
+                .to_string(),
+        );
+        Some(ssh)
+    } else {
+        None
+    };
+
     let image_tag = docker::project_image_tag(&git_root);
     let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
 
@@ -62,6 +85,7 @@ pub async fn run_agent_with_sink(
         host_settings,
         allow_docker,
         container_name_override.as_deref(),
+        ssh_dir.clone(),
     );
     out.println(format!("$ {}", docker::format_run_cmd(&display_args)));
 
@@ -80,6 +104,7 @@ pub async fn run_agent_with_sink(
             host_settings,
             allow_docker,
             container_name_override.as_deref(),
+            ssh_dir,
         )
         .context("Container exited with an error")?;
         for line in output.lines() {
@@ -94,6 +119,7 @@ pub async fn run_agent_with_sink(
             host_settings,
             allow_docker,
             container_name_override.as_deref(),
+            ssh_dir,
         )
         .context("Container exited with an error")?;
     }
@@ -124,6 +150,7 @@ mod tests {
             vec![],
             false,
             None,
+            false,
             false,
             None,
         )

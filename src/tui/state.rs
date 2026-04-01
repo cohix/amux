@@ -113,6 +113,13 @@ pub enum Dialog {
         /// Optional error message (e.g. "No previous step to return to").
         error: Option<String>,
     },
+    /// After `implement --worktree` completes: ask whether to merge, discard, or keep the branch.
+    WorktreeMergePrompt {
+        branch: String,
+        worktree_path: PathBuf,
+        git_root: PathBuf,
+        had_error: bool,
+    },
 }
 
 /// Tracks which command is waiting for dialog answers (mount scope, auth).
@@ -133,11 +140,17 @@ pub enum PendingCommand {
         allow_docker: bool,
         /// Optional workflow file path for multi-step execution.
         workflow: Option<PathBuf>,
+        /// Run in an isolated Git worktree.
+        worktree: bool,
+        /// Mount host ~/.ssh read-only into the container.
+        mount_ssh: bool,
     },
     Chat {
         non_interactive: bool,
         plan: bool,
         allow_docker: bool,
+        /// Mount host ~/.ssh read-only into the container.
+        mount_ssh: bool,
     },
     ClawsReady,
     /// specs amend: run amend agent for a work item.
@@ -376,6 +389,25 @@ pub struct TabState {
     pub workflow_current_step: Option<String>,
     /// Git root path captured when the workflow was launched (needed for state persistence).
     pub workflow_git_root: Option<PathBuf>,
+
+    // --- Worktree state (set when --worktree is active) ---
+    /// The branch name created for this worktree session.
+    pub worktree_branch: Option<String>,
+    /// The path to the active worktree directory.
+    pub worktree_active_path: Option<PathBuf>,
+    /// The git root captured when the worktree was created.
+    pub worktree_git_root: Option<PathBuf>,
+
+    // --- Workflow launch context (persisted so step-advancement uses identical settings) ---
+    /// Resolved `~/.ssh` path when `--mount-ssh` was passed for this workflow.
+    /// `None` when SSH mounting was not requested.
+    pub workflow_ssh_dir: Option<PathBuf>,
+    /// Mount path used for the first workflow step. This is the worktree path when
+    /// `--worktree` is active, or the pending mount path otherwise. Every subsequent
+    /// step must use the same path so the container sees a consistent filesystem.
+    pub workflow_mount_path: Option<PathBuf>,
+    /// Whether `--allow-docker` was passed for this workflow session.
+    pub workflow_allow_docker: bool,
 }
 
 impl TabState {
@@ -431,6 +463,12 @@ impl TabState {
             workflow: None,
             workflow_current_step: None,
             workflow_git_root: None,
+            worktree_branch: None,
+            worktree_active_path: None,
+            worktree_git_root: None,
+            workflow_ssh_dir: None,
+            workflow_mount_path: None,
+            workflow_allow_docker: false,
         }
     }
 
@@ -830,6 +868,19 @@ impl TabState {
                 }
                 crate::tui::pty::PtyEvent::Exit(code) => {
                     self.finish_command(code);
+                    // If a worktree was active, show the merge-or-discard dialog.
+                    if let (Some(branch), Some(wt_path), Some(git_root)) = (
+                        self.worktree_branch.clone(),
+                        self.worktree_active_path.clone(),
+                        self.worktree_git_root.clone(),
+                    ) {
+                        self.dialog = Dialog::WorktreeMergePrompt {
+                            branch,
+                            worktree_path: wt_path,
+                            git_root,
+                            had_error: code != 0,
+                        };
+                    }
                     break;
                 }
             }
@@ -839,6 +890,19 @@ impl TabState {
         if let Some(ref mut rx) = self.exit_rx {
             if let Ok(code) = rx.try_recv() {
                 self.finish_command(code);
+                // If a worktree was active, show the merge-or-discard dialog.
+                if let (Some(branch), Some(wt_path), Some(git_root)) = (
+                    self.worktree_branch.clone(),
+                    self.worktree_active_path.clone(),
+                    self.worktree_git_root.clone(),
+                ) {
+                    self.dialog = Dialog::WorktreeMergePrompt {
+                        branch,
+                        worktree_path: wt_path,
+                        git_root,
+                        had_error: code != 0,
+                    };
+                }
             }
         }
 

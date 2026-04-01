@@ -64,6 +64,12 @@ pub enum Action {
     WorkflowNextInNewContainer,
     /// Workflow control board: mark current step done, send next step prompt to the existing PTY.
     WorkflowNextInCurrentContainer,
+    /// Worktree merge prompt: merge the worktree branch into the current branch.
+    WorktreeMerge,
+    /// Worktree merge prompt: discard the worktree branch and remove the worktree.
+    WorktreeDiscard,
+    /// Worktree merge prompt: keep the worktree branch as-is without merging.
+    WorktreeSkip,
 }
 
 /// Dispatch a key press to the correct handler based on application state.
@@ -127,6 +133,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         Dialog::WorkflowControlBoard { .. } => {
             return handle_workflow_control_board(app.active_tab_mut(), key)
+        }
+        Dialog::WorktreeMergePrompt { .. } => {
+            return handle_worktree_merge_prompt(app.active_tab_mut(), key)
         }
         Dialog::None => {}
     }
@@ -955,6 +964,24 @@ fn handle_workflow_control_board(tab: &mut TabState, key: KeyEvent) -> Action {
             Action::None
         }
         _ => Action::None, // dialog stays open
+    }
+}
+
+fn handle_worktree_merge_prompt(tab: &mut TabState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('m') | KeyCode::Char('M') => {
+            tab.dialog = Dialog::None;
+            Action::WorktreeMerge
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            tab.dialog = Dialog::None;
+            Action::WorktreeDiscard
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Esc => {
+            tab.dialog = Dialog::None;
+            Action::WorktreeSkip
+        }
+        _ => Action::None,
     }
 }
 
