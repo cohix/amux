@@ -1167,7 +1167,7 @@ fn step_box_label_and_style(
     name: &str,
     status: &StepStatus,
     is_current: bool,
-    box_width: u16,
+    _box_width: u16,
 ) -> (String, Style) {
     const MAX_NAME: usize = 12;
     let truncated_name = if name.len() > MAX_NAME {
