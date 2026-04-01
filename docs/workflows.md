@@ -122,6 +122,85 @@ When a step completes, a confirmation dialog appears. Press `Enter` or `y` to ad
 
 ---
 
+## Workflow control board (TUI only)
+
+While a workflow step is **running**, press **Ctrl+W** (with the container window minimized) to open the **workflow control board** — a diamond-shaped popup that lets you redirect execution in real time without waiting for the current step to finish.
+
+```
+╭──────── Workflow Control ────────╮
+│ Step: implement                  │
+│                                  │
+│         ↑ Restart current step   │
+│                                  │
+│ ← Cancel to prev   → Next: new   │
+│                                  │
+│         ↓ Next: same container   │
+│                                  │
+│  [Arrow] select   [Esc] dismiss  │
+╰──────────────────────────────────╯
+```
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| **↑** | **Restart current step** — resets the running step to Pending and relaunches it in a fresh container |
+| **←** | **Cancel to previous step** — marks the current step Pending and rolls back the most recently completed step so it runs again |
+| **→** | **Next step: new container** — marks the current step Done and advances to the next step in a brand-new container |
+| **↓** | **Next step: same container** — marks the current step Done and sends the next step's prompt to the existing container via its open PTY session |
+| **Esc** | Dismiss the control board without changing anything |
+
+Each action persists workflow state to disk before launching any new execution, so an unexpected exit mid-action leaves the state consistent.
+
+### When Ctrl+W is available
+
+The control board opens only when **all** of the following are true:
+
+- A workflow is active in the current tab
+- A step is currently running (`workflow_current_step` is set)
+- The container window is **minimized** (not maximized / full-screen)
+- No other dialog is already open
+
+When a workflow is running and the container window is minimized, a hint appears below the execution window:
+
+```
+Press Ctrl+w for workflow controls
+```
+
+When the container window is maximized (PTY has full keyboard focus), the hint changes to:
+
+```
+Press Esc to minimize container, then Ctrl+w for workflow controls
+```
+
+### Next step: same container
+
+The **↓ Next: same container** action reuses the already-running Docker container instead of spinning up a new one. The next step's prompt is written directly to the container's PTY stdin, exactly as if you had typed it at the shell prompt. The container window is automatically maximized so you can follow along.
+
+This is useful when:
+- The container has already installed dependencies or built an intermediate artifact that the next step needs
+- You want to avoid the overhead of starting a new Docker container
+
+If the PTY session has already closed by the time you press **↓**, amux falls back to launching a new container and shows a status message:
+
+```
+PTY session ended — starting new container
+```
+
+### Edge cases
+
+| Situation | Behaviour |
+|---|---|
+| **↑ Restart** when current step has no next step | Relaunches the current step; no workflow-complete transition triggered |
+| **← Cancel** on the first step (no predecessor) | Dialog stays open with an error: `No previous step to return to` |
+| **← Cancel** with parallel predecessors | Rolls back the most recently completed step (last `Done` step by file order) |
+| **→ / ↓ Next** when current step is the final step | Transitions to workflow-complete state; no new launch |
+| **↓ Next: same container** with closed PTY | Falls back to new container; shows status message |
+| Container window maximized | Ctrl+W is suppressed; hint guides you to minimize first |
+| Another dialog already open | Ctrl+W is suppressed until the open dialog is dismissed |
+
+---
+
 ## Parallel groups
 
 Steps that share the same `Depends-on` set form a **parallel group**. amux v0.3 executes them **sequentially** in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically with slight indentation to indicate sequential-within-group ordering.

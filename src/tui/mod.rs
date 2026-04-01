@@ -338,6 +338,23 @@ async fn handle_action(app: &mut App, action: Action) {
         Action::WorkflowRetry => {
             retry_workflow_step(app).await;
         }
+
+        Action::WorkflowRestartStep => {
+            // Same as retry: reset step to Pending and re-launch.
+            retry_workflow_step(app).await;
+        }
+
+        Action::WorkflowCancelToPrevious => {
+            cancel_to_previous_step(app).await;
+        }
+
+        Action::WorkflowNextInNewContainer => {
+            advance_workflow_next_new_container(app).await;
+        }
+
+        Action::WorkflowNextInCurrentContainer => {
+            advance_workflow_next_current_container(app).await;
+        }
     }
 }
 
@@ -2442,4 +2459,415 @@ async fn retry_workflow_step(app: &mut App) {
     }
     // Re-launch via advance.
     launch_next_workflow_step(app).await;
+}
+
+/// Handle the all-done / no-next-ready case after marking a step Done.
+///
+/// Returns `true` if the workflow is complete or stalled (caller should not launch next step),
+/// `false` if there are ready steps to launch.
+fn mark_workflow_complete_if_needed(app: &mut App, current_step: &str) -> bool {
+    if let (Some(wf), Some(git_root)) = (app.active_tab().workflow.clone(), app.active_tab().workflow_git_root.clone()) {
+        let _ = workflow::save_workflow_state(&git_root, &wf);
+        if wf.all_done() {
+            app.active_tab_mut().push_output(format!(
+                "Workflow step '{}' complete. All steps done!", current_step
+            ));
+            app.active_tab_mut().workflow_current_step = None;
+            let state_path = workflow::workflow_state_path(&git_root, wf.work_item, &wf.workflow_name);
+            let _ = std::fs::remove_file(state_path);
+            return true;
+        }
+        if wf.next_ready().is_empty() {
+            app.active_tab_mut().push_output(format!(
+                "Workflow step '{}' complete but no steps are ready.", current_step
+            ));
+            app.active_tab_mut().workflow_current_step = None;
+            return true;
+        }
+    }
+    false
+}
+
+/// Cancel the current step and return to the previous (most recently Done) step.
+async fn cancel_to_previous_step(app: &mut App) {
+    let current_step = match app.active_tab().workflow_current_step.clone() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Mark current step Pending (undo Running status).
+    if let Some(ref mut wf) = app.active_tab_mut().workflow {
+        wf.set_status(&current_step, StepStatus::Pending);
+    }
+
+    // Find predecessor: scan steps in reverse, find last Done step.
+    let predecessor = app.active_tab().workflow.as_ref().and_then(|wf| {
+        wf.steps.iter().rev().find(|s| s.status == StepStatus::Done).map(|s| s.name.clone())
+    });
+
+    if let Some(pred_name) = predecessor {
+        // Mark predecessor Pending so it can be re-run.
+        if let Some(ref mut wf) = app.active_tab_mut().workflow {
+            wf.set_status(&pred_name, StepStatus::Pending);
+        }
+        if let (Some(wf), Some(git_root)) = (app.active_tab().workflow.clone(), app.active_tab().workflow_git_root.clone()) {
+            let _ = workflow::save_workflow_state(&git_root, &wf);
+        }
+        launch_next_workflow_step(app).await;
+    } else {
+        // No predecessor: revert current step to Running and reopen dialog with error.
+        if let Some(ref mut wf) = app.active_tab_mut().workflow {
+            wf.set_status(&current_step, StepStatus::Running);
+        }
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step,
+            error: Some("No previous step to return to".into()),
+        };
+    }
+}
+
+/// Mark the current workflow step Done and advance to the next step in a new container.
+async fn advance_workflow_next_new_container(app: &mut App) {
+    let current_step = match app.active_tab().workflow_current_step.clone() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if let Some(ref mut wf) = app.active_tab_mut().workflow {
+        wf.set_status(&current_step, StepStatus::Done);
+    }
+
+    if mark_workflow_complete_if_needed(app, &current_step) {
+        return;
+    }
+
+    launch_next_workflow_step(app).await;
+}
+
+/// Mark the current workflow step Done and send the next step's prompt to the existing PTY.
+async fn advance_workflow_next_current_container(app: &mut App) {
+    // If PTY is not available, fall back to new container.
+    if app.active_tab().pty.is_none() {
+        app.active_tab_mut().push_output("PTY session ended — starting new container".to_string());
+        advance_workflow_next_new_container(app).await;
+        return;
+    }
+
+    let current_step = match app.active_tab().workflow_current_step.clone() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if let Some(ref mut wf) = app.active_tab_mut().workflow {
+        wf.set_status(&current_step, StepStatus::Done);
+    }
+
+    if mark_workflow_complete_if_needed(app, &current_step) {
+        return;
+    }
+
+    launch_next_workflow_step_in_current_container(app).await;
+}
+
+/// Send the next workflow step's prompt to the existing PTY session (no new container).
+async fn launch_next_workflow_step_in_current_container(app: &mut App) {
+    debug_assert!(app.active_tab().pty.is_some());
+    debug_assert!(app.active_tab().container_info.is_some());
+
+    let (wf_state, git_root, work_item) = {
+        let tab = app.active_tab();
+        let wf = match tab.workflow.clone() {
+            Some(w) => w,
+            None => return,
+        };
+        let git_root = match tab.workflow_git_root.clone() {
+            Some(r) => r,
+            None => return,
+        };
+        let work_item = wf.work_item;
+        (wf, git_root, work_item)
+    };
+
+    let ready = wf_state.next_ready();
+    if ready.is_empty() {
+        return;
+    }
+
+    let step_name = ready[0].clone();
+    let step_state = match wf_state.get_step(&step_name) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+
+    // Load work item content for prompt substitution.
+    let work_item_content = match find_work_item(&git_root, work_item).and_then(|p| {
+        std::fs::read_to_string(&p).map_err(|e| anyhow::anyhow!("{}", e))
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            app.active_tab_mut().push_output(format!("Cannot read work item: {}", e));
+            return;
+        }
+    };
+
+    let prompt = workflow::substitute_prompt(&step_state.prompt_template, work_item, &work_item_content);
+
+    // Send prompt to the existing PTY, followed by a newline (acts as Enter).
+    let bytes = format!("{}\n", prompt).into_bytes();
+    if let Some(ref pty) = app.active_tab().pty {
+        pty.write_bytes(&bytes);
+    }
+
+    // Update step status and current step tracking.
+    if let Some(ref mut wf) = app.active_tab_mut().workflow {
+        wf.set_status(&step_name, StepStatus::Running);
+    }
+    app.active_tab_mut().workflow_current_step = Some(step_name.clone());
+
+    // Persist state.
+    if let (Some(wf), Some(gr)) = (app.active_tab().workflow.clone(), app.active_tab().workflow_git_root.clone()) {
+        let _ = workflow::save_workflow_state(&gr, &wf);
+    }
+
+    // Maximize the container window so the user sees the PTY output.
+    app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+
+    app.active_tab_mut().push_output(format!("--- Workflow step: {} (reusing container) ---", step_name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::state::{App, Dialog, ExecutionPhase};
+    use crate::workflow::{StepStatus, WorkflowState, WorkflowStepState};
+
+    fn new_app() -> App {
+        App::new(std::path::PathBuf::new())
+    }
+
+    fn make_step_state(name: &str, deps: &[&str], status: StepStatus) -> WorkflowStepState {
+        WorkflowStepState {
+            name: name.to_string(),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            prompt_template: format!("do {}", name),
+            status,
+            container_id: None,
+        }
+    }
+
+    fn make_workflow(steps: Vec<WorkflowStepState>) -> WorkflowState {
+        WorkflowState {
+            title: None,
+            steps,
+            workflow_hash: "hash".to_string(),
+            work_item: 1,
+            workflow_name: "test-wf".to_string(),
+        }
+    }
+
+    // ─── cancel_to_previous_step ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_to_previous_step_on_first_step_sets_error_dialog() {
+        let mut app = new_app();
+        // Single step — no predecessor exists.
+        let wf = make_workflow(vec![make_step_state("plan", &[], StepStatus::Running)]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+
+        cancel_to_previous_step(&mut app).await;
+
+        // Step should revert to Running (no predecessor to go back to).
+        assert_eq!(
+            app.active_tab().workflow.as_ref().unwrap().get_step("plan").unwrap().status,
+            StepStatus::Running,
+            "First step should revert to Running when no predecessor exists"
+        );
+        // Dialog should open with an error message.
+        match &app.active_tab().dialog {
+            Dialog::WorkflowControlBoard { current_step, error } => {
+                assert_eq!(current_step, "plan");
+                assert!(error.is_some(), "Error message should be set");
+                assert!(
+                    error.as_ref().unwrap().contains("No previous step"),
+                    "Error should mention no previous step: {:?}", error
+                );
+            }
+            other => panic!("Expected WorkflowControlBoard with error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_to_previous_step_linear_marks_predecessor_pending() {
+        let mut app = new_app();
+        // Linear: plan (Done) → impl (Running)
+        let wf = make_workflow(vec![
+            make_step_state("plan", &[], StepStatus::Done),
+            make_step_state("impl", &["plan"], StepStatus::Running),
+        ]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("impl".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        // No git root → launch_next_workflow_step returns early without spawning Docker.
+        app.active_tab_mut().workflow_git_root = None;
+
+        cancel_to_previous_step(&mut app).await;
+
+        let wf = app.active_tab().workflow.as_ref().unwrap();
+        assert_eq!(
+            wf.get_step("impl").unwrap().status,
+            StepStatus::Pending,
+            "Current step (impl) should be Pending after cancel"
+        );
+        assert_eq!(
+            wf.get_step("plan").unwrap().status,
+            StepStatus::Pending,
+            "Predecessor (plan) should revert to Pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_to_previous_step_parallel_picks_last_done_step() {
+        let mut app = new_app();
+        // plan (Done) → branch-a (Done), branch-b (Done) → merge (Running)
+        let wf = make_workflow(vec![
+            make_step_state("plan", &[], StepStatus::Done),
+            make_step_state("branch-a", &["plan"], StepStatus::Done),
+            make_step_state("branch-b", &["plan"], StepStatus::Done),
+            make_step_state("merge", &["branch-a", "branch-b"], StepStatus::Running),
+        ]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("merge".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().workflow_git_root = None;
+
+        cancel_to_previous_step(&mut app).await;
+
+        let wf = app.active_tab().workflow.as_ref().unwrap();
+        assert_eq!(
+            wf.get_step("merge").unwrap().status,
+            StepStatus::Pending,
+            "merge should be Pending after cancel"
+        );
+        // The most recent Done step in Vec order (branch-b) should be reverted.
+        assert_eq!(
+            wf.get_step("branch-b").unwrap().status,
+            StepStatus::Pending,
+            "branch-b (last Done step) should revert to Pending"
+        );
+        // Earlier Done steps should remain Done.
+        assert_eq!(
+            wf.get_step("plan").unwrap().status,
+            StepStatus::Done,
+            "plan should remain Done"
+        );
+        assert_eq!(
+            wf.get_step("branch-a").unwrap().status,
+            StepStatus::Done,
+            "branch-a should remain Done"
+        );
+    }
+
+    // ─── advance_workflow_next_current_container ────────────────────────────────
+
+    #[tokio::test]
+    async fn advance_next_current_container_falls_back_when_pty_is_none() {
+        let mut app = new_app();
+        let wf = make_workflow(vec![
+            make_step_state("plan", &[], StepStatus::Running),
+            make_step_state("impl", &["plan"], StepStatus::Pending),
+        ]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        // pty = None (default) — triggers the PTY-unavailable fallback path.
+        // No git root → launch_next_workflow_step returns early.
+
+        advance_workflow_next_current_container(&mut app).await;
+
+        assert!(
+            app.active_tab().output_lines.iter().any(|l| l.contains("PTY session ended")),
+            "Expected PTY fallback message in output. Got: {:?}",
+            app.active_tab().output_lines
+        );
+        // The fallback calls advance_workflow_next_new_container, which marks current step Done.
+        assert_eq!(
+            app.active_tab().workflow.as_ref().unwrap().get_step("plan").unwrap().status,
+            StepStatus::Done,
+            "Current step should be marked Done even when falling back"
+        );
+    }
+
+    // ─── advance_workflow_next_new_container boundary ───────────────────────────
+
+    #[tokio::test]
+    async fn advance_next_new_container_final_step_transitions_to_complete() {
+        let mut app = new_app();
+        // Single-step workflow — completing it makes all_done() true.
+        let wf = make_workflow(vec![make_step_state("plan", &[], StepStatus::Running)]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        // Use a real temp dir so save_workflow_state succeeds and all_done() is evaluated.
+        let tmp = tempfile::tempdir().unwrap();
+        app.active_tab_mut().workflow_git_root = Some(tmp.path().to_path_buf());
+
+        advance_workflow_next_new_container(&mut app).await;
+
+        assert!(
+            app.active_tab().workflow_current_step.is_none(),
+            "workflow_current_step should be cleared after the final step completes"
+        );
+        assert!(
+            app.active_tab().output_lines.iter().any(|l| l.contains("All steps done")),
+            "Expected completion message in output. Got: {:?}",
+            app.active_tab().output_lines
+        );
+    }
+
+    // ─── advance_workflow_next_new_container: state file persisted ──────────────
+
+    #[tokio::test]
+    async fn advance_next_new_container_persists_state_before_launch() {
+        let mut app = new_app();
+        let wf = make_workflow(vec![
+            make_step_state("plan", &[], StepStatus::Running),
+            make_step_state("impl", &["plan"], StepStatus::Pending),
+        ]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        let tmp = tempfile::tempdir().unwrap();
+        app.active_tab_mut().workflow_git_root = Some(tmp.path().to_path_buf());
+
+        advance_workflow_next_new_container(&mut app).await;
+
+        // plan is Done and state file exists (impl is Pending, so not all_done).
+        let state_path = crate::workflow::workflow_state_path(tmp.path(), 1, "test-wf");
+        assert!(state_path.exists(), "State file should be written before any launch attempt");
+        let saved = std::fs::read_to_string(&state_path).unwrap();
+        assert!(saved.contains("Done") || saved.contains("done"), "State file should record plan as Done");
+    }
+
+    // ─── WorkflowRestartStep action dispatch ───────────────────────────────────
+
+    #[tokio::test]
+    async fn workflow_restart_step_resets_step_to_pending() {
+        let mut app = new_app();
+        let wf = make_workflow(vec![make_step_state("plan", &[], StepStatus::Running)]);
+        app.active_tab_mut().workflow = Some(wf);
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        // No git root — launch returns early without Docker.
+
+        // WorkflowRestartStep calls retry_workflow_step which resets to Pending.
+        retry_workflow_step(&mut app).await;
+
+        assert_eq!(
+            app.active_tab().workflow.as_ref().unwrap().get_step("plan").unwrap().status,
+            StepStatus::Pending,
+            "Restart should reset step to Pending"
+        );
+    }
 }

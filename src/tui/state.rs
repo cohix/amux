@@ -106,6 +106,13 @@ pub enum Dialog {
         /// Error message.
         error: String,
     },
+    /// Workflow control board: opened with Ctrl+W during a running workflow.
+    WorkflowControlBoard {
+        /// Name of the currently running step.
+        current_step: String,
+        /// Optional error message (e.g. "No previous step to return to").
+        error: Option<String>,
+    },
 }
 
 /// Tracks which command is waiting for dialog answers (mount scope, auth).

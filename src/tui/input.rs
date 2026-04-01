@@ -56,6 +56,14 @@ pub enum Action {
     WorkflowAbort,
     /// Workflow: retry the failed step.
     WorkflowRetry,
+    /// Workflow control board: restart the current step.
+    WorkflowRestartStep,
+    /// Workflow control board: cancel current step and return to previous step.
+    WorkflowCancelToPrevious,
+    /// Workflow control board: mark current step done, start next step in a new container.
+    WorkflowNextInNewContainer,
+    /// Workflow control board: mark current step done, send next step prompt to the existing PTY.
+    WorkflowNextInCurrentContainer,
 }
 
 /// Dispatch a key press to the correct handler based on application state.
@@ -117,6 +125,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         Dialog::WorkflowStepError { failed_step, error } => {
             return handle_workflow_step_error(app.active_tab_mut(), key, failed_step, error)
         }
+        Dialog::WorkflowControlBoard { .. } => {
+            return handle_workflow_control_board(app.active_tab_mut(), key)
+        }
         Dialog::None => {}
     }
 
@@ -126,6 +137,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             KeyCode::Char('t') => return Action::CreateTab,
             KeyCode::Char('a') => return Action::SwitchTabLeft,
             KeyCode::Char('d') => return Action::SwitchTabRight,
+            KeyCode::Char('w') => {
+                let tab = app.active_tab();
+                // Guard: only open when workflow is running, not maximized, no other dialog.
+                if tab.dialog == Dialog::None
+                    && tab.workflow.is_some()
+                    && tab.workflow_current_step.is_some()
+                    && matches!(tab.phase, ExecutionPhase::Running { .. })
+                    && tab.container_window != ContainerWindowState::Maximized
+                {
+                    let step = tab.workflow_current_step.clone().unwrap();
+                    app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+                        current_step: step,
+                        error: None,
+                    };
+                }
+                return Action::None;
+            }
             _ => {}
         }
     }
@@ -904,6 +932,32 @@ fn handle_workflow_step_error(
     }
 }
 
+fn handle_workflow_control_board(tab: &mut TabState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Up => {
+            tab.dialog = Dialog::None;
+            Action::WorkflowRestartStep
+        }
+        KeyCode::Left => {
+            tab.dialog = Dialog::None;
+            Action::WorkflowCancelToPrevious
+        }
+        KeyCode::Right => {
+            tab.dialog = Dialog::None;
+            Action::WorkflowNextInNewContainer
+        }
+        KeyCode::Down => {
+            tab.dialog = Dialog::None;
+            Action::WorkflowNextInCurrentContainer
+        }
+        KeyCode::Esc => {
+            tab.dialog = Dialog::None;
+            Action::None
+        }
+        _ => Action::None, // dialog stays open
+    }
+}
+
 // --- Autocomplete ---
 
 const SUBCOMMANDS: &[&str] = &["init", "ready", "implement", "chat", "specs", "claws", "status"];
@@ -1340,5 +1394,170 @@ mod tests {
             "specs  should show amend suggestion: {:?}",
             suggestions
         );
+    }
+
+    // ─── Workflow control board: dialog state transitions ────────────────────────
+
+    fn make_test_workflow_state() -> crate::workflow::WorkflowState {
+        crate::workflow::WorkflowState::new(
+            None,
+            vec![crate::workflow::parser::WorkflowStep {
+                name: "step-one".to_string(),
+                depends_on: vec![],
+                prompt_template: "do step one".to_string(),
+            }],
+            "hash".to_string(),
+            1,
+            "test-wf".to_string(),
+        )
+    }
+
+    fn setup_running_workflow_app() -> App {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
+        app.active_tab_mut().workflow = Some(make_test_workflow_state());
+        app.active_tab_mut().workflow_current_step = Some("step-one".to_string());
+        app
+    }
+
+    #[test]
+    fn workflow_control_board_up_returns_restart_and_clears_dialog() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::WorkflowRestartStep));
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn workflow_control_board_left_returns_cancel_and_clears_dialog() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::WorkflowCancelToPrevious));
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn workflow_control_board_right_returns_next_new_container_and_clears_dialog() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::WorkflowNextInNewContainer));
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn workflow_control_board_down_returns_next_current_container_and_clears_dialog() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::WorkflowNextInCurrentContainer));
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn workflow_control_board_esc_returns_none_and_clears_dialog() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+        assert!(matches!(action, Action::None));
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn workflow_control_board_non_arrow_key_leaves_dialog_open() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        handle_key(&mut app, key);
+        assert!(
+            matches!(app.active_tab().dialog, Dialog::WorkflowControlBoard { .. }),
+            "Dialog should remain open for non-arrow keys"
+        );
+    }
+
+    // ─── Ctrl+W guard conditions ─────────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_w_opens_workflow_control_board_when_all_guards_pass() {
+        let mut app = setup_running_workflow_app();
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
+        match &app.active_tab().dialog {
+            Dialog::WorkflowControlBoard { current_step, error } => {
+                assert_eq!(current_step, "step-one");
+                assert_eq!(*error, None);
+            }
+            other => panic!("Expected WorkflowControlBoard dialog, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ctrl_w_does_not_open_dialog_when_workflow_is_none() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        // workflow is None (default)
+        app.active_tab_mut().workflow_current_step = Some("step-one".to_string());
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn ctrl_w_does_not_open_dialog_when_current_step_is_none() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().workflow = Some(make_test_workflow_state());
+        // workflow_current_step is None (default)
+        app.active_tab_mut().container_window = ContainerWindowState::Minimized;
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn ctrl_w_does_not_open_dialog_when_container_is_maximized() {
+        let mut app = setup_running_workflow_app();
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn ctrl_w_does_not_open_dialog_when_another_dialog_is_active() {
+        let mut app = setup_running_workflow_app();
+        app.active_tab_mut().dialog = Dialog::QuitConfirm;
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
+        // Dialog should remain QuitConfirm, not become WorkflowControlBoard.
+        assert_eq!(app.active_tab().dialog, Dialog::QuitConfirm);
     }
 }

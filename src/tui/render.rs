@@ -528,11 +528,19 @@ fn build_stats_title(tab: &TabState) -> String {
 fn draw_status_bar(frame: &mut Frame, tab: &TabState, area: Rect) {
     let spans: Vec<Span> = match (&tab.phase, &tab.focus, &tab.container_window) {
         // Container maximized + window focused: Esc to minimize, scroll for history.
+        // When a workflow step is running, add a hint to use Ctrl+w after minimizing.
         (ExecutionPhase::Running { .. }, Focus::ExecutionWindow, ContainerWindowState::Maximized) => {
-            vec![Span::styled(
-                " Esc minimize  ·  scroll ↕ history ",
-                Style::default().fg(Color::Yellow),
-            )]
+            if tab.workflow.is_some() && tab.workflow_current_step.is_some() {
+                vec![Span::styled(
+                    " Esc minimize  ·  then ctrl-w for workflow controls ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )]
+            } else {
+                vec![Span::styled(
+                    " Esc minimize  ·  scroll ↕ history ",
+                    Style::default().fg(Color::Yellow),
+                )]
+            }
         }
 
         // Container minimized + window focused: hints for scrolling + c to restore.
@@ -551,11 +559,20 @@ fn draw_status_bar(frame: &mut Frame, tab: &TabState, area: Rect) {
             )]
         }
 
-        // Running + command box: ↑ to focus the window.
-        (ExecutionPhase::Running { .. }, Focus::CommandBox, _) => vec![Span::styled(
-            " Press ↑ to focus the window ",
-            Style::default().fg(Color::DarkGray),
-        )],
+        // Running + command box: ↑ to focus the window; ctrl-w hint when workflow is running.
+        (ExecutionPhase::Running { .. }, Focus::CommandBox, _) => {
+            if tab.workflow.is_some() && tab.workflow_current_step.is_some() {
+                vec![Span::styled(
+                    " Press ctrl-w for workflow controls ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )]
+            } else {
+                vec![Span::styled(
+                    " Press ↑ to focus the window ",
+                    Style::default().fg(Color::DarkGray),
+                )]
+            }
+        }
 
         // Done + window selected: Esc to deselect; ↑/↓ to scroll; b/e to jump.
         (ExecutionPhase::Done { .. }, Focus::ExecutionWindow, _) => vec![Span::styled(
@@ -690,6 +707,10 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
         draw_interview_summary_dialog(frame, kind, title, *work_item_number, summary, *cursor_pos, area);
         return;
     }
+    if let Dialog::WorkflowControlBoard { current_step, error } = &tab.dialog {
+        draw_workflow_control_board(frame, area, current_step, error.as_deref());
+        return;
+    }
 
     let (title, body) = match &tab.dialog {
         Dialog::CloseTabConfirm => (
@@ -812,6 +833,10 @@ or n or 2 (or Esc) to cancel.  ".to_string(),
         Dialog::None => return,
         // NewInterviewSummary is handled by the early return above — this arm is unreachable.
         Dialog::NewInterviewSummary { .. } => return,
+        Dialog::WorkflowControlBoard { .. } => {
+            // Handled by the special-case early return below — unreachable here.
+            return;
+        }
     };
 
     let popup_width = 72u16.min(area.width.saturating_sub(4));
@@ -981,6 +1006,82 @@ fn draw_interview_summary_dialog(
         Span::styled("Esc to cancel", Style::default().fg(Color::DarkGray)),
     ]));
     frame.render_widget(footer, footer_area);
+}
+
+fn draw_workflow_control_board(frame: &mut Frame, area: Rect, step_name: &str, error: Option<&str>) {
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
+    let popup_height = if error.is_some() { 13u16 } else { 11u16 }.min(area.height.saturating_sub(4));
+    let popup = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Workflow Control ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let arrow_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let label_style = Style::default();
+    let step_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let error_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(Color::DarkGray);
+
+    // Truncate step name if too long.
+    let max_step_len = popup_width.saturating_sub(10) as usize;
+    let step_display = if step_name.len() > max_step_len {
+        format!("{}…", &step_name[..max_step_len.saturating_sub(1)])
+    } else {
+        step_name.to_string()
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::raw(" Step: "),
+            Span::styled(step_display, step_style),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("         "),
+            Span::styled("↑", arrow_style),
+            Span::styled(" Restart current step", label_style),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("←", arrow_style),
+            Span::styled(" Cancel to prev", label_style),
+            Span::raw("   "),
+            Span::styled("→", arrow_style),
+            Span::styled(" Next: new container", label_style),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("         "),
+            Span::styled("↓", arrow_style),
+            Span::styled(" Next: same container", label_style),
+        ]),
+        Line::raw(""),
+    ];
+
+    if let Some(err) = error {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}", err),
+            error_style,
+        )]));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::from(vec![Span::styled(
+        " [Arrow] select  [Esc] dismiss",
+        hint_style,
+    )]));
+
+    let para = Paragraph::new(lines);
+    frame.render_widget(para, inner);
 }
 
 /// Return a centered rectangle of the given size within `area`.
@@ -1827,5 +1928,122 @@ mod tests {
             h_parallel,
             h
         );
+    }
+
+    // ─── Workflow control board dialog rendering ─────────────────────────────────
+
+    fn render_all_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for col in 0..width {
+                text.push_str(buf[(col, row)].symbol());
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn workflow_control_board_dialog_renders_diamond_labels() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().dialog = crate::tui::state::Dialog::WorkflowControlBoard {
+            current_step: "my-step".to_string(),
+            error: None,
+        };
+
+        let text = render_all_text(&mut app, 80, 30);
+
+        assert!(text.contains("Workflow Control"), "Popup title should appear");
+        assert!(text.contains("my-step"), "Step name should appear");
+        // Diamond: up arrow at top, down at bottom, left and right in the middle row.
+        assert!(text.contains('↑'), "Up arrow (Restart) should appear");
+        assert!(text.contains('↓'), "Down arrow (Next: same container) should appear");
+        assert!(text.contains('←'), "Left arrow (Cancel to prev) should appear");
+        assert!(text.contains('→'), "Right arrow (Next: new container) should appear");
+        assert!(text.contains("[Arrow] select"), "Hint line should appear");
+    }
+
+    #[test]
+    fn workflow_control_board_dialog_renders_error_message() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().dialog = crate::tui::state::Dialog::WorkflowControlBoard {
+            current_step: "first-step".to_string(),
+            error: Some("No previous step to return to".to_string()),
+        };
+
+        let text = render_all_text(&mut app, 80, 30);
+
+        assert!(
+            text.contains("No previous step to return to"),
+            "Error message should appear in dialog"
+        );
+    }
+
+    #[test]
+    fn workflow_control_board_dialog_no_error_omits_error_line() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().dialog = crate::tui::state::Dialog::WorkflowControlBoard {
+            current_step: "some-step".to_string(),
+            error: None,
+        };
+
+        let text = render_all_text(&mut app, 80, 30);
+
+        assert!(
+            !text.contains("No previous step"),
+            "Error text should not appear when error is None"
+        );
+        // But the dialog itself must still render.
+        assert!(text.contains("Workflow Control"), "Popup should still render without error");
+    }
+
+    #[test]
+    fn status_bar_shows_workflow_hint_when_maximized_and_workflow_running() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = crate::tui::state::Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+        // Workflow running — hint should mention ctrl-w.
+        app.active_tab_mut().workflow = Some(crate::workflow::WorkflowState::new(
+            None,
+            vec![crate::workflow::parser::WorkflowStep {
+                name: "plan".to_string(),
+                depends_on: vec![],
+                prompt_template: "do it".to_string(),
+            }],
+            "hash".to_string(),
+            1,
+            "wf".to_string(),
+        ));
+        app.active_tab_mut().workflow_current_step = Some("plan".to_string());
+
+        let text = render_all_text(&mut app, 80, 24);
+        assert!(
+            text.contains("ctrl-w"),
+            "Status bar should mention ctrl-w when maximized with running workflow. Got: {:?}",
+            &text[..text.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn status_bar_no_workflow_hint_when_maximized_without_workflow() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "run".into() };
+        app.active_tab_mut().focus = crate::tui::state::Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+        // No workflow.
+
+        let text = render_all_text(&mut app, 80, 24);
+        assert!(
+            !text.contains("ctrl-w"),
+            "Status bar should not mention ctrl-w when maximized without workflow"
+        );
+        assert!(text.contains("minimize"), "Minimize hint should still appear");
     }
 }

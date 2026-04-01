@@ -861,6 +861,7 @@ The yellow warning is automatically cleared as soon as you:
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+C** (in command box, multiple tabs) | Close the current tab |
+| **Ctrl+W** (workflow running, container minimized) | Open the [workflow control board](workflows.md#workflow-control-board-tui-only) |
 
 Tabs are independent — each has its own output, phase, and container state.
 Background tabs continue running even when not active.
