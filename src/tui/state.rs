@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Duration of container output inactivity before a tab is considered "stuck".
-pub const STUCK_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STUCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which widget currently receives keyboard input.
 #[derive(Debug, Clone, PartialEq)]
@@ -413,6 +413,10 @@ pub struct TabState {
     pub workflow_current_step: Option<String>,
     /// Git root path captured when the workflow was launched (needed for state persistence).
     pub workflow_git_root: Option<PathBuf>,
+    /// Set to `true` once the `WorkflowControlBoard` dialog has been auto-opened for the
+    /// current stuck episode, preventing it from re-opening on every subsequent tick.
+    /// Reset to `false` by `acknowledge_stuck()` and `finish_command()`.
+    pub workflow_stuck_dialog_opened: bool,
 
     // --- Worktree state (set when --worktree is active) ---
     /// The branch name created for this worktree session.
@@ -487,6 +491,7 @@ impl TabState {
             workflow: None,
             workflow_current_step: None,
             workflow_git_root: None,
+            workflow_stuck_dialog_opened: false,
             worktree_branch: None,
             worktree_active_path: None,
             worktree_git_root: None,
@@ -593,6 +598,7 @@ impl TabState {
 
         // Clear the stuck-detection timer; the container is no longer running.
         self.last_output_time = None;
+        self.workflow_stuck_dialog_opened = false;
 
         // Close the container window and generate a summary if applicable.
         if self.container_window != ContainerWindowState::Hidden {
@@ -767,10 +773,13 @@ impl TabState {
                 .unwrap_or(false)
     }
 
-    /// Reset the stuck timer to now.  Call this whenever the user interacts
-    /// with this tab (switching to it, typing, mouse scroll, etc.) so the
-    /// yellow warning colour is immediately cleared.
+    /// Reset the stuck timer to now and clear the auto-open flag.
+    /// Call this whenever the user interacts with this tab (switching to it,
+    /// typing, mouse scroll, etc.) so the yellow warning colour is immediately
+    /// cleared and any pending auto-open of the `WorkflowControlBoard` dialog
+    /// is deferred for another full `STUCK_TIMEOUT` window.
     pub fn acknowledge_stuck(&mut self) {
+        self.workflow_stuck_dialog_opened = false;
         if self.last_output_time.is_some() {
             self.last_output_time = Some(Instant::now());
         }
@@ -991,6 +1000,9 @@ pub struct App {
     /// Shared with any running `status --watch` background task so the table reflects
     /// current state on every refresh rather than the state at command-start time.
     pub tui_tabs_shared: Arc<Mutex<Vec<TuiTabInfo>>>,
+    /// Set to `true` after a TUI suspend/restore so the event loop calls
+    /// `terminal.clear()` before the next draw, forcing a full re-render.
+    pub needs_full_redraw: bool,
 }
 
 impl App {
@@ -1000,6 +1012,7 @@ impl App {
             active_tab_idx: 0,
             should_quit: false,
             tui_tabs_shared: Arc::new(Mutex::new(vec![])),
+            needs_full_redraw: false,
         }
     }
 
@@ -1038,6 +1051,28 @@ impl App {
         for tab in &mut self.tabs {
             tab.tick();
         }
+
+        // Auto-open WorkflowControlBoard on the active tab when it becomes stuck.
+        // Uses an index rather than the loop above to avoid a split-borrow conflict.
+        // Intentionally no `container_window != Maximized` guard here — unlike Ctrl+W,
+        // the auto-open must work even when the container is fullscreen.
+        let active = self.active_tab_idx;
+        if active < self.tabs.len() {
+            let tab = &mut self.tabs[active];
+            if tab.is_stuck()
+                && tab.workflow_current_step.is_some()
+                && tab.dialog == Dialog::None
+                && !tab.workflow_stuck_dialog_opened
+            {
+                let step = tab.workflow_current_step.clone().unwrap();
+                tab.dialog = Dialog::WorkflowControlBoard {
+                    current_step: step,
+                    error: None,
+                };
+                tab.workflow_stuck_dialog_opened = true;
+            }
+        }
+
         let snapshot: Vec<TuiTabInfo> = self.tabs.iter().enumerate()
             .map(|(i, tab)| TuiTabInfo {
                 tab_number: i + 1,
@@ -1621,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn is_stuck_true_when_container_silent_over_30s() {
+    fn is_stuck_true_when_container_silent_over_10s() {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
@@ -1635,8 +1670,8 @@ mod tests {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
-        // 29 seconds elapsed — just under the threshold.
-        tab.last_output_time = Some(Instant::now() - Duration::from_secs(29));
+        // 9 seconds elapsed — just under the 10s threshold.
+        tab.last_output_time = Some(Instant::now() - Duration::from_secs(9));
         assert!(!tab.is_stuck());
     }
 
@@ -1706,9 +1741,11 @@ mod tests {
     #[test]
     fn acknowledge_stuck_is_noop_when_no_container() {
         let mut tab = new_tab();
-        // last_output_time is None — acknowledge_stuck should not crash or change anything.
+        // last_output_time is None — the timer reset is skipped, but the
+        // auto-open flag is still cleared (it is always reset unconditionally).
         tab.acknowledge_stuck();
         assert!(tab.last_output_time.is_none());
+        assert!(!tab.workflow_stuck_dialog_opened);
     }
 
     #[test]
@@ -1740,5 +1777,159 @@ mod tests {
 
         tab.finish_command(0);
         assert!(!tab.is_stuck());
+    }
+
+    // --- Workflow auto-advance (0031) tests ---
+
+    fn new_app() -> App {
+        App::new(std::path::PathBuf::new())
+    }
+
+    /// Returns an App whose active tab is a running, stuck workflow tab.
+    /// `start_container` sets `container_window = Maximized`; adjust after calling
+    /// if a specific window state is needed.
+    fn setup_stuck_workflow_app() -> App {
+        let mut app = new_app();
+        let tab = app.active_tab_mut();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+        tab.workflow_current_step = Some("step-one".to_string());
+        // Wind the clock back so the tab is past the stuck threshold.
+        tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+        app
+    }
+
+    // --- Unit: threshold constant ---
+
+    #[test]
+    fn stuck_timeout_is_10s() {
+        assert_eq!(STUCK_TIMEOUT, Duration::from_secs(10));
+    }
+
+    // --- Unit: workflow_stuck_dialog_opened field ---
+
+    #[test]
+    fn workflow_stuck_dialog_opened_initialises_false() {
+        let tab = new_tab();
+        assert!(!tab.workflow_stuck_dialog_opened);
+    }
+
+    #[test]
+    fn finish_command_resets_workflow_stuck_dialog_opened() {
+        let mut tab = new_tab();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.workflow_stuck_dialog_opened = true;
+        tab.finish_command(0);
+        assert!(!tab.workflow_stuck_dialog_opened);
+    }
+
+    #[test]
+    fn acknowledge_stuck_resets_workflow_stuck_dialog_opened() {
+        let mut tab = new_tab();
+        tab.workflow_stuck_dialog_opened = true;
+        tab.acknowledge_stuck();
+        assert!(!tab.workflow_stuck_dialog_opened);
+    }
+
+    // --- Integration: tick_all auto-open logic ---
+
+    #[test]
+    fn tick_all_opens_dialog_for_active_stuck_workflow_tab() {
+        let mut app = setup_stuck_workflow_app();
+        app.tick_all();
+        match &app.active_tab().dialog {
+            Dialog::WorkflowControlBoard { current_step, error } => {
+                assert_eq!(current_step, "step-one");
+                assert_eq!(*error, None);
+            }
+            other => panic!("expected WorkflowControlBoard, got {:?}", other),
+        }
+        assert!(app.active_tab().workflow_stuck_dialog_opened);
+    }
+
+    #[test]
+    fn tick_all_does_not_reopen_dialog_if_flag_set() {
+        let mut app = setup_stuck_workflow_app();
+        // Simulate: dialog was already auto-opened once and then manually cleared.
+        app.active_tab_mut().workflow_stuck_dialog_opened = true;
+        app.active_tab_mut().dialog = Dialog::None;
+        app.tick_all();
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn tick_all_does_not_auto_open_for_background_stuck_workflow_tab() {
+        let mut app = new_app();
+        // Add a second tab and make it (index 1, inactive) a stuck workflow tab.
+        app.tabs.push(TabState::new(std::path::PathBuf::new()));
+        let tab1 = &mut app.tabs[1];
+        tab1.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab1.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+        tab1.workflow_current_step = Some("step-one".to_string());
+        tab1.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+        // active_tab_idx stays 0.
+        app.tick_all();
+        assert_eq!(app.tabs[1].dialog, Dialog::None);
+    }
+
+    #[test]
+    fn tick_all_does_not_auto_open_when_different_dialog_active() {
+        let mut app = setup_stuck_workflow_app();
+        app.active_tab_mut().dialog = Dialog::QuitConfirm;
+        app.tick_all();
+        assert_eq!(app.active_tab().dialog, Dialog::QuitConfirm);
+    }
+
+    #[test]
+    fn tick_all_does_not_auto_open_for_stuck_non_workflow_containers() {
+        let mut app = new_app();
+        let tab = app.active_tab_mut();
+        tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+        tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+        // workflow_current_step is None by default.
+        app.tick_all();
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    #[test]
+    fn tick_all_auto_opens_dialog_even_when_container_maximized() {
+        // setup_stuck_workflow_app already leaves container_window = Maximized
+        // (set by start_container), so no extra setup needed.
+        let mut app = setup_stuck_workflow_app();
+        assert_eq!(app.active_tab().container_window, ContainerWindowState::Maximized);
+        app.tick_all();
+        assert!(
+            matches!(app.active_tab().dialog, Dialog::WorkflowControlBoard { .. }),
+            "auto-open must not be suppressed by Maximized container window"
+        );
+    }
+
+    // --- End-to-end: deferred auto-open on tab switch ---
+
+    #[test]
+    fn switching_to_stuck_background_tab_triggers_dialog_on_next_tick() {
+        let mut app = new_app();
+        // Add a second tab and make it (index 1, inactive) a stuck workflow tab.
+        app.tabs.push(TabState::new(std::path::PathBuf::new()));
+        let tab1 = &mut app.tabs[1];
+        tab1.phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        tab1.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
+        tab1.workflow_current_step = Some("step-one".to_string());
+        tab1.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
+
+        // Confirm auto-open is deferred while tab 1 is not active.
+        app.tick_all();
+        assert_eq!(app.tabs[1].dialog, Dialog::None, "background tab must not auto-open");
+
+        // Simulate switching to tab 1 (set index directly to isolate tick_all logic).
+        app.active_tab_idx = 1;
+
+        // On the next tick, tab 1 is now active and stuck → dialog opens.
+        app.tick_all();
+        assert!(
+            matches!(app.active_tab().dialog, Dialog::WorkflowControlBoard { .. }),
+            "expected WorkflowControlBoard after switching to stuck background tab"
+        );
     }
 }

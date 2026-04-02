@@ -124,9 +124,9 @@ Tab colors show live state at a glance:
 | Green | Agent container active |
 | Purple | Claw session running |
 | Red | Exited with error |
-| Yellow | possible stuck agent |
+| Yellow | agent silent for >10 s (possible stuck) |
 
-A stuck tab (yellow, `⚠️` prefix) clears automatically when you switch to it or interact with it.
+A stuck tab (yellow, `⚠️` prefix) clears automatically when you switch to it or interact with it. For workflow tabs, the [workflow control board](workflows.md#auto-advance-when-stuck) opens automatically so you can take action without having to notice the indicator.
 
 A practical workflow: open one tab to `implement` a work item, open another to `chat` about a different part of the codebase, and monitor both from the tab bar without leaving the TUI.
 

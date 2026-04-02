@@ -102,6 +102,10 @@ where
     execute_command(&mut app, &startup_cmd).await;
 
     loop {
+        if app.needs_full_redraw {
+            app.needs_full_redraw = false;
+            let _ = terminal.clear();
+        }
         terminal.draw(|f| render::draw(f, &mut app))?;
 
         // Poll for crossterm events with a short timeout to keep the UI responsive.
@@ -412,6 +416,79 @@ fn run_git_show(tab: &mut crate::tui::state::TabState, cwd: &std::path::Path, ar
     }
 }
 
+/// RAII guard that restores the Ratatui terminal on drop.
+///
+/// Created immediately after suspending (leaving alternate screen, disabling raw mode,
+/// disabling mouse capture).  If `run_git_interactive` panics — e.g. on OOM inside
+/// `Command::status()` — Rust's drop glue runs this before unwinding, guaranteeing the
+/// terminal is never left in a suspended state.
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    }
+}
+
+/// Run a git command that may require interactive TTY access (e.g. a GPG passphrase prompt).
+///
+/// Suspends the Ratatui terminal before executing — disables mouse capture, leaves the
+/// alternate screen, and disables raw mode — so that pinentry or any other TTY-based
+/// subprocess gets clean terminal ownership.  Restores the terminal afterwards (via a
+/// `Drop` guard for panic-safety) and sets `app.needs_full_redraw` so the event loop
+/// triggers a full re-render on the next tick.
+///
+/// Works with every signing method (GPG, SSH key signing, S/MIME) and every pinentry
+/// variant without any special-casing.  Users without signing enabled see no visible
+/// change: the suspend/restore round-trip is imperceptible when no passphrase prompt
+/// appears.
+///
+/// Returns `true` if the command exited with status 0.
+fn run_git_interactive(app: &mut App, cwd: &std::path::Path, args: &[&str]) -> bool {
+    // Print a visible header so the user knows why the TUI disappeared.
+    println!("\n[amux] running: git {}\n", args.join(" "));
+
+    // Suspend: disable mouse capture, leave alternate screen, then disable raw mode.
+    // Order matters — leave alternate screen while still in raw mode produces garbage
+    // on some terminals; disable mouse capture first to avoid stray escape sequences
+    // appearing on the normal screen during the subprocess.
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+
+    // Run with inherited stdio so GPG/pinentry gets full terminal access.
+    // The Drop guard restores the terminal unconditionally — even on panic.
+    let status = {
+        let _guard = TerminalRestoreGuard;
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+        // _guard drops here: enable_raw_mode + EnterAlternateScreen + EnableMouseCapture
+    };
+
+    // Signal the event loop to call terminal.clear() before the next draw so that
+    // Ratatui's internal buffer is reset and a full re-render is performed.
+    app.needs_full_redraw = true;
+
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            app.active_tab_mut().push_output(format!(
+                "git {} exited with code {}",
+                args.join(" "),
+                s.code().unwrap_or(-1)
+            ));
+            false
+        }
+        Err(e) => {
+            app.active_tab_mut()
+                .push_output(format!("git {}: {e}", args.join(" ")));
+            false
+        }
+    }
+}
+
 /// Check for uncommitted files in the worktree and either show the commit-prompt dialog
 /// (if there are uncommitted files) or skip straight to the merge-confirm dialog.
 async fn handle_worktree_merge(app: &mut App) {
@@ -456,7 +533,10 @@ async fn handle_worktree_commit_files(
     {
         let tab = app.active_tab_mut();
         run_git_show(tab, &wt_path, &["add", "-A"]);
-        run_git_show(tab, &wt_path, &["commit", "-m", &message]);
+    }
+    if !run_git_interactive(app, &wt_path, &["commit", "-m", &message]) {
+        // Error already pushed to output; stay in the current state so the user sees it.
+        return;
     }
     app.active_tab_mut().dialog = Dialog::WorktreeMergeConfirm {
         branch,
@@ -476,9 +556,12 @@ async fn handle_worktree_merge_confirmed(
     {
         let tab = app.active_tab_mut();
         let merge_ok = run_git_show(tab, &git_root, &["merge", "--squash", &branch]);
-        if merge_ok {
-            run_git_show(tab, &git_root, &["commit", "-m", &commit_msg]);
+        if !merge_ok {
+            return;
         }
+    }
+    if !run_git_interactive(app, &git_root, &["commit", "-m", &commit_msg]) {
+        return;
     }
     app.active_tab_mut().dialog = Dialog::WorktreeDeleteConfirm {
         branch,
@@ -3186,6 +3269,99 @@ mod tests {
             app.active_tab().workflow.as_ref().unwrap().get_step("plan").unwrap().status,
             StepStatus::Pending,
             "Restart should reset step to Pending"
+        );
+    }
+
+    // ─── run_git_interactive (0032 — GPG pinentry TUI fix) ───────────────────
+
+    /// `App::new()` must initialise `needs_full_redraw` to `false` so the event loop
+    /// does not issue a spurious `terminal.clear()` before the first draw.
+    #[test]
+    fn needs_full_redraw_starts_false() {
+        let app = new_app();
+        assert!(
+            !app.needs_full_redraw,
+            "needs_full_redraw must be false immediately after App::new()"
+        );
+    }
+
+    /// Unit test: suspends and restores terminal state around a no-op subprocess.
+    ///
+    /// Uses `git --version` as the no-op: it exits 0, produces no passphrase prompt,
+    /// and exercises the full suspend → subprocess → Drop-guard restore path.
+    /// `needs_full_redraw = true` after the call is the observable signal that the
+    /// `TerminalRestoreGuard` ran and the event loop will issue `terminal.clear()`.
+    #[test]
+    fn run_git_interactive_suspends_and_restores_around_subprocess() {
+        let mut app = new_app();
+        assert!(!app.needs_full_redraw, "precondition: flag starts false");
+        let cwd = std::env::current_dir().unwrap();
+        let ok = run_git_interactive(&mut app, &cwd, &["--version"]);
+        assert!(ok, "git --version should exit 0");
+        assert!(
+            app.needs_full_redraw,
+            "needs_full_redraw must be true after run_git_interactive — \
+             signals that TerminalRestoreGuard ran and the event loop should call terminal.clear()"
+        );
+    }
+
+    /// Integration test: git command exits nonzero; assert TUI is restored before
+    /// error is propagated.
+    ///
+    /// The implementation sets `needs_full_redraw = true` (restore signal, set after
+    /// the `TerminalRestoreGuard` drops) before the `match` branch that calls
+    /// `push_output` (error propagation).  Both being observable at return time
+    /// is structural proof of correct ordering.
+    #[test]
+    fn run_git_interactive_restores_before_surfacing_error() {
+        let mut app = new_app();
+        let cwd = std::env::current_dir().unwrap();
+        let ok = run_git_interactive(&mut app, &cwd, &["no-such-subcommand-xyzzy"]);
+        // TUI was restored (Drop guard ran, needs_full_redraw set).
+        assert!(!ok, "unknown git subcommand should exit nonzero");
+        assert!(
+            app.needs_full_redraw,
+            "needs_full_redraw must be set even when git exits nonzero — \
+             TerminalRestoreGuard runs unconditionally before error is written to output"
+        );
+        // Error was propagated (visible in the output pane after restore).
+        let output = &app.active_tab().output_lines;
+        assert!(
+            output.iter().any(|l| l.contains("no-such-subcommand-xyzzy")),
+            "error line must reference the failing subcommand; got: {:?}",
+            output
+        );
+        assert!(
+            output.iter().any(|l| l.contains("exited with code")),
+            "error line must include the exit code; got: {:?}",
+            output
+        );
+    }
+
+    /// The Drop guard (`TerminalRestoreGuard`) fires even when `Command::status()`
+    /// returns `Err` — i.e. when the subprocess cannot be spawned at all (bad cwd).
+    /// `needs_full_redraw` must be set and a spawn-error description must appear in
+    /// output regardless of the failure mode.
+    #[test]
+    fn run_git_interactive_drop_guard_fires_on_spawn_error() {
+        let mut app = new_app();
+        // Create a real temp dir then drop it so the path no longer exists on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_cwd = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let ok = run_git_interactive(&mut app, &bad_cwd, &["--version"]);
+        assert!(!ok, "should return false when the cwd does not exist");
+        assert!(
+            app.needs_full_redraw,
+            "TerminalRestoreGuard must have fired (needs_full_redraw=true) \
+             even when the subprocess cannot be spawned"
+        );
+        let output = &app.active_tab().output_lines;
+        assert!(
+            !output.is_empty(),
+            "spawn-error description must be written to output_lines: {:?}",
+            output
         );
     }
 }

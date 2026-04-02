@@ -5,15 +5,11 @@ Prompt: Read work item {{work_item_number}} and produce a detailed implementatio
 
 ## Step: implement
 Depends-on: plan
-Prompt: Implement work item {{work_item_number}} according to the plan produced in the previous step. Iterate until the work item is comprehensively implemented, the build succeeds, and all existing tests pass. DO NOT write any new tests yet, just fix any you break. New tests will be implemented in the next step.
+Prompt: Implement work item {{work_item_number}} according to the plan produced in the previous step. Iterate until the work item is comprehensively implemented, the build succeeds, and all existing tests pass. DO NOT write any new tests yet, just fix any you break. New tests will be implemented in the next step. Do not write or change any docs yet, that will happen in a future step.
 
 Follow the plan you wrote and compare against the work item implementation spec:
 
 {{work_item_section:[Implementation Details]}}
-
-## Step: docs
-Depends-on: implement
-Prompt: Write comprehensive documentation for work item {{work_item_number}}, following the plan that was previously written and following guidelines from the project aspec.
 
 ## Step: tests
 Depends-on: implement
@@ -21,9 +17,15 @@ Prompt: Implement tests for work item {{work_item_number}} as described in the p
 
 {{work_item_section:[Test Considerations]}}
 
+
+## Step: docs
+Depends-on: implement
+Prompt: Write comprehensive documentation for work item {{work_item_number}}, following the plan that was previously written and following guidelines from the project aspec.
+
+
 ## Step: review
 Depends-on: docs,tests
-Prompt: Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Suggest improvements if needed. Ensure all edge cases are considered:
+Prompt: Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Suggest improvements if needed, but ask before changing anything. Ensure all edge cases are considered:
 
 {{work_item_section:[Edge Case Considerations]}}
 

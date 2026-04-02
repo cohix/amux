@@ -852,12 +852,17 @@ independent project context (working directory, command, container).
 | Green | Running with an active container |
 | Magenta/Purple | Running a claws session |
 | Red | Exited with an error |
-| **Yellow** | Container has been **silent for 60 seconds** (stuck warning) |
+| **Yellow** | Container has been **silent for 10 seconds** (stuck warning) |
 
 **Stuck tab detection** — if a running container produces no output for more
-than 60 seconds, the tab turns **yellow** and the subcommand label gains a
+than 10 seconds, the tab turns **yellow** and the subcommand label gains a
 **⚠️** prefix (e.g. `⚠️ implement 0001`). This alerts you that the container
 may be waiting for input or has stalled.
+
+For **workflow tabs**, amux goes a step further: the [workflow control board](workflows.md#auto-advance-when-stuck)
+opens automatically so you can restart, advance, or cancel the step without
+having to notice the yellow indicator and manually press Ctrl+W. The dialog
+is suppressed on background tabs and appears as soon as you switch to them.
 
 The yellow warning is automatically cleared as soon as you:
 - Switch to the yellow tab (**Ctrl+A** / **Ctrl+D**)
@@ -1155,6 +1160,40 @@ Merge failed with conflicts — resolve manually in /path/to/repo,
 then run: git branch -d amux/work-item-0030 && git worktree remove ~/.amux/worktrees/myrepo/0030
 ```
 
+### Commit signing (GPG, SSH, S/MIME)
+
+When you have Git commit signing enabled (`commit.gpgsign = true`,
+`gpg.format = ssh`, or `gpg.format = x509`), the `git commit` steps in the
+worktree merge flow require a passphrase prompt. To allow this to work cleanly,
+amux **suspends the TUI** around every `git commit` it runs, then restores it
+once the command returns.
+
+What you see when the TUI suspends:
+
+```
+[amux] running: git commit -m "Implement amux/work-item-0030"
+```
+
+At this point the terminal is in normal (non-TUI) mode. Your configured
+passphrase prompt — `pinentry-curses`, `pinentry-mac`, an SSH `ssh-askpass`,
+or whichever variant your system uses — appears and operates normally. After
+you enter your passphrase (or if no prompt is needed because the key is cached
+in the agent), the TUI is restored and rendering resumes.
+
+This affects two points in the worktree flow:
+
+| Step | What amux runs |
+|------|----------------|
+| **Commit uncommitted files** — the optional step before merge, when the agent left files unstaged | `git commit -m "<message>"` in the worktree directory |
+| **Squash-merge commit** — after `git merge --squash` succeeds on the main branch | `git commit -m "Implement <branch>"` in the Git root |
+
+If the `git commit` fails (e.g. wrong passphrase, cancelled prompt), the TUI
+is still restored and the error is shown in the execution window output. The
+merge flow stops at the failed step so you can retry from the dialog.
+
+Users without commit signing configured see no change — the suspend/restore
+round-trip is invisible when no passphrase prompt appears.
+
 ### Edge cases
 
 | Situation | Behaviour |
@@ -1165,6 +1204,8 @@ then run: git branch -d amux/work-item-0030 && git worktree remove ~/.amux/workt
 | Merge conflict | Error printed with manual resolution instructions; worktree kept |
 | Combined with `--workflow` | All workflow-step containers use the same worktree |
 | Combined with `--mount-ssh` | Both flags apply independently; SSH mount added alongside worktree mount |
+| GPG / SSH / S-MIME commit signing enabled | TUI suspends for each `git commit`, passphrase prompt works normally, TUI restores after |
+| Commit signing passphrase wrong or cancelled | TUI restored before error is shown; merge flow stops at the failed step |
 
 ### Worktree storage
 

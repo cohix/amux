@@ -1750,4 +1750,55 @@ mod tests {
         // Dialog should remain QuitConfirm, not become WorkflowControlBoard.
         assert_eq!(app.active_tab().dialog, Dialog::QuitConfirm);
     }
+
+    // ─── Auto-advance: input routing over maximized container ────────────────────
+
+    /// When a WorkflowControlBoard dialog is open over a maximized container window,
+    /// keystrokes must be dispatched to the dialog handler, not forwarded to the PTY.
+    /// handle_key dispatches dialogs before reaching handle_window_key, so this
+    /// property holds regardless of container_window state.
+    #[test]
+    fn keys_route_to_dialog_not_pty_when_dialog_open_over_maximized_container() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+
+        // Esc must not leak through to the PTY.
+        assert!(
+            !matches!(action, Action::ForwardToPty(_)),
+            "Esc should not be forwarded to the PTY when a dialog is open"
+        );
+        // The dialog handler consumed Esc and cleared the dialog.
+        assert_eq!(app.active_tab().dialog, Dialog::None);
+    }
+
+    /// Confirm the same holds for an arrow key (↑ = WorkflowRestartStep).
+    #[test]
+    fn arrow_key_routes_to_dialog_not_pty_when_dialog_open_over_maximized_container() {
+        let mut app = new_app();
+        app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
+        app.active_tab_mut().focus = Focus::ExecutionWindow;
+        app.active_tab_mut().container_window = ContainerWindowState::Maximized;
+        app.active_tab_mut().dialog = Dialog::WorkflowControlBoard {
+            current_step: "step-one".to_string(),
+            error: None,
+        };
+
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        let action = handle_key(&mut app, key);
+
+        assert!(
+            !matches!(action, Action::ForwardToPty(_)),
+            "Up arrow should not be forwarded to the PTY when a dialog is open"
+        );
+        assert!(matches!(action, Action::WorkflowRestartStep));
+    }
 }

@@ -118,7 +118,7 @@ A **workflow status strip** appears between the execution window and the command
 | Blue / bold | Running |
 | Green | Done |
 | Red / bold | Error |
-| Yellow / bold | Stuck (idle for >30 s) |
+| Yellow / bold | Stuck (idle for >10 s) |
 
 When a step completes, a confirmation dialog appears. Press `Enter` or `y` to advance, `q` or `Esc` to pause.
 
@@ -154,16 +154,33 @@ While a workflow step is **running**, press **Ctrl+W** (with the container windo
 
 Each action persists workflow state to disk before launching any new execution, so an unexpected exit mid-action leaves the state consistent.
 
-### When Ctrl+W is available
+### Auto-advance when stuck
 
-The control board opens only when **all** of the following are true:
+If a running workflow step produces no container output for **10 seconds**, amux considers it stuck and **automatically opens the workflow control board** so you can take action without having to notice the yellow indicator and manually press Ctrl+W.
+
+The auto-open fires only when all of the following are true:
+
+- The stuck tab is the **currently active tab** (background tabs are deferred)
+- A workflow step is currently running
+- No other dialog is already open
+- The control board has not already been auto-opened for this stuck episode
+
+The auto-open works even when the container window is **maximized** — the dialog appears over the full-screen terminal view and keyboard input is routed to the dialog rather than the PTY.
+
+**After you dismiss with Esc**, the stuck timer resets. If the container remains silent for another 10 seconds, the dialog re-opens. This prevents a rapid re-open loop while still keeping you informed.
+
+**Background tab deferral** — if a workflow step goes silent on a tab you are not currently viewing, the auto-open is suppressed. When you switch to that tab, the control board opens on the next tick (within ~100 ms) if the step is still stuck.
+
+### When Ctrl+W is available (manual)
+
+Press **Ctrl+W** to open the control board manually. This requires **all** of the following:
 
 - A workflow is active in the current tab
-- A step is currently running (`workflow_current_step` is set)
+- A step is currently running
 - The container window is **minimized** (not maximized / full-screen)
 - No other dialog is already open
 
-When a workflow is running and the container window is minimized, a hint appears below the execution window:
+Ctrl+W is deliberately blocked when the container window is maximized — the auto-open path handles that case instead. When a workflow is running and the container window is minimized, a hint appears below the execution window:
 
 ```
 Press Ctrl+w for workflow controls
@@ -198,8 +215,12 @@ PTY session ended — starting new container
 | **← Cancel** with parallel predecessors | Rolls back the most recently completed step (last `Done` step by file order) |
 | **→ / ↓ Next** when current step is the final step | Transitions to workflow-complete state; no new launch |
 | **↓ Next: same container** with closed PTY | Falls back to new container; shows status message |
-| Container window maximized | Ctrl+W is suppressed; hint guides you to minimize first |
-| Another dialog already open | Ctrl+W is suppressed until the open dialog is dismissed |
+| Container window maximized (manual Ctrl+W) | Ctrl+W is suppressed; hint guides you to minimize first |
+| Container window maximized (auto-open) | Dialog opens over the maximized terminal; input routes to the dialog |
+| Another dialog already open | Both Ctrl+W and auto-open are suppressed until the open dialog is dismissed |
+| Step goes silent on a background tab | Auto-open is deferred; control board appears when you switch to that tab |
+| Esc dismissed; container still silent | Timer resets; dialog re-opens after another 10 s of silence |
+| Output resumes before the 10 s threshold | Stuck state clears; auto-open does not trigger |
 
 ---
 
