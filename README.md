@@ -147,7 +147,7 @@ amux init                        # set up a project for amux
 amux ready [--refresh]           # verify environment; refresh and rebuild Dockerfile.dev
 amux specs new [--interview]     # create a work item; --interview has the agent fill it out
 amux specs amend <nnnn>          # update a spec to match what was actually built
-amux implement <nnnn> [--plan]   # launch an agent to implement a work item
+amux implement <nnnn> [--plan] [--workflow <path>] [--worktree] [--mount-ssh]  # launch an agent to implement a work item
 amux chat [--plan]               # start a freeform agent session
 amux status [--watch]            # live dashboard of all running agent containers
 amux claws ready                 # check/start the persistent nanoclaw container

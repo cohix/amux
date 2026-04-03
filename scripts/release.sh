@@ -21,6 +21,29 @@ ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
 warn() { echo -e "  ${YELLOW}!${NC} $*"; }
 die()  { echo -e "\n${RED}${BOLD}Error:${NC} $*" >&2; exit 1; }
 
+# Ask a yes/no question. Default answer is shown in caps.
+# Usage: ask_proceed "message" [y|n]  (default: n)
+# Returns 0 if user says yes, exits if no.
+ask_proceed() {
+  local msg="$1"
+  local default="${2:-n}"
+  local prompt
+  if [[ "$default" == "y" ]]; then
+    prompt="[Y/n]"
+  else
+    prompt="[y/N]"
+  fi
+  echo ""
+  read -r -p "  ${YELLOW}?${NC} $msg $prompt " REPLY < /dev/tty
+  REPLY="${REPLY:-$default}"
+  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    return 0
+  else
+    echo "  Aborting." >&2
+    exit 1
+  fi
+}
+
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 VERSION="${1:-}"
@@ -49,40 +72,49 @@ ok "gh: authenticated"
 # on main
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [ "$BRANCH" != "main" ]; then
-  die "Must be on 'main' branch, currently on '$BRANCH'"
+  warn "Currently on branch '$BRANCH', not 'main'."
+  ask_proceed "Proceed with release from '$BRANCH'?" n
+else
+  ok "Branch: main"
 fi
-ok "Branch: main"
 
 # up to date with origin
 git fetch origin main --quiet
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
 if [ "$LOCAL" != "$REMOTE" ]; then
-  die "Local main is behind origin/main. Run: git pull --ff-only"
+  warn "Local branch is not in sync with origin/main."
+  git status -sb | head -5
+  ask_proceed "Proceed anyway (you may be ahead, or behind)?" n
+else
+  ok "Up to date with origin/main"
 fi
-ok "Up to date with origin/main"
 
 # clean working tree — allow only files this script manages
-SCRIPT_FILES_PATTERN="Cargo\.\(toml\|lock\)\|docs/releases/"
-DIRTY=$(git status --porcelain | grep -v "^\(..\) \($SCRIPT_FILES_PATTERN\)" || true)
+MANAGED_FILES="Cargo.toml Cargo.lock docs/releases/"
+DIRTY=$(git status --porcelain | grep -v "^.. Cargo\.\(toml\|lock\)" | grep -v "^.. docs/releases/" || true)
 if [ -n "$DIRTY" ]; then
-  echo "$DIRTY"
-  die "Working tree has unexpected changes. Commit or stash them first."
+  warn "Working tree has unexpected changes:"
+  echo "$DIRTY" | sed 's/^/    /'
+  ask_proceed "Proceed anyway? (consider committing or stashing these first)" n
+else
+  ok "Working tree clean (or only release-managed files pending)"
 fi
-ok "Working tree clean (or only release-managed files pending)"
 
-# tag must not already exist on remote
+# tag on remote
 if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q "$VERSION"; then
-  die "Tag $VERSION already exists on origin. Choose a different version or delete the remote tag."
+  warn "Tag $VERSION already exists on origin."
+  ask_proceed "Proceed anyway? (GitHub release creation will be skipped if it exists)" y
+else
+  ok "Tag $VERSION not yet on remote"
 fi
-ok "Tag $VERSION not yet on remote"
 
 # tag may already exist locally from a prior interrupted run — that's OK
 if git tag -l "$VERSION" | grep -q "$VERSION"; then
   warn "Tag $VERSION already exists locally (prior run). Will push it."
 fi
 
-ok "All pre-checks passed"
+ok "Pre-checks done"
 
 # ── STEP 1: Version bump ──────────────────────────────────────────────────────
 
@@ -115,8 +147,7 @@ else
   ok "Bumped Cargo.toml: $CURRENT_CARGO_VERSION → $BARE_VERSION"
 fi
 
-# Verify the binary (once built) will report the right version.
-# We defer the actual build to the test step; here we just confirm Cargo.toml is correct.
+# Verify the version is correct in Cargo.toml.
 VERIFIED_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
 if [ "$VERIFIED_VERSION" != "$BARE_VERSION" ]; then
   die "Cargo.toml version is '$VERIFIED_VERSION' but expected '$BARE_VERSION'. Check the file manually."
@@ -147,7 +178,7 @@ if grep -qF "$TEMPLATE_MARKER" "$NOTES_FILE"; then
   echo ""
   echo "  Edit $NOTES_FILE with the release notes, then re-run this script."
   echo ""
-  read -r -p "  Launch 'amux chat' to write release notes now? [Y/n] " REPLY
+  read -r -p "  Launch 'amux chat' to write release notes now? [Y/n] " REPLY < /dev/tty
   REPLY="${REPLY:-Y}"
   if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     amux chat
@@ -202,7 +233,7 @@ else
     rm -f "$TEST_LOG"
 
     echo ""
-    read -r -p "  Launch 'amux chat' to fix the failing tests? [Y/n] " REPLY
+    read -r -p "  Launch 'amux chat' to fix the failing tests? [Y/n] " REPLY < /dev/tty
     REPLY="${REPLY:-Y}"
     if [[ "$REPLY" =~ ^[Yy]$ ]]; then
       amux chat
@@ -215,16 +246,17 @@ fi
 
 # ── STEP 4: Commit ────────────────────────────────────────────────────────────
 
-COMMIT_MSG="Add release notes for ${VERSION}"
-
 step "Commit"
 
-if git log --oneline --all | grep -qF "$COMMIT_MSG"; then
-  ok "Release notes already committed"
+# Check whether there are any release-related changes that need committing.
+PENDING=$(git status --porcelain -- Cargo.toml Cargo.lock "$NOTES_FILE" 2>/dev/null || true)
+
+if [ -z "$PENDING" ]; then
+  ok "Nothing to commit (release files already committed)"
 else
   git add "$NOTES_FILE" Cargo.toml Cargo.lock
-  git commit -m "$COMMIT_MSG"
-  ok "Committed: $COMMIT_MSG"
+  git commit -m "Add release notes for ${VERSION}"
+  ok "Committed: Add release notes for ${VERSION}"
 fi
 
 # ── STEP 5: Tag ───────────────────────────────────────────────────────────────
