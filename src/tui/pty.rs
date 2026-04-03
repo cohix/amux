@@ -3,6 +3,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
+use tracing::Instrument;
 
 /// Events emitted from the PTY reader thread to the TUI event loop.
 pub enum PtyEvent {
@@ -124,20 +125,25 @@ pub fn spawn_text_command<F, Fut>(
     F: FnOnce(crate::commands::output::OutputSink) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
-        let sink = crate::commands::output::OutputSink::Channel(output_tx);
-        let code = match f(sink).await {
-            Ok(()) => 0,
-            Err(e) => {
-                // The error message was not printed by the command — send it now.
-                // (The sink was consumed so we can't use it here; the error is
-                //  surfaced via the exit code and the TUI shows a generic message.)
-                eprintln!("command error: {}", e);
-                1
-            }
-        };
-        let _ = exit_tx.send(code);
-    });
+    let span = tracing::debug_span!("text_command_task");
+    tokio::spawn(
+        async move {
+            let sink = crate::commands::output::OutputSink::Channel(output_tx);
+            let code = match f(sink).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    // The error message was not printed by the command — send it now.
+                    // (The sink was consumed so we can't use it here; the error is
+                    //  surfaced via the exit code and the TUI shows a generic message.)
+                    eprintln!("command error: {}", e);
+                    1
+                }
+            };
+            tracing::debug!(exit_code = code, "text_command_task complete");
+            let _ = exit_tx.send(code);
+        }
+        .instrument(span),
+    );
 }
 
 #[cfg(test)]

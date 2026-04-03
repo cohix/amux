@@ -52,7 +52,14 @@
       "Read(//usr/local/share/**)",
       "Bash(grep -o '.\\\\{0,100\\\\}lspRecommendation.\\\\{0,100\\\\}')",
       "Bash(timeout:*)",
-      "Bash(grep -E \"\\(FAILED|ok$|test result\\)\" /root/.claude/projects/-workspace/484d09f3-428b-447e-a490-a66f1c889751/tool-results/bfy5or7eq.txt)"
+      "Bash(grep -E \"\\(FAILED|ok$|test result\\)\" /root/.claude/projects/-workspace/484d09f3-428b-447e-a490-a66f1c889751/tool-results/bfy5or7eq.txt)",
+      "Bash(GIT_DIR=/workspace/.git GIT_WORK_TREE=/workspace git log --oneline -3)",
+      "Bash(find /workspace -path *benches* -o -path *benchmark*)",
+      "Bash(grep -rn scrollback ~/.cargo/registry/src/*/vt100-*/src/screen.rs)",
+      "Bash(find ~/.cargo/registry -name *.rs -path */vt100*)",
+      "Bash(find /root/.cargo -name *.rs)",
+      "Bash(grep:*)",
+      "Bash(find /workspace/tests -name *.rs -type f)"
     ]
   }
 }

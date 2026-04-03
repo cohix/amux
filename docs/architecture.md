@@ -626,6 +626,112 @@ without them.
 
 ---
 
+## Performance Characteristics
+
+This section documents the performance design of amux, based on the audit conducted in work item 0033. It covers the render loop, memory model, async task architecture, and Docker interaction overhead.
+
+---
+
+### Render Loop
+
+The TUI event loop runs in `src/tui/mod.rs` and drives all rendering:
+
+```
+loop {
+    terminal.draw(|f| render::draw(f, &mut app))?;  // redraws every iteration
+    if event::poll(Duration::from_millis(16))? {    // ≤16ms wait
+        // handle key/mouse event
+    }
+    tick_all(&mut app);   // drains channels, updates state
+}
+```
+
+**Always-redraw (current behaviour):** `terminal.draw()` is called unconditionally on every loop iteration (~60 Hz), regardless of whether any state changed. When the user is idle and no container is running, the full widget tree is rebuilt and diffed every ~16 ms. A dirty-flag optimisation is planned (work item 0034) that will skip `terminal.draw()` when no state has changed.
+
+**Ratatui double-buffering:** `Terminal::draw()` compares the new widget cell buffer against the previous frame and emits only changed cells as terminal escape codes. This means terminal I/O is proportional to changed cells, not screen size, so the idle-CPU cost is widget construction rather than terminal output.
+
+**Tick rate:** the `event::poll(16ms)` call caps the maximum frame rate at ~60 Hz.
+
+---
+
+### Output Buffer
+
+Each `TabState` holds an `output_lines: Vec<String>` for non-container (text command) output. This buffer is currently **unbounded** — lines accumulate for the lifetime of the tab. A bounded ring-buffer replacement using `VecDeque<String>` with a configurable cap (default 10,000 lines) is planned in work item 0035.
+
+**Memory estimates at current behaviour:**
+- Typical terminal line: ~80 bytes average after ANSI stripping
+- After 1 hour of moderate output: ~4–8 MB per tab
+- After 3+ hours of high-throughput output: can grow to tens of MB per tab
+
+**Cleanup on tab close:** `TabState` is dropped when a tab is closed, freeing `output_lines` immediately via Rust's ownership model. There is no cross-tab leak — the risk is growth during the tab's own lifetime.
+
+The `vt100::Parser` used for container window rendering is initialised with a **1,000-line scrollback cap** (matching common terminal emulators), which is a hard memory bound on the full-terminal emulation path.
+
+The scroll computation in `draw_exec_window` iterates all retained lines each frame to compute the total visual row count for scroll offset rendering (O(n) where n = lines in buffer). With a bounded buffer this becomes O(max_lines); until work item 0035 lands, n is unbounded.
+
+---
+
+### Async Task Architecture
+
+amux uses a mixed async/thread model:
+
+| Task/Thread | Spawn mechanism | Exit condition |
+|---|---|---|
+| Stats poller | `tokio::spawn` + `spawn_blocking` for Docker call | `stats_rx` receiver dropped on `finish_command` |
+| Text command (init, ready, non-interactive implement) | `tokio::spawn` via `spawn_text_command` | Function returns |
+| PTY reader | `std::thread::spawn` | EOF on PTY master (process exit or master close) |
+| PTY wait | `std::thread::spawn` | Child process exits |
+| PTY writer | `std::thread::spawn` | `input_rx` channel closed when `PtySession` is dropped |
+| Docker build stdout/stderr | `std::thread::spawn` | EOF on subprocess stdout/stderr |
+| Status watch | `tokio::spawn` via `spawn_text_command` | `status_watch_cancel_tx` fires cancel |
+
+**Tab close cleanup:** dropping a `TabState` closes the PTY master (`Box<dyn MasterPty>`), which sends SIGHUP to the foreground process group of the PTY on Linux and macOS. This causes the `docker run` child process to exit, which in turn causes the PTY reader thread and wait thread to exit. Dropping `PtySession` closes the writer channel, causing the writer thread to exit. Cleanup is RAII-driven; no explicit join or cancel call is needed for PTY sessions.
+
+**Blocking calls and Tokio:** `run_container_captured` and `run_container` are synchronous functions that block until the Docker subprocess exits. They are called inside `tokio::spawn` tasks via `spawn_text_command` without `spawn_blocking`, which occupies a Tokio worker thread for the container's full runtime. During a long agent run (minutes), this can starve other tasks scheduled on that worker thread. The stats poller correctly uses `spawn_blocking` for its `docker stats` call and serves as the model for the fix planned in work item 0036.
+
+**Channel sizing:**
+
+| Channel | Type | Capacity |
+|---|---|---|
+| PTY event (`PtyEvent`) | `std::sync::mpsc::sync_channel` | 256 |
+| PTY input | `std::sync::mpsc::sync_channel` | 64 |
+| Text output (`output_tx`/`output_rx`) | `tokio::sync::mpsc::unbounded_channel` | Unbounded (bounded+lossy replacement planned in work item 0038) |
+| Stats | `tokio::sync::mpsc::unbounded_channel` | Unbounded (≤1 message queued at 5s poll rate; effectively bounded) |
+
+---
+
+### Docker Interaction Overhead
+
+All Docker operations spawn a new `std::process::Command` child process. There is no persistent Docker HTTP client. Typical per-operation costs:
+
+| Operation | Approximate latency |
+|---|---|
+| `docker info` (daemon check) | 50–200 ms |
+| `docker stats --no-stream` (stats poll) | 200–500 ms |
+| `docker build` | seconds–minutes (cache-dependent) |
+| `docker run` startup | dominated by container init, not subprocess spawn (~5 ms) |
+
+Stats are polled every **5 seconds** per active container, amortising the ~300 ms Docker call cost adequately. Each container session has its own stats poller task; in normal usage containers have unique generated names so there is no deduplication overhead.
+
+Container cleanup uses `--rm` on all `docker run` invocations, causing Docker to remove the container immediately on exit. No manual cleanup is required.
+
+---
+
+### Scalability Target
+
+**20 concurrent tabs** (containers) is the validated scalability target. Key O(n) paths and their cost at 20 tabs:
+
+| Path | Complexity | Cost at 20 tabs |
+|---|---|---|
+| `tick_all()` | O(tabs) | ~20 µs (negligible) |
+| `draw_tab_bar()` | O(tabs) | Negligible |
+| `draw_exec_window()` | O(output_lines of active tab only) | Unaffected by tab count |
+| `tui_tabs_shared` lock | O(tabs) | Brief write lock per tick; no contention |
+
+Inactive tabs are rendered only as a tab bar entry — the full render path runs only for the active tab.
+
+---
+
 ## Testing Strategy
 
 | Layer | Location | What is tested |

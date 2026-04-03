@@ -8,6 +8,7 @@ use ratatui::style::Color;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver;
+use tracing;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -511,6 +512,7 @@ impl TabState {
     }
 
     /// Clear output and reset state for a fresh command execution.
+    #[tracing::instrument(skip(self), fields(command = %command))]
     pub fn start_command(&mut self, command: String) {
         // Cancel any running status --watch loop so it doesn't overwrite the
         // new command's output.
@@ -531,6 +533,7 @@ impl TabState {
     ///
     /// `cols` and `rows` specify the inner dimensions of the container window
     /// (used to initialise the VT100 terminal emulator).
+    #[tracing::instrument(skip(self), fields(container_name = %container_name, cols, rows))]
     pub fn start_container(
         &mut self,
         container_name: String,
@@ -565,6 +568,7 @@ impl TabState {
     }
 
     /// Transition to Done or Error based on exit code; re-enable input.
+    #[tracing::instrument(skip(self), fields(exit_code))]
     pub fn finish_command(&mut self, exit_code: i32) {
         let command = match &self.phase {
             ExecutionPhase::Running { command } => command.clone(),
@@ -644,6 +648,7 @@ impl TabState {
     /// The method maintains `pty_line_buffer` (the current incomplete line) and
     /// a "live line" at the end of `output_lines` that is updated in-place until
     /// a `\n` finalises it.
+    #[tracing::instrument(skip(self, bytes), fields(bytes_len = bytes.len()))]
     pub fn process_pty_data(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
