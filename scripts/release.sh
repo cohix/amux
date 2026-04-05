@@ -233,13 +233,21 @@ else
     rm -f "$TEST_LOG"
 
     echo ""
-    read -r -p "  Launch 'amux chat' to fix the failing tests? [Y/n] " REPLY < /dev/tty
-    REPLY="${REPLY:-Y}"
+    read -r -p "  Skip tests and continue the release anyway? [y/N] " REPLY < /dev/tty
+    REPLY="${REPLY:-N}"
     if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-      amux chat
-      die "Re-run this script after verifying the tests pass."
+      warn "Skipping tests at user request — proceeding with release."
+      touch "$TESTS_SENTINEL"
     else
-      die "Fix the tests and re-run this script."
+      echo ""
+      read -r -p "  Launch 'amux chat' to fix the failing tests? [Y/n] " REPLY < /dev/tty
+      REPLY="${REPLY:-Y}"
+      if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        amux chat
+        die "Re-run this script after verifying the tests pass."
+      else
+        die "Fix the tests and re-run this script."
+      fi
     fi
   fi
 fi

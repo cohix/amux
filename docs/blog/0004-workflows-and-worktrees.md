@@ -1,11 +1,11 @@
 # amux 0.4: Workflows and worktrees
 
-Running multiple agents in parallel is great, but I wanted to be able to encode my preferred workflow into my agents and make it repeatable and tweakable over time so I can more closely guide how work gets done without needing to always reply 'No, do this instead' to an Agent's plan.
+Running multiple agents in parallel has been pretty addicting as I've been working on `amux`, but I wanted to force them to follow my preferred workflow. I wanted to make it repeatable and tweakable over time so I can more closely guide how agents get work done without needing to always reply 'No, do this instead' to an Agent's plan.
 
 ---
 
 ```sh
-# amux is a terminal multiplexer; run parallel containerized code and claw agents.
+# amux is an agent multiplexer for your terminal; run parallel containerized code and claw agents.
 curl -s https://prettysmart.dev/install/amux.sh | sh
 ```
 
