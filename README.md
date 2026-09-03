@@ -17,7 +17,7 @@
 1. Isolate your code agents with containers and worktrees 🛑
 2. Run multiple agents in parallel with the TUI 🔄
 3. Turn your team's development lifecycle into repeatable workflows 📈
-4. Automate the rest — schedule recurring work with squad, fan out to your homelab or cluster with API mode 🤝
+4. Automate the rest — build a squad of agents to tackle recurring work, fan out to your homelab or cluster with API mode 🤝
 
 ![awman workflows](./docs/blog/images/tui-workflow.png)
 
@@ -167,9 +167,9 @@ Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`
 
 Don't want to write the file at all? `awman exec workflow --dynamic --work-item 0027` puts a leader agent in a container, has it design a workflow for that work item, validates the result, and runs it. See [Dynamic Workflows](docs/06-dynamic-workflows.md).
 
-### Automate recurring work with squad
+### Create a squad to automate your work
 
-Workflows still need you to start them. **squad** is a background daemon that watches for the conditions you describe and runs a workflow when one fires — "when a new issue is opened, triage it and post a plan", "if any open PR has failing tests, fix them".
+Workflows still need you to start them. Your **squad** is a group of agents that work on your behalf while you're doing something else. You give the squad tasks — "when a new issue is opened, triage it and post a plan", "if any open PR has failing tests, fix them" — and it watches for each one and runs a workflow when it fires.
 
 ```sh
 awman squad start --background
@@ -178,9 +178,9 @@ awman squad add --name issue-triage \
   --interval 30m --overlay "env(GITHUB_TOKEN)"
 ```
 
-On each interval an evaluation agent decides whether the condition is actually met. If it is, squad designs and runs a workflow for it unattended. Each task gets a durable workspace that persists across runs, so state carries between them.
+On each interval one of your squad's agents decides whether the condition is actually met. If it is, the squad designs and runs a workflow for it unattended. Each task gets a durable workspace that persists across runs, so state carries between them.
 
-Run `awman squad` for a TUI tab showing every task as a card with its last and next run — press **Enter** for details, **a** to attach to a live run. See [squad](docs/12-squad.md).
+Run `awman squad` for a TUI tab showing every task your squad is on as a card with its last and next run — press **Enter** for details, **t** to have the squad tackle a task right now, **a** to attach to a live run. See [squad](docs/12-squad.md).
 
 ### Hand off completely (yolo mode)
 
@@ -261,9 +261,10 @@ awman specs amend <nnnn>               # update a spec to match what was built
 awman status [--watch]                 # dashboard of all running agent containers
 awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
 awman config show                      # view all config values
-awman squad                            # open the squad TUI tab
-awman squad start [--background]       # start the squad daemon
-awman squad add --name <name> --description <text> [--interval <dur>]   # create a scheduled task
+awman squad                            # open your squad's TUI tab
+awman squad start [--background]       # put your squad on duty (starts the squad daemon)
+awman squad add --name <name> --description <text> [--interval <dur>]   # create a new task for your squad to tackle
+awman squad trigger <name>             # have your squad tackle a task now, ignoring its schedule
 awman squad list | show <name> | pause <name> | resume <name> | remove <name>
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
 awman api status | kill                # check or stop the API server

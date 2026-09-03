@@ -17,7 +17,7 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{
     DialogRequest, DialogResponse, WorkflowControlBoardState, WorkflowStepErrorState,
 };
-use crate::frontend::tui::tabs::ContainerSlotEvent;
+use crate::frontend::tui::tabs::{ContainerSlotEvent, WorkflowStepKind};
 
 impl WorkflowFrontend for TuiCommandFrontend {
     fn show_workflow_control_board(
@@ -211,26 +211,42 @@ impl WorkflowFrontend for TuiCommandFrontend {
         if let Ok(mut guard) = self.workflow_view.lock() {
             let view =
                 guard.get_or_insert_with(crate::frontend::tui::tabs::WorkflowViewState::default);
-            view.steps = steps
+            let main_steps = steps.iter().map(|s| {
+                // Only surface agent/model on the strip when the step itself
+                // declares one — otherwise it inherits the project defaults
+                // and gets no label (WI: workflow-strip agent/model labels).
+                let (agent, model) = if s.has_step_override {
+                    (Some(s.agent.clone()), s.model.clone())
+                } else {
+                    (None, None)
+                };
+                crate::frontend::tui::tabs::WorkflowStepView {
+                    name: s.name.clone(),
+                    status: workflow_status_str(&s.status).to_string(),
+                    agent,
+                    model,
+                    depends_on: s.depends_on.clone(),
+                    kind: crate::frontend::tui::tabs::WorkflowStepKind::Agent,
+                }
+            });
+            // This callback only knows about the main phase, so replacing
+            // `view.steps` wholesale would wipe out any setup/teardown
+            // pseudo-steps `on_setup_step_*`/`on_teardown_step_*` already
+            // tracked there — splice the new main steps back between them.
+            use crate::frontend::tui::tabs::WorkflowStepKind;
+            let setup: Vec<_> = view
+                .steps
                 .iter()
-                .map(|s| {
-                    // Only surface agent/model on the strip when the step itself
-                    // declares one — otherwise it inherits the project defaults
-                    // and gets no label (WI: workflow-strip agent/model labels).
-                    let (agent, model) = if s.has_step_override {
-                        (Some(s.agent.clone()), s.model.clone())
-                    } else {
-                        (None, None)
-                    };
-                    crate::frontend::tui::tabs::WorkflowStepView {
-                        name: s.name.clone(),
-                        status: workflow_status_str(&s.status).to_string(),
-                        agent,
-                        model,
-                        depends_on: s.depends_on.clone(),
-                    }
-                })
+                .filter(|s| s.kind == WorkflowStepKind::Setup)
+                .cloned()
                 .collect();
+            let teardown: Vec<_> = view
+                .steps
+                .iter()
+                .filter(|s| s.kind == WorkflowStepKind::Teardown)
+                .cloned()
+                .collect();
+            view.steps = setup.into_iter().chain(main_steps).chain(teardown).collect();
             view.current_step = steps
                 .iter()
                 .find(|s| matches!(s.status, WorkflowStepStatus::Running))
@@ -327,6 +343,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_setup_step_started(&mut self, description: &str) {
         self.messages.info(format!("setup: {description}"));
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "running");
     }
 
     fn on_setup_step_output(&mut self, line: &str) {
@@ -335,6 +352,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_setup_step_completed(&mut self, description: &str) {
         self.messages.success(format!("setup: {description}"));
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "done");
     }
 
     fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -344,10 +362,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
             format!("setup failed: {description} (exit {exit_code}): {stderr}")
         };
         self.messages.error_msg(msg);
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "error");
     }
 
     fn on_teardown_step_started(&mut self, description: &str) {
         self.messages.info(format!("teardown: {description}"));
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "running");
     }
 
     fn on_teardown_step_output(&mut self, line: &str) {
@@ -356,6 +376,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_teardown_step_completed(&mut self, description: &str) {
         self.messages.success(format!("teardown: {description}"));
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "done");
     }
 
     fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -365,6 +386,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
             format!("teardown failed: {description} (exit {exit_code}): {stderr}")
         };
         self.messages.error_msg(msg);
+        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "error");
     }
 
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
@@ -516,6 +538,61 @@ fn workflow_status_str(status: &WorkflowStepStatus) -> &'static str {
         WorkflowStepStatus::Failed { .. } => "error",
         WorkflowStepStatus::Cancelled => "cancelled",
         WorkflowStepStatus::Skipped => "skipped",
+    }
+}
+
+/// Insert or update a setup/teardown pseudo-step in the live Workflow
+/// Overview, so a locally-attached run shows the same `[setup]`/`[teardown]`
+/// column a squad/remote run gets from `workflow_state_to_view_state` — the
+/// engine's `on_*_step_*` hooks (unlike `report_workflow_progress`) carry
+/// only a description, not the full ordered plan, so entries appear as they
+/// start rather than as `pending` ahead of time.
+///
+/// The hooks carry no stable id, so a step in flight is found by matching
+/// `(kind, description)`; setup/teardown steps run strictly sequentially, so
+/// the most recent match (searched from the end) is always the current one.
+/// A new setup entry is inserted after any earlier setup entries, ahead of
+/// the main/teardown steps already tracked; a new teardown entry is appended,
+/// since teardown can only start once every main step is done.
+fn upsert_phase_step(
+    workflow_view: &crate::frontend::tui::tabs::SharedWorkflowViewState,
+    kind: WorkflowStepKind,
+    description: &str,
+    status: &str,
+) {
+    use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+
+    let Ok(mut guard) = workflow_view.lock() else {
+        return;
+    };
+    let view = guard.get_or_insert_with(WorkflowViewState::default);
+    if let Some(existing) = view
+        .steps
+        .iter_mut()
+        .rev()
+        .find(|s| s.kind == kind && s.name == description)
+    {
+        existing.status = status.to_string();
+        return;
+    }
+    let step = WorkflowStepView {
+        name: description.to_string(),
+        status: status.to_string(),
+        agent: None,
+        model: None,
+        depends_on: Vec::new(),
+        kind,
+    };
+    match kind {
+        WorkflowStepKind::Setup => {
+            let pos = view
+                .steps
+                .iter()
+                .position(|s| s.kind != WorkflowStepKind::Setup)
+                .unwrap_or(view.steps.len());
+            view.steps.insert(pos, step);
+        }
+        WorkflowStepKind::Teardown | WorkflowStepKind::Agent => view.steps.push(step),
     }
 }
 
@@ -1152,5 +1229,64 @@ mod tests {
         // TUI event loop to swap to.
         assert!(frontend.stdin_tx_shared.lock().unwrap().is_some());
         assert!(frontend.resize_tx_shared.lock().unwrap().is_some());
+    }
+
+    // ── setup/teardown steps in the Workflow Overview (local execution) ──────
+
+    #[test]
+    fn setup_and_teardown_steps_land_around_the_main_steps_in_the_workflow_view() {
+        use crate::engine::workflow::actions::{WorkflowStepProgressInfo, WorkflowStepStatus};
+        use crate::frontend::tui::tabs::WorkflowStepKind;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+
+        frontend.on_setup_step_started("clone repo");
+        frontend.on_setup_step_completed("clone repo");
+
+        frontend.report_workflow_progress(&[WorkflowStepProgressInfo {
+            name: "build".into(),
+            agent: "claude".into(),
+            model: None,
+            has_step_override: false,
+            status: WorkflowStepStatus::Running,
+            depends_on: vec![],
+            max_concurrent: None,
+        }]);
+
+        frontend.on_teardown_step_started("clean up");
+
+        let guard = frontend.workflow_view.lock().unwrap();
+        let view = guard.as_ref().expect("workflow view must be seeded");
+        let steps: Vec<(WorkflowStepKind, &str, &str)> = view
+            .steps
+            .iter()
+            .map(|s| (s.kind, s.name.as_str(), s.status.as_str()))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (WorkflowStepKind::Setup, "clone repo", "done"),
+                (WorkflowStepKind::Agent, "build", "running"),
+                (WorkflowStepKind::Teardown, "clean up", "running"),
+            ],
+            "setup must stay ahead of the main steps and teardown behind them, \
+             surviving report_workflow_progress's replace of the main-step list"
+        );
+    }
+
+    #[test]
+    fn a_failed_setup_step_is_reflected_in_the_workflow_view() {
+        use crate::frontend::tui::tabs::WorkflowStepKind;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+
+        frontend.on_setup_step_started("install deps");
+        frontend.on_setup_step_failed("install deps", 1, "boom");
+
+        let guard = frontend.workflow_view.lock().unwrap();
+        let view = guard.as_ref().expect("workflow view must be seeded");
+        assert_eq!(view.steps.len(), 1, "the started step is updated in place, not duplicated");
+        assert_eq!(view.steps[0].kind, WorkflowStepKind::Setup);
+        assert_eq!(view.steps[0].status, "error");
     }
 }

@@ -48,7 +48,7 @@ use crate::command::commands::squad::daemon::{
     SquadLogsFlags, SquadStartFlags, SquadStatusFlags, SquadStopFlags,
 };
 use crate::command::commands::squad::gateway::{
-    CreateTask, SharedTaskGateway, TaskGateway, DEFAULT_WORKSPACE_FLAG_VALUE,
+    CreateTask, SharedTaskGateway, TaskGateway, UpdateTask, DEFAULT_WORKSPACE_FLAG_VALUE,
 };
 use crate::command::commands::status::{StatusCommand, StatusCommandFlags, StatusCommandFrontend};
 use crate::command::commands::Command;
@@ -733,6 +733,12 @@ impl<F: CommandFrontend> Dispatch<F> {
                             // Raw specs only; syntax is validated once, in the
                             // gateway, before anything is persisted.
                             overlays: self.frontend.flag_strings(&canonical_refs, "overlay")?,
+                            agents_to_models: parse_squad_agent_models(
+                                &canonical_refs,
+                                &self
+                                    .frontend
+                                    .flag_strings(&canonical_refs, "agent-models")?,
+                            )?,
                         }),
                     }
                 };
@@ -742,7 +748,87 @@ impl<F: CommandFrontend> Dispatch<F> {
                     self.engines.clone(),
                 )))
             }
-            ["squad", action @ ("list" | "show" | "remove" | "pause" | "resume")] => {
+            ["squad", "edit"] => {
+                let gateway = self
+                    .squad_gateway
+                    .clone()
+                    .map(|gateway| Box::new(SharedTaskGateway(gateway)) as Box<dyn TaskGateway>);
+                let name = self
+                    .frontend
+                    .argument(&canonical_refs, "name")?
+                    .ok_or_else(|| {
+                        CommandError::missing_required_argument(&canonical_refs, "name")
+                    })?;
+                let interview = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "interview")?
+                    .unwrap_or(false);
+                // In interview mode Layer 2 collects the fields through the
+                // frontend, prefilled from the task as it stands, so nothing is
+                // assembled here.
+                let update = if interview {
+                    UpdateTask::default()
+                } else {
+                    let interval = self.frontend.flag_string(&canonical_refs, "interval")?;
+                    let clear_flag = |flag: &str| -> Result<bool, CommandError> {
+                        Ok(self
+                            .frontend
+                            .flag_bool(&canonical_refs, flag)?
+                            .unwrap_or(false))
+                    };
+                    // A `--clear-*` flag and its value flag conflict in the
+                    // catalogue, so at most one of each pair is present and
+                    // "clear" and "set" can never disagree here.
+                    let agent = match self.frontend.flag_string(&canonical_refs, "agent")? {
+                        Some(agent) => Some(Some(agent)),
+                        None if clear_flag("clear-agent")? => Some(None),
+                        None => None,
+                    };
+                    let model = match self.frontend.flag_string(&canonical_refs, "model")? {
+                        Some(model) => Some(Some(model)),
+                        None if clear_flag("clear-model")? => Some(None),
+                        None => None,
+                    };
+                    let overlay_specs = self.frontend.flag_strings(&canonical_refs, "overlay")?;
+                    let overlays = if !overlay_specs.is_empty() {
+                        Some(overlay_specs)
+                    } else if clear_flag("clear-overlays")? {
+                        Some(Vec::new())
+                    } else {
+                        None
+                    };
+                    let pool_specs = self
+                        .frontend
+                        .flag_strings(&canonical_refs, "agent-models")?;
+                    let agents_to_models = if !pool_specs.is_empty() {
+                        Some(parse_squad_agent_models(&canonical_refs, &pool_specs)?)
+                    } else if clear_flag("clear-agent-models")? {
+                        Some(Default::default())
+                    } else {
+                        None
+                    };
+                    UpdateTask {
+                        description: self.frontend.flag_string(&canonical_refs, "description")?,
+                        interval_secs: interval
+                            .map(|raw| parse_squad_interval(&canonical_refs, &raw))
+                            .transpose()?,
+                        agent,
+                        model,
+                        overlays,
+                        agents_to_models,
+                    }
+                };
+                Ok(BuiltCommand::Squad(SquadCommand::new(
+                    SquadSubcommand::Edit {
+                        name,
+                        interview,
+                        update,
+                    },
+                    gateway,
+                    self.engines.clone(),
+                )))
+            }
+            ["squad", action @ ("list" | "show" | "remove" | "pause" | "resume" | "trigger")] => {
                 let gateway = self
                     .squad_gateway
                     .clone()
@@ -776,6 +862,13 @@ impl<F: CommandFrontend> Dispatch<F> {
                             })?,
                     ),
                     "resume" => SquadSubcommand::Resume(
+                        self.frontend
+                            .argument(&canonical_refs, "name")?
+                            .ok_or_else(|| {
+                                CommandError::missing_required_argument(&canonical_refs, "name")
+                            })?,
+                    ),
+                    "trigger" => SquadSubcommand::Trigger(
                         self.frontend
                             .argument(&canonical_refs, "name")?
                             .ok_or_else(|| {
@@ -1145,6 +1238,22 @@ pub(crate) fn parse_squad_interval(command: &[&str], raw: &str) -> Result<u64, C
             flag: "interval".into(),
             reason: "expected seconds or a duration such as 5m".into(),
         })
+}
+
+/// Parse `--agent-models` specs at the dispatch boundary, so Layer 2 only ever
+/// sees the assembled map (WI 0110). The parse itself lives with the gateway
+/// types beside the formatter that reverses it.
+pub(crate) fn parse_squad_agent_models(
+    command: &[&str],
+    specs: &[String],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, CommandError> {
+    crate::command::commands::squad::gateway::parse_agent_models_specs(specs).map_err(|reason| {
+        CommandError::InvalidFlagValue {
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            flag: "agent-models".into(),
+            reason,
+        }
+    })
 }
 
 /// Convert the catalogue-validated launch-mode enum into the Layer 0 type.

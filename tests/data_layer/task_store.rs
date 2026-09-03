@@ -2,7 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use awman::command::commands::squad::gateway::{CreateTask, LocalTaskGateway, TaskGateway};
+use awman::command::commands::squad::gateway::{
+    CreateTask, LocalTaskGateway, TaskGateway, UpdateTask,
+};
 use awman::command::dispatch::Engines;
 use awman::data::fs::{
     AuthPathResolver, DataPaths, MountScope, RunDetail, RunStatus, Task, TaskStatus, TaskStore,
@@ -33,6 +35,7 @@ fn task(name: &str, now: chrono::DateTime<Utc>) -> Task {
         created_at: now - Duration::hours(1),
         updated_at: now - Duration::hours(1),
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -104,6 +107,7 @@ fn squad_schema_and_workspace_overlay_fields_round_trip() {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     };
     store.create(&stored).unwrap();
@@ -162,6 +166,7 @@ async fn malformed_task_overlay_is_rejected_before_store_or_workspace_write() {
         agent: None,
         model: None,
         overlays: vec!["not-an-overlay".into()],
+        agents_to_models: Default::default(),
     };
 
     let error = gateway.create(request).await.unwrap_err();
@@ -233,6 +238,104 @@ fn due_for_evaluation_applies_pause_backoff_interval_and_running_filters() {
     );
 }
 
+/// `squad trigger` overrides the two rules that are about *when* a task is
+/// due — the interval and the backoff — and neither of the two that are about
+/// whether it may run at all.
+#[test]
+fn a_trigger_request_overrides_the_interval_and_backoff_but_not_pause_or_a_running_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DataPaths::at_root(tmp.path().join("data")).db_path();
+    let store = TaskStore::open(&db).unwrap();
+    store.migrate().unwrap();
+    let now = Utc::now();
+
+    let not_elapsed = Task {
+        interval_secs: 3600,
+        last_run_at: Some(now - Duration::seconds(10)),
+        ..task("not-elapsed", now)
+    };
+    let backed_off = Task {
+        interval_secs: 3600,
+        last_run_at: Some(now - Duration::seconds(10)),
+        backoff_until: Some(now + Duration::minutes(30)),
+        ..task("backed-off", now)
+    };
+    let paused = Task {
+        interval_secs: 3600,
+        last_run_at: Some(now - Duration::seconds(10)),
+        status: TaskStatus::Paused,
+        ..task("paused", now)
+    };
+    let running = Task {
+        interval_secs: 3600,
+        last_run_at: Some(now - Duration::seconds(10)),
+        ..task("running", now)
+    };
+    for item in [
+        not_elapsed.clone(),
+        backed_off.clone(),
+        paused.clone(),
+        running.clone(),
+    ] {
+        store.create(&item).unwrap();
+    }
+    store.start_run(&running.id, None, now).unwrap();
+
+    assert!(
+        store.due_for_evaluation(now).unwrap().is_empty(),
+        "none of these tasks is due on its own schedule"
+    );
+
+    for name in ["not-elapsed", "backed-off", "paused", "running"] {
+        assert!(store.request_trigger(name, now).unwrap(), "{name} exists");
+    }
+    assert!(
+        !store.request_trigger("no-such-task", now).unwrap(),
+        "triggering a task that does not exist reports so rather than succeeding"
+    );
+
+    let due: std::collections::BTreeSet<_> = store
+        .due_for_evaluation(now)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.name)
+        .collect();
+    assert_eq!(
+        due,
+        ["not-elapsed", "backed-off"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "a trigger beats the interval and the backoff; it does not un-pause a \
+         task or start a second concurrent run"
+    );
+
+    // The trigger is recorded on the task so a frontend can show that it is
+    // pending, and cleared the moment the run it asked for opens — so the next
+    // tick selects the task on its schedule again, not a second time.
+    let task = store.get("not-elapsed").unwrap().unwrap();
+    assert!(task.trigger_requested_at.is_some());
+    assert_eq!(
+        task.backoff_until, None,
+        "an explicit trigger clears the backoff it overrides"
+    );
+
+    store.start_run(&not_elapsed.id, None, now).unwrap();
+    let task = store.get("not-elapsed").unwrap().unwrap();
+    assert_eq!(
+        task.trigger_requested_at, None,
+        "opening the run honours the trigger and consumes it"
+    );
+    assert!(
+        store
+            .due_for_evaluation(now + Duration::seconds(1))
+            .unwrap()
+            .iter()
+            .all(|item| item.name != "not-elapsed"),
+        "a consumed trigger must not re-fire on the following tick"
+    );
+}
+
 #[tokio::test]
 async fn task_store_crud_is_exercised_through_daemon_gateway() {
     let tmp = tempfile::tempdir().unwrap();
@@ -256,6 +359,7 @@ async fn task_store_crud_is_exercised_through_daemon_gateway() {
         agent: None,
         model: None,
         overlays: Vec::new(),
+        agents_to_models: Default::default(),
     };
 
     let created = gateway.create(request()).await.unwrap();
@@ -395,6 +499,7 @@ async fn a_custom_workspace_below_a_repository_root_is_a_plain_directory_and_nev
             agent: None,
             model: None,
             overlays: Vec::new(),
+            agents_to_models: Default::default(),
         })
         .await
         .unwrap();
@@ -416,6 +521,7 @@ async fn a_custom_workspace_below_a_repository_root_is_a_plain_directory_and_nev
             agent: None,
             model: None,
             overlays: Vec::new(),
+            agents_to_models: Default::default(),
         })
         .await
         .unwrap();
@@ -443,4 +549,444 @@ fn init_test_repo(path: &std::path::Path) {
         .status()
         .expect("git must run");
     assert!(status.success(), "git init must succeed");
+}
+
+/// WI 0110 regression: `squad_runs.task_id` references `squad_tasks(id)`, so a
+/// delete that only touched `squad_tasks` failed with `FOREIGN KEY constraint
+/// failed` the moment a task had been evaluated even once — which is why
+/// deleting a task from the TUI appeared to do nothing. The store removes a
+/// task's runs with the task, and leaves every other task's runs alone.
+#[test]
+fn deleting_a_task_that_has_run_history_removes_the_task_and_its_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DataPaths::at_root(tmp.path().join("data")).db_path();
+    let store = TaskStore::open(&db).unwrap();
+    store.migrate().unwrap();
+    let now = Utc::now();
+
+    let doomed = task("doomed", now);
+    let keeper = task("keeper", now);
+    store.create(&doomed).unwrap();
+    store.create(&keeper).unwrap();
+
+    // A finished run and a still-open one: both reference the task row.
+    let finished = store.start_run(&doomed.id, None, now).unwrap();
+    store
+        .finish_run(&finished, RunStatus::Failed, &RunDetail::default(), now)
+        .unwrap();
+    store.start_run(&doomed.id, None, now).unwrap();
+    store.start_run(&keeper.id, None, now).unwrap();
+
+    assert!(
+        store.delete("doomed").unwrap(),
+        "deleting a task with run history must succeed, not fail the FK check"
+    );
+    assert!(store.get("doomed").unwrap().is_none());
+    assert!(store.runs_for("doomed", 10).unwrap().is_empty());
+
+    assert!(store.get("keeper").unwrap().is_some());
+    assert_eq!(
+        store.runs_for("keeper", 10).unwrap().len(),
+        1,
+        "another task's run history must be untouched"
+    );
+
+    assert!(
+        !store.delete("doomed").unwrap(),
+        "a second delete reports that there was nothing to remove"
+    );
+}
+
+// ─── WI 0110: editing a task, and its own config.json ───────────────────────
+
+/// Build a gateway plus its squad paths, sharing one temp root.
+fn edit_fixture(
+    tmp: &tempfile::TempDir,
+) -> (
+    Arc<TaskStore>,
+    LocalTaskGateway,
+    awman::data::fs::SquadPaths,
+) {
+    let db = DataPaths::at_root(tmp.path().join("data")).db_path();
+    let store = Arc::new(TaskStore::open(&db).unwrap());
+    store.migrate().unwrap();
+    let paths = awman::data::fs::SquadPaths::from_root(tmp.path().join("squad"));
+    let gateway = LocalTaskGateway::new(
+        store.clone(),
+        test_engines(tmp.path()),
+        Arc::new(Mutex::new(SchedulerStatus::default())),
+        paths.clone(),
+    );
+    (store, gateway, paths)
+}
+
+fn editable_task(name: &str) -> CreateTask {
+    CreateTask {
+        name: name.into(),
+        description: "when something happens, do something".into(),
+        workspace: TaskWorkspace::Default,
+        mount_scope: MountScope::Directory,
+        interval_secs: 6 * 60 * 60,
+        agent: Some("claude".into()),
+        model: Some("claude-opus-4-8".into()),
+        overlays: vec!["env(GITHUB_TOKEN)".into()],
+        agents_to_models: Default::default(),
+    }
+}
+
+/// An edit changes only the fields it carries, and leaves the capture-once
+/// workspace identity alone — there is no way to express a change to it.
+#[tokio::test]
+async fn an_edit_changes_only_the_fields_it_carries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    let created = gateway.create(editable_task("editable")).await.unwrap();
+
+    let updated = gateway
+        .update(
+            "editable",
+            UpdateTask {
+                description: Some("a new description".into()),
+                interval_secs: Some(600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.description, "a new description");
+    assert_eq!(updated.interval_secs, 600);
+    assert_eq!(
+        updated.agent.as_deref(),
+        Some("claude"),
+        "a field the edit did not mention keeps its value"
+    );
+    assert_eq!(updated.overlays, created.overlays);
+    assert_eq!(updated.repo_scope, created.repo_scope);
+    assert_eq!(updated.mount_scope, created.mount_scope);
+    assert_eq!(updated.created_at, created.created_at);
+    assert!(updated.updated_at >= created.updated_at);
+}
+
+/// `Some(None)` is the "clear this back to the squad default" answer, and must
+/// be distinguishable from "not mentioned".
+#[tokio::test]
+async fn clearing_the_agent_and_model_is_distinct_from_leaving_them_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    gateway.create(editable_task("clearable")).await.unwrap();
+
+    let untouched = gateway
+        .update(
+            "clearable",
+            UpdateTask {
+                description: Some("still has an agent".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(untouched.agent.as_deref(), Some("claude"));
+
+    let cleared = gateway
+        .update(
+            "clearable",
+            UpdateTask {
+                agent: Some(None),
+                model: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.agent, None);
+    assert_eq!(cleared.model, None);
+}
+
+/// Overlays are replace-or-keep: a `Some` list replaces the stored one whole,
+/// and an empty `Some` clears it. The rules creation enforces still apply.
+#[tokio::test]
+async fn overlays_are_replaced_wholesale_and_still_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    gateway.create(editable_task("overlaid")).await.unwrap();
+
+    let replaced = gateway
+        .update(
+            "overlaid",
+            UpdateTask {
+                overlays: Some(vec!["env(A)".into(), "env(B)".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replaced.overlays,
+        vec!["env(A)".to_string(), "env(B)".to_string()]
+    );
+
+    let cleared = gateway
+        .update(
+            "overlaid",
+            UpdateTask {
+                overlays: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(cleared.overlays.is_empty());
+
+    let error = gateway
+        .update(
+            "overlaid",
+            UpdateTask {
+                overlays: Some(vec!["not-an-overlay".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("overlay"), "{error}");
+}
+
+/// An edit must not be able to install an interval `squad add` would refuse.
+#[tokio::test]
+async fn an_edited_interval_is_held_to_the_creation_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    gateway.create(editable_task("bounded")).await.unwrap();
+
+    for interval in [30u64, 200_000] {
+        let error = gateway
+            .update(
+                "bounded",
+                UpdateTask {
+                    interval_secs: Some(interval),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("task interval must be between"),
+            "{interval}s should be refused: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn editing_an_unknown_task_reports_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    let error = gateway
+        .update(
+            "never-created",
+            UpdateTask {
+                description: Some("x".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("was not found"), "{error}");
+}
+
+/// The task's agent pool is written to its own `config.json`, in the same
+/// document shape as the global config, and an empty pool removes the file
+/// rather than writing an empty block.
+#[tokio::test]
+async fn the_task_agent_pool_round_trips_through_its_own_config_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, paths) = edit_fixture(&tmp);
+
+    let mut pool = std::collections::BTreeMap::new();
+    pool.insert(
+        "claude".to_string(),
+        vec![
+            "claude-opus-4-8".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ],
+    );
+    gateway
+        .create(CreateTask {
+            agents_to_models: pool.clone(),
+            ..editable_task("pooled")
+        })
+        .await
+        .unwrap();
+
+    let config_path = paths.task_config_file("pooled").unwrap();
+    let document = awman::data::config::global::GlobalConfig::load_path(&config_path).unwrap();
+    let squad = document
+        .squad
+        .expect("the task config carries a squad block");
+    assert_eq!(
+        squad
+            .agents_to_models
+            .as_ref()
+            .unwrap()
+            .get("claude")
+            .unwrap(),
+        &vec![
+            "claude-opus-4-8".to_string(),
+            "claude-sonnet-4-6".to_string()
+        ]
+    );
+
+    // Emptying the pool removes the file, so the task goes back to inheriting
+    // the global block cleanly rather than carrying an empty override.
+    gateway
+        .update(
+            "pooled",
+            UpdateTask {
+                agents_to_models: Some(Default::default()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !config_path.exists(),
+        "an emptied pool removes the task config instead of writing an empty block"
+    );
+}
+
+/// The scheduler's per-tick read: the task block wins field-by-field over the
+/// global one, and a task with no file inherits the global block whole.
+#[tokio::test]
+async fn a_task_config_layers_over_the_global_squad_block() {
+    use awman::data::config::global::task_squad_config;
+    use awman::data::config::repo::SquadConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, paths) = edit_fixture(&tmp);
+    let global = SquadConfig {
+        agents_to_models: Some(std::collections::HashMap::from([(
+            "claude".to_string(),
+            vec!["claude-opus-4-8".to_string()],
+        )])),
+        default_leader: Some("claude::claude-opus-4-8".to_string()),
+        guidance: Some(vec!["Keep changes focused.".to_string()]),
+        max_concurrent_evaluations: Some(3),
+    };
+
+    gateway.create(editable_task("inheritor")).await.unwrap();
+    assert_eq!(
+        task_squad_config(&paths, "inheritor", &global).unwrap(),
+        global,
+        "a task with no config.json inherits the global block whole"
+    );
+
+    let mut pool = std::collections::BTreeMap::new();
+    pool.insert("codex".to_string(), vec!["gpt-5".to_string()]);
+    gateway
+        .create(CreateTask {
+            agents_to_models: pool,
+            ..editable_task("overrider")
+        })
+        .await
+        .unwrap();
+
+    let effective = task_squad_config(&paths, "overrider", &global).unwrap();
+    assert_eq!(
+        effective
+            .agents_to_models
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["codex"],
+        "the task's pool replaces the global pool for that task only"
+    );
+    assert_eq!(
+        effective.guidance, global.guidance,
+        "guidance the task did not override is still applied"
+    );
+}
+
+/// A hand-edited task file that does not parse is an error the run reports,
+/// not a silent fall back to the global pool.
+#[test]
+fn a_malformed_task_config_is_reported_rather_than_ignored() {
+    use awman::data::config::global::task_squad_config;
+    use awman::data::config::repo::SquadConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = awman::data::fs::SquadPaths::from_root(tmp.path().join("squad"));
+    let config_path = paths.task_config_file("broken").unwrap();
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "{not json").unwrap();
+
+    let error = task_squad_config(&paths, "broken", &SquadConfig::default()).unwrap_err();
+    assert!(
+        error.to_string().contains("config.json"),
+        "the error should name the file that is broken: {error}"
+    );
+}
+
+// ─── squad trigger ──────────────────────────────────────────────────────────
+
+/// The gateway is where "triggering a paused task" is answered, because it is
+/// the only layer that can say *why*: the store would happily record the
+/// request, and `due_for_evaluation` would then quietly never select it, so
+/// the user would be left watching a task they triggered do nothing.
+#[tokio::test]
+async fn triggering_refuses_a_paused_or_unknown_task_and_arms_an_active_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, gateway, _paths) = edit_fixture(&tmp);
+    gateway.create(editable_task("triggerable")).await.unwrap();
+
+    gateway
+        .trigger("triggerable")
+        .await
+        .expect("an active task can be triggered");
+    assert!(
+        store
+            .get("triggerable")
+            .unwrap()
+            .unwrap()
+            .trigger_requested_at
+            .is_some(),
+        "the request is recorded on the task"
+    );
+
+    let missing = gateway.trigger("no-such-task").await.unwrap_err();
+    assert!(
+        missing.to_string().contains("was not found"),
+        "an unknown task is named as such: {missing}"
+    );
+
+    gateway
+        .set_status("triggerable", TaskStatus::Paused)
+        .await
+        .unwrap();
+    let paused = gateway.trigger("triggerable").await.unwrap_err();
+    let message = paused.to_string();
+    assert!(
+        message.contains("paused") && message.contains("squad resume triggerable"),
+        "refusing a paused task must say what to do about it: {message}"
+    );
+}
+
+/// A trigger changes nothing about the task's configuration — that is the
+/// whole point of having it rather than telling users to shorten the interval.
+#[tokio::test]
+async fn triggering_leaves_the_tasks_schedule_and_every_other_field_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, gateway, _paths) = edit_fixture(&tmp);
+    let before = gateway.create(editable_task("untouched")).await.unwrap();
+
+    gateway.trigger("untouched").await.unwrap();
+    let after = gateway.get("untouched").await.unwrap();
+
+    assert_eq!(after.interval_secs, before.interval_secs);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.agent, before.agent);
+    assert_eq!(after.model, before.model);
+    assert_eq!(after.overlays, before.overlays);
+    assert_eq!(
+        after.last_run_at, before.last_run_at,
+        "the last-run timestamp still says when the task last actually ran"
+    );
 }

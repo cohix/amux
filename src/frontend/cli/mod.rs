@@ -16,7 +16,7 @@ use std::sync::Arc;
 use clap::ArgMatches;
 use tokio::sync::RwLock;
 
-use crate::command::commands::squad::daemon::SquadSupervisor;
+use crate::command::commands::squad::daemon::{SquadKeyState, SquadSupervisor};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuiltCommand, Dispatch, Engines};
@@ -101,7 +101,7 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         path_strs.as_slice(),
         [
             "squad",
-            "add" | "list" | "show" | "remove" | "pause" | "resume" | "status"
+            "add" | "edit" | "list" | "show" | "remove" | "pause" | "resume" | "trigger" | "status"
         ]
     ) {
         if let Err(error) =
@@ -121,7 +121,7 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         path_strs.as_slice(),
         [
             "squad",
-            "add" | "list" | "show" | "remove" | "pause" | "resume"
+            "add" | "edit" | "list" | "show" | "remove" | "pause" | "resume" | "trigger"
         ]
     ) {
         let supervisor = match SquadSupervisor::from_env(&Env::from_process()) {
@@ -134,9 +134,16 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         };
         // A first run mints the bearer key. Disclose it on stderr — stdout
         // belongs to `--json` consumers, and this is the only moment the
-        // plaintext exists outside the daemon's hash file.
-        if let Some(setup) = supervisor.take_generated_key_setup() {
-            eprintln!("{setup}");
+        // plaintext exists outside the daemon's hash file. A key we do *not*
+        // hold is reported here too, rather than left to surface as a bare
+        // `HTTP 401` from a request that was never going to be accepted.
+        match supervisor.key_state() {
+            Ok(SquadKeyState::Minted { setup, .. }) => eprintln!("{setup}"),
+            Ok(SquadKeyState::Ready) => {}
+            Ok(SquadKeyState::Missing) => {
+                return per_command::squad::render_failure(&missing_squad_key_error(), json)
+            }
+            Err(error) => return per_command::squad::render_failure(&error, json),
         }
         dispatch = dispatch.with_squad_gateway(Arc::new(gateway) as Arc<dyn TaskGateway>);
     } else if path_strs == ["squad", "status"] {
@@ -520,6 +527,24 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         CommandError::NotAvailableForFrontend { .. } => 1,
         CommandError::Other(_) => 1,
     }
+}
+
+/// The CLI's answer to a squad daemon this shell holds no key for.
+///
+/// Reported *before* the request rather than after it, because the request's
+/// own answer is a bare `HTTP 401: API key required`, which names neither the
+/// variable to set nor the fact that the key can no longer be read back — it
+/// was shown once and is stored only as a hash.
+fn missing_squad_key_error() -> CommandError {
+    CommandError::Other(format!(
+        "squad requires a bearer key and none is set in this shell.\n\n\
+         The key is shown only once, when it is minted, and only its hash is \
+         stored — so it cannot be read back. Set {} if you saved it, or mint a \
+         new one with:\n    awman squad start --refresh-key\n\
+         which invalidates the previous key, so any shell still exporting it \
+         must be updated too.",
+        crate::data::config::env::AWMAN_SQUAD_KEY
+    ))
 }
 
 #[cfg(test)]

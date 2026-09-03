@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway};
+use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
@@ -143,6 +143,7 @@ fn fake_task(name: &str) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -326,6 +327,9 @@ impl TaskGateway for RecordingGateway {
     async fn create(&self, _req: CreateTask) -> Result<Task, CommandError> {
         unimplemented!("not exercised by this test")
     }
+    async fn update(&self, _name: &str, _req: UpdateTask) -> Result<Task, CommandError> {
+        unimplemented!("not exercised by this test")
+    }
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
@@ -337,6 +341,9 @@ impl TaskGateway for RecordingGateway {
         unimplemented!("not exercised by this test")
     }
     async fn set_status(&self, _name: &str, _status: TaskStatus) -> Result<(), CommandError> {
+        unimplemented!("not exercised by this test")
+    }
+    async fn trigger(&self, _name: &str) -> Result<(), CommandError> {
         unimplemented!("not exercised by this test")
     }
     async fn delete(&self, _name: &str) -> Result<(), CommandError> {

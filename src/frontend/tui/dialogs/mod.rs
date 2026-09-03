@@ -28,6 +28,10 @@ pub enum DialogRequest {
     MultilineInput {
         title: String,
         prompt: String,
+        /// Text the editor opens holding (WI 0110). `None` opens empty. Used
+        /// by edit interviews, where an untouched box must mean "keep what
+        /// is there" rather than "erase it".
+        default_text: Option<String>,
     },
     ListPicker {
         title: String,
@@ -130,6 +134,17 @@ pub enum Dialog {
     SquadRemoveConfirm {
         name: String,
     },
+    /// Confirmation before starting a squad daemon that is not already running
+    /// (WI 0110). Opening the squad tab starts a long-lived background
+    /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
+    /// no tab at all. Never raised when a daemon is already up.
+    SquadStartConfirm,
+    /// The squad daemon requires a bearer key this process does not hold: a
+    /// hash exists on disk, `AWMAN_SQUAD_KEY` is unset here, and the plaintext
+    /// key is unrecoverable. `y` mints a new key and restarts the daemon onto
+    /// it; `n`/`Esc` opens no squad tab, because one that 401s on every poll
+    /// would show nothing but that.
+    SquadKeyMissing,
     Loading {
         title: String,
     },
@@ -151,6 +166,14 @@ pub enum Dialog {
     Notice {
         title: String,
         body: String,
+        /// The raw squad bearer key, when this notice is the key-setup
+        /// snippet — `[c]` copies it to the clipboard. `None` for notices
+        /// unrelated to a key (e.g. "daemon did not start"), which shows no
+        /// copy hint.
+        copy_key: Option<String>,
+        /// The bare shell export line alone, so `[z]` can copy just what
+        /// belongs in the rc file, without the banner and notes around it.
+        copy_zshrc_snippet: Option<String>,
     },
 }
 
@@ -369,7 +392,13 @@ pub fn render_yes_no(title: &str, body: &str, area: Rect, frame: &mut Frame) {
         })
         .sum();
     let body_h = wrapped_lines as u16;
-    let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+    // The dialog frame costs 4 rows (two borders + a row of padding each
+    // side), and the content is `body_h` rows plus a blank separator plus the
+    // key-hint row. Anything less than `body_h + 6` clips the hint off the
+    // bottom — which is exactly the row a user needs to know that `y`/`n`/Esc
+    // are the answers. `.max(8)` keeps a one-line body's dialog from looking
+    // cramped.
+    let height = (body_h + 6).min(area.height.saturating_sub(2)).max(8);
     let dialog_area = centered_fixed(width, height, area);
     let inner = render_dialog_frame(title, Color::Yellow, dialog_area, frame);
     let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");

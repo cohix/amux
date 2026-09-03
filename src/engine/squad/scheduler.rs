@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::data::config::global::task_squad_config;
 use crate::data::config::{EnvSnapshot, GlobalConfig};
 use crate::data::fs::{RunDetail, RunId, RunStatus, SquadPaths, Task, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
@@ -161,21 +162,24 @@ impl SquadScheduler {
         let cfg = GlobalConfig::load_with(&self.env).unwrap_or_default();
         let squad = cfg.squad.unwrap_or_default();
         let max_concurrent = squad.max_concurrent_evaluations_or_default().max(1);
-        let guidance = squad.guidance;
-        let agents_to_models = squad.agents_to_models;
-        let default_leader = squad.default_leader;
 
-        self.log_running_agents(default_leader.as_deref(), agents_to_models.as_ref());
+        self.log_running_agents(
+            squad.default_leader.as_deref(),
+            squad.agents_to_models.as_ref(),
+        );
 
         let now = Utc::now();
-        let tick_count;
         {
+            // The tick count and timestamp are still recorded — `squad status`
+            // reports both — but the tick itself is deliberately not logged.
+            // A line every 30 seconds forever buried the lines that say
+            // something actually happened. `log_running_agents` above is the
+            // user-facing summary, and it emits nothing when nothing is
+            // running.
             let mut status = self.status.lock().expect("scheduler status poisoned");
             status.last_tick = Some(now);
             status.tick_count += 1;
-            tick_count = status.tick_count;
         }
-        tracing::info!(tick = tick_count, at = %now, "squad scheduler tick");
 
         // The whole admission predicate — active, off-backoff, interval
         // elapsed, and not already running — is enforced in SQL. Never
@@ -264,15 +268,41 @@ impl SquadScheduler {
                 log_dir = %run_log_dir.display(),
                 "squad task selected for evaluation"
             );
+            // WI 0110: a task may carry its own `config.json` beside its
+            // workspace. It is read here, per task and per tick, and layered
+            // over the global block, so an edited task config takes effect on
+            // the next tick exactly as an edited global one does. A malformed
+            // task file fails that task's run with a named error rather than
+            // being ignored — it is scoped to one task, so one run can say what
+            // is wrong with it.
+            let effective = match task_squad_config(&self.paths, &task.name, &squad) {
+                Ok(effective) => effective,
+                Err(error) => {
+                    let detail = RunDetail {
+                        error: Some(format!("reading the task's config.json: {error}")),
+                        ..Default::default()
+                    };
+                    let _ = self
+                        .store
+                        .finish_run(&run_id, RunStatus::Failed, &detail, Utc::now());
+                    tracing::warn!(
+                        task = %task.name,
+                        run_id = %run_id,
+                        error = %error,
+                        "squad: failed to read the task's config.json"
+                    );
+                    continue;
+                }
+            };
             adjust_in_flight(&self.status, 1);
 
             let store = Arc::clone(&self.store);
             let evaluator = Arc::clone(&self.evaluator);
             let status = Arc::clone(&self.status);
             let failures = Arc::clone(&self.failure_counts);
-            let guidance = guidance.clone();
-            let agents_to_models = agents_to_models.clone();
-            let default_leader = default_leader.clone();
+            let guidance = effective.guidance.clone();
+            let agents_to_models = effective.agents_to_models.clone();
+            let default_leader = effective.default_leader.clone();
             tasks.spawn(async move {
                 evaluate_task(EvaluateArgs {
                     store,
@@ -687,6 +717,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         };
         store.create(&configured).unwrap();

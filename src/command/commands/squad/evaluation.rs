@@ -403,14 +403,35 @@ impl LocalTaskEvaluator {
             session.default_agent().map(|a| a.as_str()),
         )?;
         let agent = AgentName::new(leader.agent.clone()).map_err(CommandError::Data)?;
-        ensure_agent_image_with_build_output(
-            &self.engines,
-            &git_root,
-            &dockerfiles,
-            agent.as_str(),
-            &mut sink,
-            Some(&mut build_logs),
-        )?;
+        // WI 0110: build an image for every agent in the task's effective pool,
+        // not just the leader's. The leader picks its generated workflow's step
+        // agents from the listing it was shown, so an unbuilt pool agent would
+        // otherwise cost a build in the middle of the run — or, for a pool
+        // configured after the workspace was scaffolded, fail validation. The
+        // leader's own image is built first so it starts as soon as it can.
+        //
+        // `ensure_agent_image*` is an `image_exists` fast path, so a pool whose
+        // images are already built adds nothing but a runtime query per agent.
+        let mut pool_agents = vec![agent.as_str().to_string()];
+        if let Some(map) = request.agents_to_models.as_ref() {
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            for name in names {
+                if !pool_agents.contains(name) && available_agents.iter().any(|(a, _)| a == name) {
+                    pool_agents.push(name.clone());
+                }
+            }
+        }
+        for pool_agent in &pool_agents {
+            ensure_agent_image_with_build_output(
+                &self.engines,
+                &git_root,
+                &dockerfiles,
+                pool_agent,
+                &mut sink,
+                Some(&mut build_logs),
+            )?;
+        }
 
         // `guidance` is additive and never overridden by a task, so it is
         // rendered into every leader prompt regardless of which level supplied
@@ -1009,6 +1030,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         }
     }

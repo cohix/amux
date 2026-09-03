@@ -88,6 +88,26 @@ impl SquadPaths {
         Ok(base.join("workspace"))
     }
 
+    /// The task-scoped config file for one task:
+    /// `<root>/tasks/<name>/config.json`. A sibling of the task's `workspace/`
+    /// directory, guarded exactly as [`task_dir`] is, and carrying the same
+    /// document shape as `~/.awman/config.json` and `GITROOT/.awman/config.json`
+    /// — of which only the `squad` block means anything for a task (WI 0110).
+    ///
+    /// The file is optional: a task without one inherits the global `squad`
+    /// block unchanged.
+    ///
+    /// [`task_dir`]: SquadPaths::task_dir
+    pub fn task_config_file(&self, name: &str) -> Result<PathBuf, DataError> {
+        let base = self.tasks_dir().join(name);
+        validate_under_root(
+            &self.tasks_dir(),
+            &base,
+            "task directory must reside under the squad tasks root",
+        )?;
+        Ok(base.join(crate::data::config::global::GLOBAL_CONFIG_FILENAME))
+    }
+
     /// Directory holding per-task container image build logs.
     pub fn builds_dir(&self) -> PathBuf {
         self.root.join(BUILDS_SUBDIR)
@@ -160,6 +180,24 @@ mod tests {
             paths.task_dir("issue-triage").unwrap(),
             PathBuf::from("/r/tasks/issue-triage/workspace")
         );
+    }
+
+    #[test]
+    fn task_config_file_sits_beside_the_workspace() {
+        let paths = SquadPaths::from_root("/r");
+        assert_eq!(
+            paths.task_config_file("issue-triage").unwrap(),
+            PathBuf::from("/r/tasks/issue-triage/config.json")
+        );
+    }
+
+    #[test]
+    fn task_config_file_rejects_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SquadPaths::from_root(tmp.path());
+        std::fs::create_dir_all(paths.tasks_dir()).unwrap();
+        std::fs::create_dir_all(tmp.path().join("escape")).unwrap();
+        assert!(paths.task_config_file("../escape").is_err());
     }
 
     #[test]

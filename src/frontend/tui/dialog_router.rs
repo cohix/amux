@@ -390,6 +390,38 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
             _ => {}
         },
+        // `y` is the only recovery there is: the previous key was never stored
+        // in plaintext, so a working client means a *new* key, which means a
+        // new hash and a restarted daemon. `n` opens no tab — see the variant's
+        // doc comment.
+        Some(Dialog::SquadKeyMissing) => match c {
+            'y' | 'Y' => {
+                app.active_dialog = None;
+                app.start_squad_key_refresh();
+            }
+            'n' | 'N' => {
+                app.active_dialog = None;
+                app.status_bar.text =
+                    "squad needs a bearer key; the squad tab was not opened.".to_string();
+            }
+            _ => {}
+        },
+        // WI 0110: `y` accepts starting a squad daemon in the background and
+        // opening the tab; `n`/`Esc` opens no tab and starts nothing. The
+        // dialog decides nothing itself — it only collects the consent
+        // `open_or_focus_squad_tab` asked for.
+        Some(Dialog::SquadStartConfirm) => match c {
+            'y' | 'Y' => {
+                app.active_dialog = None;
+                app.build_and_install_squad_tab();
+            }
+            'n' | 'N' => {
+                app.active_dialog = None;
+                app.status_bar.text =
+                    "squad daemon not started; the squad tab was not opened.".to_string();
+            }
+            _ => {}
+        },
         // WI 0102: `y` confirms removal by dispatching `squad remove <name>`
         // through the ordinary Layer-2 path; `n`/`Esc` dismisses. This dialog
         // decides nothing itself — it only collects the confirmation.
@@ -552,10 +584,41 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
                     key_handler::squad_dispatch_by_name(app, "resume", &name);
                     app.active_dialog = None;
                 }
+                // Evaluate this task on the next tick regardless of its
+                // schedule — the modal's counterpart to `t` on the grid, and
+                // scoped to the modal's task like every other key here.
+                't' => {
+                    key_handler::squad_dispatch_by_name(app, "trigger", &name);
+                    app.active_dialog = None;
+                }
+                // WI 0110: edit the task the modal is showing, not the list's
+                // current selection — the same scoping the other four keys use.
+                'e' => {
+                    key_handler::squad_edit_by_name(app, &name);
+                    app.active_dialog = None;
+                }
                 'd' => {
                     app.active_dialog = Some(Dialog::SquadRemoveConfirm { name });
                 }
                 _ => {}
+            }
+        }
+
+        // `c`/`z` copy the key or the shell snippet to the clipboard without
+        // dismissing the dialog — the user may want both before pressing
+        // Enter, and a copy is not itself an acknowledgment of the notice.
+        Some(Dialog::Notice {
+            copy_key,
+            copy_zshrc_snippet,
+            ..
+        }) => {
+            let copy = match c {
+                'c' => copy_key.clone().map(|text| ("squad key", text)),
+                'z' => copy_zshrc_snippet.clone().map(|text| ("zshrc snippet", text)),
+                _ => None,
+            };
+            if let Some((label, text)) = copy {
+                key_handler::copy_dialog_text_to_clipboard(app, label, &text);
             }
         }
 
@@ -565,8 +628,7 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         | Some(Dialog::KindSelect { .. })
         | Some(Dialog::YesNo { .. })
         | Some(Dialog::YesNoCancel { .. })
-        | Some(Dialog::FatalError { .. })
-        | Some(Dialog::Notice { .. }) => {}
+        | Some(Dialog::FatalError { .. }) => {}
 
         None => {}
     }

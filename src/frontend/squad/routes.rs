@@ -108,10 +108,13 @@ async fn handle_command(
 
 fn squad_outcome_response(outcome: SquadOutcome) -> Response {
     match outcome {
-        SquadOutcome::Task(task) => Json(task).into_response(),
+        SquadOutcome::Task(task) | SquadOutcome::Updated(task) => Json(task).into_response(),
         SquadOutcome::Detail(detail) => Json(detail).into_response(),
         SquadOutcome::Tasks(tasks) => Json(tasks).into_response(),
         SquadOutcome::Removed { name, .. } => {
+            Json(serde_json::json!({ "name": name })).into_response()
+        }
+        SquadOutcome::Triggered { name } => {
             Json(serde_json::json!({ "name": name })).into_response()
         }
         SquadOutcome::Ok => Json(serde_json::json!({})).into_response(),

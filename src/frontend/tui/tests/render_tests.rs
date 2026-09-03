@@ -206,6 +206,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -224,6 +225,36 @@ fn render_frame_squad_tab_no_slots_draws_squad_body_not_execution_window() {
     assert!(
         !text.contains("awman"),
         "the ordinary execution window's idle title must not render for the squad tab: {text}"
+    );
+}
+
+/// WI 0110: the squad tab's body is the card grid, so the tab's status log —
+/// where a failed command's error normally lands — is never on screen. Without
+/// this line a failed `squad remove` looked exactly like a key that did nothing,
+/// which is how the delete bug stayed invisible.
+#[test]
+fn a_failed_squad_action_renders_above_the_task_grid() {
+    use crate::frontend::tui::tabs::ExecutionPhase;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.active_tab_mut().execution_phase = ExecutionPhase::Error {
+        command: "squad remove task-a".into(),
+        message: "remote returned status 400".into(),
+    };
+
+    let text = buffer_text(&render_app(&mut app, 100, 24));
+
+    assert!(
+        text.contains("squad remove task-a failed"),
+        "the failed action must name itself above the grid: {text}"
+    );
+    assert!(
+        text.contains("remote returned status 400"),
+        "and carry the daemon's reason: {text}"
+    );
+    assert!(
+        text.contains("enter detail"),
+        "the grid and its hints stay on screen underneath: {text}"
     );
 }
 
@@ -246,6 +277,34 @@ fn render_frame_squad_tab_with_slots_draws_normal_execution_rendering() {
     assert!(
         text.contains("running: squad attach task-a"),
         "the ordinary execution window must render instead: {text}"
+    );
+}
+
+/// WI 0110: `ctrl-\ detach` must be advertised in the hint bar whenever a
+/// squad attach session has the container view on screen — not just for an
+/// ordinary command's maximized container. Before this test's fix,
+/// `render_status_bar` returned its squad-grid hint for every squad tab
+/// regardless of `container_slots`, so the detach hint never appeared during
+/// attach even though keys were already going to the PTY.
+#[test]
+fn squad_attach_session_shows_the_detach_hint_in_the_status_bar() {
+    use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.focus = Focus::ExecutionWindow;
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "squad attach task-a".into(),
+        };
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 24));
+    assert!(
+        text.contains("ctrl-\\ detach"),
+        "the detach hint must render during a squad attach session: {text}"
     );
 }
 
@@ -458,7 +517,7 @@ fn acp_permission_request_modal_renders_through_the_dialog_framework() {
 
 /// Publish a parallel workflow of `n` sibling steps into the active tab.
 fn set_parallel_workflow(app: &App, n: usize) {
-    use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
     *app.active_tab().workflow_state.lock().unwrap() = Some(WorkflowViewState {
         steps: (0..n)
             .map(|i| WorkflowStepView {
@@ -467,6 +526,7 @@ fn set_parallel_workflow(app: &App, n: usize) {
                 agent: None,
                 model: None,
                 depends_on: vec![],
+                kind: WorkflowStepKind::Agent,
             })
             .collect(),
         current_step: None,
@@ -767,4 +827,261 @@ fn the_squad_detail_modal_shows_the_task_scoped_action_tooltip() {
             "the modal's action tooltip must offer {key:?}: {text}"
         );
     }
+}
+
+// ─── every task-interview modal shows its key bindings ──────────────────────
+
+/// The dialogs the squad task interview raises must each render the row that
+/// says which keys do what.
+///
+/// Two of them did not. `TextInput` reserved no row for its hint at all, so
+/// `[Enter] submit / [Esc] cancel` was laid out one row past the bottom of the
+/// dialog and never drawn — and `TextInput` is what collects the interval, the
+/// leader agent, the leader model and every overlay. `YesNo` and `KindSelect`
+/// sized themselves one and two rows short respectively, which was invisible
+/// for a one-line body and clipped the hint the moment the body was longer —
+/// which every squad confirmation's body is.
+///
+/// The dialogs are driven directly rather than through the interview, because
+/// the interview blocks on a frontend thread; what is under test is the
+/// rendering, and these are the exact shapes `per_command/squad.rs` builds.
+#[test]
+fn every_modal_in_the_squad_task_interview_renders_its_key_bindings() {
+    use crate::frontend::tui::text_edit::TextEdit;
+
+    let mut editor = TextEdit::new(false);
+    editor.set_text("6h");
+    let mut multiline = TextEdit::new(true);
+    multiline.set_text("watch the issue tracker");
+
+    let cases: Vec<(&str, Dialog, Vec<&str>)> = vec![
+        (
+            "the interval / agent / model / overlay prompt",
+            Dialog::TextInput {
+                title: "Evaluation interval".into(),
+                prompt: "How often to evaluate (e.g. 6h, 1d):".into(),
+                editor,
+            },
+            vec!["[Enter] submit", "[Esc] cancel"],
+        ),
+        (
+            "the description editor",
+            Dialog::MultilineInput {
+                title: "Edit squad task description".into(),
+                prompt: "Describe when this task fires and what squad should do.\n\
+                         (Ctrl+Enter to submit)"
+                    .into(),
+                editor: multiline,
+            },
+            vec!["submit", "[Enter] newline", "[Esc] cancel"],
+        ),
+        (
+            // The real body: three lines once the question is included, which
+            // is exactly the case the old height clipped.
+            "the replace-overlays / agent-pool confirmation",
+            Dialog::YesNo {
+                title: "Agents and models".into(),
+                body: "A global squad configuration exists.\n\n\
+                       Use those settings for this task? \
+                       (No = give this task its own agents and models)"
+                    .into(),
+            },
+            vec!["[y] Yes", "[n] No", "[Esc] Cancel"],
+        ),
+        (
+            "the workspace-choice picker",
+            Dialog::KindSelect {
+                title: "Task Workspace".into(),
+                options: vec![
+                    ("1".into(), "Default Task Workspace".into()),
+                    ("2".into(), "Custom Folder / Repo".into()),
+                ],
+            },
+            vec!["[1-9] select", "[Esc] cancel"],
+        ),
+    ];
+
+    for (label, dialog, expected) in cases {
+        let mut app = make_app();
+        app.active_dialog = Some(dialog);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        for hint in expected {
+            assert!(
+                text.contains(hint),
+                "{label} must show its {hint:?} key binding:\n{text}"
+            );
+        }
+    }
+}
+
+/// The squad key-setup notice must offer a way to copy the key or the
+/// zshrc snippet — the body text itself cannot be selected/copied by mouse
+/// in a terminal UI, so a keybinding is the only way to get the key out.
+/// A notice unrelated to a key (e.g. "daemon did not start") must not show
+/// copy hints that would do nothing.
+#[test]
+fn the_squad_key_notice_shows_copy_hints_only_when_it_has_something_to_copy() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "squad authentication".into(),
+        body: "╔══╗\n║ deadbeef ║\n╚══╝".into(),
+        copy_key: Some("deadbeef".into()),
+        copy_zshrc_snippet: Some("export AWMAN_SQUAD_KEY=deadbeef".into()),
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(text.contains("[c] copy key"), "{text}");
+    assert!(text.contains("[z] copy .zshrc snippet"), "{text}");
+    assert!(text.contains("[Enter] dismiss"), "{text}");
+
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "squad daemon did not start".into(),
+        body: "failed to start the squad daemon: did not become ready".into(),
+        copy_key: None,
+        copy_zshrc_snippet: None,
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        !text.contains("[c] copy key") && !text.contains("[z] copy .zshrc snippet"),
+        "a notice with nothing to copy must not offer copy hints: {text}"
+    );
+}
+
+// ─── card labels, the pending trigger, and where failures are reported ──────
+
+/// Every value on a card is introduced by a grey label. The description's
+/// label sits on its own row so the text still gets the card's full width;
+/// the last-run *timestamp* — previously an unlabelled indented continuation
+/// of the outcome line — now says what it is.
+#[test]
+fn squad_task_cards_label_the_description_and_the_last_run_timestamp() {
+    use crate::data::fs::task_store::RunStatus;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        let mut task = fake_task("issue-triage");
+        task.description = "watch the issue tracker".into();
+        task.last_run_at = Some(chrono::Utc::now());
+        task.last_run_status = Some(RunStatus::WorkflowExecuted);
+        snap.tasks = vec![task];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+
+    assert!(
+        text.contains("Description"),
+        "the description must carry a label: {text}"
+    );
+    assert!(
+        text.contains("watch the issue tracker"),
+        "labelling the description must not cost it the width it needs: {text}"
+    );
+    let last_run = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    assert!(
+        text.contains(&format!("Last run: {last_run}")),
+        "the last-run timestamp must be labelled, not left as a bare date: {text}"
+    );
+    assert!(
+        text.contains("Outcome: workflow executed"),
+        "the outcome keeps a label of its own: {text}"
+    );
+}
+
+/// A triggered task must look triggered. Leaving the card showing its ordinary
+/// next-evaluation time would make `t` read as a key that did nothing.
+#[test]
+fn a_task_with_a_pending_trigger_says_so_instead_of_its_scheduled_time() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        let mut task = fake_task("issue-triage");
+        task.last_run_at = Some(chrono::Utc::now());
+        task.trigger_requested_at = Some(chrono::Utc::now());
+        snap.tasks = vec![task];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        text.contains("triggered"),
+        "a pending trigger must be visible on the card: {text}"
+    );
+}
+
+/// A failed squad action is reported in the hint bar above the command box —
+/// the row that is on screen for every tab — and not as a header above the
+/// card grid, which pushed every card down a row.
+#[test]
+fn a_failed_squad_action_is_reported_in_the_hint_bar_not_above_the_card_grid() {
+    use crate::frontend::tui::tabs::ExecutionPhase;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task("issue-triage")];
+        snap.loaded = true;
+    }
+    app.active_tab_mut().execution_phase = ExecutionPhase::Error {
+        command: "squad remove issue-triage".to_string(),
+        message: "task \"issue-triage\" was not found".to_string(),
+    };
+
+    let buf = render_app(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("squad remove issue-triage failed"),
+        "the failure must be reported somewhere: {text}"
+    );
+    assert!(
+        text.contains("was not found"),
+        "the reason travels with it: {text}"
+    );
+    // The hint bar is the row directly above the command box's top border.
+    let rows: Vec<String> = text.lines().map(str::to_string).collect();
+    let hint_row = rows
+        .iter()
+        .position(|row| row.contains("squad remove issue-triage failed"))
+        .expect("the failure renders");
+    assert!(
+        rows[hint_row + 1].contains("command"),
+        "the failure belongs in the hint bar above the command box, not in the \
+         grid header:\n{text}"
+    );
+    assert!(
+        !text.contains("Exit code"),
+        "a squad tab has no execution window, so its exit-code hint is noise: {text}"
+    );
+}
+
+/// The missing-key recovery has to explain three things a 401 does not: that
+/// the key is unrecoverable, what accepting will do, and what it costs.
+#[test]
+fn the_missing_key_dialog_explains_the_recovery_and_its_key_bindings() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::SquadKeyMissing);
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+
+    assert!(
+        text.contains("AWMAN_SQUAD_KEY"),
+        "the variable to set must be named: {text}"
+    );
+    assert!(
+        text.contains("only once"),
+        "why the key cannot simply be looked up must be stated: {text}"
+    );
+    assert!(
+        text.contains("[y]") && text.contains("[n / Esc]"),
+        "both answers must be offered: {text}"
+    );
+    assert!(
+        text.contains("old key will stop working"),
+        "the cost of refreshing must be stated before it is accepted: {text}"
+    );
 }

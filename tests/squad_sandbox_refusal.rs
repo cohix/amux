@@ -242,6 +242,7 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
             agent: None,
             model: None,
             overlays: Vec::new(),
+            agents_to_models: Default::default(),
         })
         .await
         .expect("creation under a container runtime must succeed");
@@ -269,6 +270,7 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
             agent: None,
             model: None,
             overlays: Vec::new(),
+            agents_to_models: Default::default(),
         })
         .await
         .expect_err("creation under the sandbox tier must be rejected");

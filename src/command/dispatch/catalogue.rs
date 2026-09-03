@@ -944,11 +944,13 @@ const SQUAD: CommandSpec = CommandSpec {
         &SQUAD_STATUS,
         &SQUAD_LOGS,
         &SQUAD_ADD,
+        &SQUAD_EDIT,
         &SQUAD_LIST,
         &SQUAD_SHOW,
         &SQUAD_REMOVE,
         &SQUAD_PAUSE,
         &SQUAD_RESUME,
+        &SQUAD_TRIGGER,
         &SQUAD_ATTACH,
     ],
 };
@@ -1062,6 +1064,20 @@ const SQUAD_LOGS: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
+/// The task-scoped agent pool, shared verbatim by `squad add` and
+/// `squad edit` so both write the same `config.json` block (WI 0110).
+const SQUAD_AGENT_MODELS_FLAG: FlagSpec = FlagSpec {
+    long: "agent-models",
+    short: None,
+    help: "Agents and models this task may use: <agent>=<model>[,<model>...]. Repeatable.",
+    kind: FlagKind::VecString,
+    default: FlagDefault::EmptyVec,
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+};
+
 const SQUAD_ADD: CommandSpec = CommandSpec {
     name: "add",
     aliases: &[],
@@ -1172,6 +1188,7 @@ const SQUAD_ADD: CommandSpec = CommandSpec {
             implies: &[],
             optional: true,
         },
+        SQUAD_AGENT_MODELS_FLAG,
         FlagSpec {
             long: "interview",
             short: None,
@@ -1247,6 +1264,148 @@ const SQUAD_SHOW: CommandSpec = CommandSpec {
     api_allowed: true,
     subcommands: &[],
 };
+/// `squad edit` carries every field a task may change after creation. `name`,
+/// `workspace` and `mount-scope` are absent on purpose: they are captured once
+/// at creation and define the task's identity and isolation (WI 0110).
+const SQUAD_EDIT: CommandSpec = CommandSpec {
+    name: "edit",
+    aliases: &[],
+    help: "Edit an existing squad task.",
+    long_help: Some(
+        "Change a task's description, schedule, leader agent/model, overlays, or agent pool. \
+         A task's name, workspace and mount scope are fixed at creation and cannot be edited; \
+         changing those means creating a new task. Every flag is optional, but at least one \
+         must be given unless --interview is used.",
+    ),
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[
+        FlagSpec {
+            long: "description",
+            short: None,
+            help: "Replace the task description.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "interval",
+            short: None,
+            help: "Replace the evaluation interval (for example 6h).",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "agent",
+            short: None,
+            help: "Replace the task-specific leader agent.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-agent"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-agent",
+            short: None,
+            help: "Drop the task's own leader agent, falling back to the squad default.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["agent"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "model",
+            short: None,
+            help: "Replace the task-specific leader model.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-model"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-model",
+            short: None,
+            help: "Drop the task's own leader model, falling back to the squad default.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["model"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "overlay",
+            short: None,
+            help: "Replace the task's overlays: dir()/ssh()/env()/skill(). Repeatable.",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-overlays"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-overlays",
+            short: None,
+            help: "Remove every overlay from the task.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["overlay"],
+            implies: &[],
+            optional: true,
+        },
+        SQUAD_AGENT_MODELS_FLAG,
+        FlagSpec {
+            long: "clear-agent-models",
+            short: None,
+            help: "Remove the task's own agent pool, inheriting the global squad settings.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["agent-models"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "interview",
+            short: None,
+            help: "Collect the edited fields interactively, prefilled with the current values.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["non-interactive"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "non-interactive",
+            short: Some('n'),
+            help: "Never prompt: refuse anything needing a confirmation instead of asking.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["interview"],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: true,
+    subcommands: &[],
+};
+
 const SQUAD_REMOVE: CommandSpec = CommandSpec {
     name: "remove",
     aliases: &[],
@@ -1282,6 +1441,21 @@ const SQUAD_RESUME: CommandSpec = CommandSpec {
     aliases: &[],
     help: "Resume a squad task.",
     long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    subcommands: &[],
+};
+const SQUAD_TRIGGER: CommandSpec = CommandSpec {
+    name: "trigger",
+    aliases: &[],
+    help: "Evaluate a squad task now, ignoring its schedule.",
+    long_help: Some(
+        "Ask the squad daemon to evaluate a task on its next scheduler tick, whatever \
+         its interval says and whatever backoff is outstanding. The task's interval is \
+         not changed: the trigger fires exactly one evaluation, after which the task \
+         returns to its normal schedule. A paused task is refused — resume it first.",
+    ),
     arguments: &[SQUAD_NAME_ARGUMENT],
     flags: &[],
     api_allowed: true,

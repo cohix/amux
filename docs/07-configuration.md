@@ -78,8 +78,8 @@ Applies to every project on the machine unless a repo overrides it.
 
 The optional `squad` block is global, so it belongs in
 `~/.awman/config.json` (or the relocated global config file). It controls the
-agents and models available to the squad daemon and the guidance it passes to
-task evaluations:
+agents and models your squad may use and the guidance it passes to task
+evaluations:
 
 Task-specific workspace, interval, and overlay choices are configured with
 `awman squad add` rather than in this global block. See [Squad](12-squad.md)
@@ -102,6 +102,35 @@ component, or uses an invalid agent name; or `guidance` has an empty or
 whitespace-only entry. A `guidance` list may contain at most 50 entries, and
 each entry is limited to 1,000 characters. Agent names use ASCII letters,
 digits, `-`, and `_`, and are 1–64 characters long.
+
+#### Per-task squad settings
+
+A squad task can carry its own copy of this block, in a `config.json` beside its
+durable workspace:
+
+```text
+~/.awman/squad/tasks/<name>/config.json
+```
+
+The file has the same shape as `~/.awman/config.json` — only its `squad` block
+means anything for a task — and is held to the same validation rules:
+
+```json
+{ "squad": { "agentsToModels": { "claude": ["claude-opus-4-8"] } } }
+```
+
+A field the task sets wins for that task; a field it omits is inherited from the
+global block, so a task can narrow its agent pool while keeping the standing
+`guidance` every task gets. `maxConcurrentEvaluations` is the exception: it
+bounds the whole daemon, so it is always read from the global block and ignored
+in a task file.
+
+The file is optional, and awman writes it for you when you answer the agent and
+model questions during `awman squad add` — see [Choosing a task's agents and
+models](12-squad.md#choosing-a-tasks-agents-and-models). Edits take effect on the
+daemon's next scheduling tick, the same as edits to the global block. A task file
+that does not parse fails that one task's next run with an error naming the file,
+rather than being silently ignored.
 
 > **Upgrading from an old config?** The `envPassthrough` field was removed. Express environment passthrough as `env(VAR)` entries in the `overlays` array instead — see [Overlays](08-overlays.md). The old object-style `overlays` block (`{"skills": …, "directories": …}`) is also gone; `overlays` is now a flat array of overlay specs and the old format produces a parse error.
 

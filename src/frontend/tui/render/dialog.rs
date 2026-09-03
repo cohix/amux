@@ -41,7 +41,10 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 })
                 .sum();
             let body_h = wrapped_lines as u16;
-            let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+            // `body_h + 6`: 4 rows of frame + a blank separator + the hint
+            // row. See `dialogs::render_yes_no` — a smaller height clips the
+            // key hints off the bottom of the dialog.
+            let height = (body_h + 6).min(area.height.saturating_sub(2)).max(8);
             let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner = dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
             let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");
@@ -54,8 +57,15 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         } => {
             // Layout: prompt (multi-line) + spacer + bordered input + spacer +
             // hint row. Width grows with terminal but caps at 80.
+            //
+            // The height is the sum of exactly those rows: `prompt_lines`
+            // + 1 spacer + 3 (the bordered input) + 1 spacer + 1 hint = the
+            // inner height, plus 4 for the frame's borders and padding. It was
+            // one row short, so the `[Enter] submit / [Esc] cancel` hint fell
+            // outside the dialog and never rendered at all — the one modal in
+            // the task interview with no visible key bindings.
             let prompt_lines = prompt.lines().count() as u16;
-            let dialog_h = prompt_lines + 9;
+            let dialog_h = prompt_lines + 10;
             let dialog_w = (area.width.saturating_sub(8)).clamp(50, 80);
             let dialog_area = dialogs::centered_fixed(dialog_w, dialog_h, area);
             let inner = dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
@@ -316,8 +326,11 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 .max(title_w)
                 .max(50)
                 .min(area.width.saturating_sub(4));
-            let body_h = options.len() as u16 + 1; // +1 for hint
-            let height = (body_h + 4).min(area.height.saturating_sub(2)).max(7);
+            // One row per option, a blank separator, and the hint row — plus
+            // the frame's 4 rows. The old `options + 5` was two short and
+            // clipped the `[1-9] select   [Esc] cancel` hint away.
+            let body_h = options.len() as u16 + 2;
+            let height = (body_h + 4).min(area.height.saturating_sub(2)).max(8);
             let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner = dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
             let mut lines: Vec<Line> = options
@@ -642,6 +655,54 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::SquadTaskDetail(state) => {
             render_squad_detail(state, area, frame);
         }
+        dialogs::Dialog::SquadStartConfirm => {
+            let width = 66u16.min(area.width.saturating_sub(4).max(40));
+            let dialog_area = dialogs::centered_fixed(width, 9, area);
+            let inner = dialogs::render_dialog_frame(
+                "Start squad daemon?",
+                Color::Cyan,
+                dialog_area,
+                frame,
+            );
+            let text = "  The squad daemon is not running.\n\
+                        \n  Start it in the background and open the squad tab?\n\
+                        \n  [y] start   [n / Esc] cancel";
+            frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+        }
+        dialogs::Dialog::SquadKeyMissing => {
+            let width = 74u16.min(area.width.saturating_sub(4).max(40));
+            let lines: Vec<Line> = vec![
+                Line::from(Span::styled(
+                    "  The squad daemon requires a key, and this session has none.",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("  AWMAN_SQUAD_KEY is not set here, and squad's key was shown"),
+                Line::from("  only once when it was minted — only its hash is stored, so"),
+                Line::from("  the key itself cannot be read back."),
+                Line::from(""),
+                Line::from("  Mint a new key and restart the squad daemon onto it?"),
+                Line::from(Span::styled(
+                    "  Any other shell still exporting the old key will stop working.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [y] mint a new key and restart squad   [n / Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            // +4 for the frame's borders and padding.
+            let height = (lines.len() as u16 + 4).min(area.height.saturating_sub(2));
+            let dialog_area = dialogs::centered_fixed(width, height, area);
+            let inner = dialogs::render_dialog_frame(
+                "squad authentication",
+                Color::Yellow,
+                dialog_area,
+                frame,
+            );
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        }
         dialogs::Dialog::SquadRemoveConfirm { name } => {
             let width = 60u16.min(area.width.saturating_sub(4).max(40));
             let dialog_area = dialogs::centered_fixed(width, 8, area);
@@ -748,7 +809,12 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             )));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
-        dialogs::Dialog::Notice { title, body } => {
+        dialogs::Dialog::Notice {
+            title,
+            body,
+            copy_key,
+            copy_zshrc_snippet,
+        } => {
             let body_lines = body.lines().count() as u16;
             let title_w = unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
             // The squad key snippet contains a box-drawn banner and an indented
@@ -762,11 +828,28 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 .max(title_w)
                 .saturating_add(6)
                 .clamp(55, area.width.saturating_sub(4));
-            let height = (body_lines + 6).min(area.height.saturating_sub(2)).max(8);
+            // One hint line always ("[Enter] dismiss"), plus one more for
+            // each copy action this notice actually offers.
+            let hint_lines = 1 + copy_key.is_some() as u16 + copy_zshrc_snippet.is_some() as u16;
+            let height = (body_lines + 5 + hint_lines)
+                .min(area.height.saturating_sub(2))
+                .max(8);
             let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner = dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
             let mut lines: Vec<Line> = body.lines().map(Line::from).collect();
             lines.push(Line::from(""));
+            if copy_key.is_some() {
+                lines.push(Line::from(Span::styled(
+                    "  [c] copy key",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if copy_zshrc_snippet.is_some() {
+                lines.push(Line::from(Span::styled(
+                    "  [z] copy .zshrc snippet",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             lines.push(Line::from(Span::styled(
                 "  [Enter] dismiss",
                 Style::default().fg(Color::DarkGray),
@@ -870,7 +953,7 @@ fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mu
     // close the modal to attach/pause/resume/remove.
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "a attach \u{b7} p pause \u{b7} r resume \u{b7} d delete \u{b7} esc close",
+            "a attach \u{b7} e edit \u{b7} t trigger \u{b7} p pause \u{b7} r resume \u{b7} d delete \u{b7} esc close",
             Style::default().fg(Color::DarkGray),
         )),
         chunks[3],

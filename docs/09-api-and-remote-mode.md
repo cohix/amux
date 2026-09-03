@@ -19,10 +19,10 @@ API metadata, credentials, and output logs are recorded durably under
 `~/.awman/api/` for auditability. The shared SQLite database is stored at
 `~/.awman/data/awman.db`.
 
-API mode is for request-driven sessions and commands. For recurring,
-scheduled automation, use the separate [squad daemon](12-squad.md),
-which manages scheduled tasks and their unattended agent runs. The API server
-and squad daemon share the database and are mutually exclusive on one machine.
+API mode is for request-driven sessions and commands. To hand recurring work to
+a group of agents that pick it up on their own, build a [squad](12-squad.md)
+instead. The API server and the squad daemon behind your squad share the
+database and are mutually exclusive on one machine.
 
 ---
 

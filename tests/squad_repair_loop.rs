@@ -213,6 +213,7 @@ fn task(name: &str) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }

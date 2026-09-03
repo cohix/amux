@@ -21,6 +21,33 @@ use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 /// prompt), which wraps and is always readable.
 pub const TASK_DESCRIPTION_TITLE: &str = "New squad task description";
 
+impl TuiCommandFrontend {
+    /// One optional-field edit prompt (WI 0110): prefilled with the current
+    /// value, cleared box means "fall back to the squad default".
+    ///
+    /// The TUI can express `Option<Option<_>>` without a sentinel token the way
+    /// the CLI needs one: the box arrives holding the current value, so
+    /// *emptying* it is an unambiguous "clear this", and leaving it alone is
+    /// "keep this".
+    fn ask_edited_optional(
+        &mut self,
+        title: &str,
+        noun: &str,
+        current: Option<&str>,
+    ) -> Result<Option<String>, CommandError> {
+        let response = self.ask_dialog(DialogRequest::TextInput {
+            title: title.to_string(),
+            prompt: format!("Leader {noun} (clear the box to use the squad default):"),
+            default_text: current.map(str::to_string),
+        })?;
+        match response {
+            DialogResponse::Text(t) if !t.trim().is_empty() => Ok(Some(t.trim().to_string())),
+            DialogResponse::Text(_) => Ok(None),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+}
+
 impl SquadCommandFrontend for TuiCommandFrontend {
     /// The TUI runs in the user's own terminal, so the process's current
     /// directory is theirs and the mount-scope question can be put to them.
@@ -53,6 +80,7 @@ impl SquadCommandFrontend for TuiCommandFrontend {
                      and how squad should handle the task each time it is triggered.\n\
                      (Ctrl+Enter to submit)"
                 .into(),
+            default_text: None,
         })?;
         match response {
             DialogResponse::Text(t) => Ok(t),
@@ -201,6 +229,137 @@ impl SquadCommandFrontend for TuiCommandFrontend {
         match response {
             DialogResponse::No => Ok(MountScope::Cwd),
             DialogResponse::Yes => Ok(MountScope::GitRoot),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    // ── Task agent pool (WI 0110) ──────────────────────────────────────
+
+    fn ask_use_global_squad_config(&mut self) -> Result<bool, CommandError> {
+        let response = self.ask_dialog(DialogRequest::YesNo {
+            title: "Agents and models".into(),
+            body: "A global squad configuration exists.\n\n\
+                   Use those settings for this task? \
+                   (No = give this task its own agents and models)"
+                .into(),
+        })?;
+        match response {
+            DialogResponse::Yes => Ok(true),
+            DialogResponse::No => Ok(false),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    fn ask_agent_model(
+        &mut self,
+        agent: &str,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let response = self.ask_dialog(DialogRequest::TextInput {
+            title: format!("Models for {agent} ({} added)", existing.len()),
+            prompt: format!("Add a model {agent} may use (blank to finish):"),
+            default_text: None,
+        })?;
+        match response {
+            DialogResponse::Text(t) if !t.trim().is_empty() => Ok(Some(t.trim().to_string())),
+            // A blank submission ends the loop; a dismissal abandons the
+            // interview, exactly as in the overlay step.
+            DialogResponse::Text(_) => Ok(None),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    fn ask_additional_agent(
+        &mut self,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let response = self.ask_dialog(DialogRequest::TextInput {
+            title: format!("Available agents ({} added)", existing.len()),
+            prompt: "Add another agent this task may use (blank to finish):".into(),
+            default_text: None,
+        })?;
+        match response {
+            DialogResponse::Text(t) if !t.trim().is_empty() => Ok(Some(t.trim().to_string())),
+            DialogResponse::Text(_) => Ok(None),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    // ── Task edit (WI 0110) ────────────────────────────────────────────
+
+    fn ask_edited_description(&mut self, current: &str) -> Result<String, CommandError> {
+        let response = self.ask_dialog(DialogRequest::MultilineInput {
+            title: "Edit squad task description".into(),
+            prompt: "Describe when this task fires and what squad should do.\n\
+                     (Ctrl+Enter to submit)"
+                .into(),
+            default_text: Some(current.to_string()),
+        })?;
+        match response {
+            DialogResponse::Text(t) => Ok(t),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    fn ask_edited_interval(&mut self, current: &str) -> Result<String, CommandError> {
+        let response = self.ask_dialog(DialogRequest::TextInput {
+            title: "Evaluation interval".into(),
+            prompt: "How often to evaluate (e.g. 6h, 1d):".into(),
+            default_text: Some(current.to_string()),
+        })?;
+        match response {
+            DialogResponse::Text(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
+            // A cleared box keeps the current value rather than meaning zero.
+            DialogResponse::Text(_) => Ok(current.to_string()),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    fn ask_edited_agent(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        self.ask_edited_optional("Leader agent", "agent", current)
+    }
+
+    fn ask_edited_model(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        self.ask_edited_optional("Leader model", "model", current)
+    }
+
+    fn ask_replace_overlays(&mut self, current: &[String]) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(none)".to_string()
+        } else {
+            current.join(", ")
+        };
+        let response = self.ask_dialog(DialogRequest::YesNo {
+            title: "Overlays".into(),
+            body: format!("Current overlays: {shown}\n\nReplace them? (No = leave them alone)"),
+        })?;
+        match response {
+            DialogResponse::Yes => Ok(true),
+            DialogResponse::No => Ok(false),
+            _ => Err(CommandError::Aborted),
+        }
+    }
+
+    fn ask_replace_agent_pool(
+        &mut self,
+        current: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(inherits the global squad settings)".to_string()
+        } else {
+            current
+                .iter()
+                .map(|(agent, models)| format!("{agent} = {}", models.join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let response = self.ask_dialog(DialogRequest::YesNo {
+            title: "Agents and models".into(),
+            body: format!("Current agents:\n{shown}\n\nReplace them? (No = leave them alone)"),
+        })?;
+        match response {
+            DialogResponse::Yes => Ok(true),
+            DialogResponse::No => Ok(false),
             _ => Err(CommandError::Aborted),
         }
     }

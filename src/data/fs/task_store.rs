@@ -69,6 +69,16 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
+    /// When `squad trigger` last asked for this task to be evaluated ahead of
+    /// its schedule, if that request has not been honoured yet.
+    ///
+    /// The scheduler treats a pending request as "the interval has elapsed":
+    /// it overrides the interval and any backoff, but not the three rules that
+    /// are about whether an evaluation is possible at all — a paused task, or
+    /// one whose previous run is still going, is not triggered. Cleared when
+    /// the run it asked for opens, so a trigger fires exactly once.
+    #[serde(default)]
+    pub trigger_requested_at: Option<DateTime<Utc>>,
     /// Outcome of the most recent run, read alongside the task in the same
     /// query. Derived, never stored on the task row: `squad_runs` remains the
     /// only record of a run.
@@ -253,6 +263,24 @@ pub struct RunDetail {
     pub error: Option<String>,
 }
 
+/// The mutable columns of a task, as a partial write (WI 0110).
+///
+/// Every field means "leave this column alone" when `None`. `agent` and
+/// `model` are nullable columns, so they take an extra level: `Some(None)`
+/// clears the column, `Some(Some(v))` sets it.
+///
+/// The immutable columns are absent on purpose — `name`, `repo_scope` and
+/// `mount_scope` are captured once at creation and define the task's identity
+/// and isolation (see [`Task`]'s type-level docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskUpdate {
+    pub description: Option<String>,
+    pub interval_secs: Option<u64>,
+    pub agent: Option<Option<String>>,
+    pub model: Option<Option<String>>,
+    pub overlays: Option<Vec<String>>,
+}
+
 /// A persisted squad evaluation attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
@@ -340,6 +368,11 @@ impl TaskStore {
         // contain. `NULL` (a row written before this column existed) decodes
         // to an empty list.
         Self::add_column_if_missing(conn, "squad_tasks", "overlays", "TEXT")?;
+        // Set by `squad trigger` and cleared the moment the run it asked for
+        // opens (`start_run`). It is a *request*, not a schedule: it survives
+        // a daemon restart, so a task triggered while the daemon was down is
+        // still evaluated when it comes back.
+        Self::add_column_if_missing(conn, "squad_tasks", "trigger_requested_at", "TEXT")?;
         Ok(())
     }
 
@@ -411,7 +444,7 @@ impl TaskStore {
         let raw = conn
             .query_row(
                 "SELECT id, name, description, repo_scope, mount_scope, overlays, interval_secs, status, agent, model,
-                        backoff_until, created_at, updated_at, last_run_at,
+                        backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                         (SELECT r.status FROM squad_runs r
                           WHERE r.task_id = squad_tasks.id
                           ORDER BY r.started_at DESC LIMIT 1)
@@ -430,7 +463,7 @@ impl TaskStore {
             // task grid needs it for every card, and one query per card would
             // be an N+1 across the daemon's HTTP surface.
             "SELECT id, name, description, repo_scope, mount_scope, overlays, interval_secs, status, agent, model,
-                    backoff_until, created_at, updated_at, last_run_at,
+                    backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                     (SELECT r.status FROM squad_runs r
                       WHERE r.task_id = squad_tasks.id
                       ORDER BY r.started_at DESC LIMIT 1)
@@ -438,6 +471,62 @@ impl TaskStore {
         )?;
         let rows = stmt.query_map([], task_from_row)?;
         collect_tasks(rows)
+    }
+
+    /// Apply an edit to one task, returning it as it now stands (`None` when
+    /// no task by that name exists).
+    ///
+    /// Only the columns the request actually carries are changed; `updated_at`
+    /// always is. Writing every mutable column from an already-read row — rather
+    /// than assembling a partial `UPDATE` per call — keeps one statement to
+    /// reason about and makes "leave alone" and "set to this" the same code
+    /// path.
+    pub fn update(&self, name: &str, req: &TaskUpdate) -> Result<Option<Task>, DataError> {
+        let Some(existing) = self.get(name)? else {
+            return Ok(None);
+        };
+        let description = req
+            .description
+            .clone()
+            .unwrap_or_else(|| existing.description.clone());
+        let interval_secs = req.interval_secs.unwrap_or(existing.interval_secs);
+        let interval_secs = i64::try_from(interval_secs).map_err(|_| {
+            DataError::Other(format!(
+                "task interval_secs {interval_secs} exceeds SQLite's signed integer range"
+            ))
+        })?;
+        // `Some(None)` clears the column; `None` leaves whatever is stored.
+        let agent = match &req.agent {
+            Some(value) => value.clone(),
+            None => existing.agent.clone(),
+        };
+        let model = match &req.model {
+            Some(value) => value.clone(),
+            None => existing.model.clone(),
+        };
+        let overlays = req
+            .overlays
+            .clone()
+            .unwrap_or_else(|| existing.overlays.clone());
+        {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE squad_tasks
+                 SET description = ?1, interval_secs = ?2, agent = ?3, model = ?4,
+                     overlays = ?5, updated_at = ?6
+                 WHERE name = ?7",
+                params![
+                    description,
+                    interval_secs,
+                    agent,
+                    model,
+                    encode_overlays(&overlays)?,
+                    timestamp(Utc::now()),
+                    name,
+                ],
+            )?;
+        }
+        self.get(name)
     }
 
     pub fn set_status(&self, name: &str, status: TaskStatus) -> Result<bool, DataError> {
@@ -448,9 +537,57 @@ impl TaskStore {
         )? > 0)
     }
 
+    /// Remove a task and the run history that references it, atomically.
+    ///
+    /// `squad_runs.task_id` carries a foreign key onto `squad_tasks(id)`, so a
+    /// bare `DELETE FROM squad_tasks` fails with `FOREIGN KEY constraint
+    /// failed` for every task that has ever been evaluated — which is every
+    /// task a user is likely to want to remove. The runs are deleted here with
+    /// the task, in one transaction, so the row set stays consistent whichever
+    /// statement fails.
+    ///
+    /// Removing the task is the only operation that discards its runs: nothing
+    /// on the evaluation path deletes history, exactly as nothing there deletes
+    /// the durable workspace (WI 0106 §6a).
     pub fn delete(&self, name: &str) -> Result<bool, DataError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM squad_tasks WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM squad_runs WHERE task_id = ?1", [&id])?;
+        let removed = tx.execute("DELETE FROM squad_tasks WHERE id = ?1", [&id])? > 0;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Record a `squad trigger` request: evaluate this task on the next tick
+    /// whatever its interval and backoff say. `Ok(false)` when no task by that
+    /// name exists.
+    ///
+    /// Triggering deliberately does **not** touch `status` or `last_run_at`.
+    /// A paused task stays paused (and so stays out of
+    /// [`due_for_evaluation`](Self::due_for_evaluation)), and the card's "last
+    /// run" timestamp keeps saying when the task last actually ran rather than
+    /// being rewritten to fake an elapsed interval. Backoff is cleared here
+    /// because the request is an explicit instruction to retry now, which is
+    /// the one thing backoff exists to defer.
+    pub fn request_trigger(&self, name: &str, now: DateTime<Utc>) -> Result<bool, DataError> {
         let conn = self.lock();
-        Ok(conn.execute("DELETE FROM squad_tasks WHERE name = ?1", [name])? > 0)
+        let now = timestamp(now);
+        Ok(conn.execute(
+            "UPDATE squad_tasks
+                SET trigger_requested_at = ?1, backoff_until = NULL, updated_at = ?1
+              WHERE name = ?2",
+            params![now, name],
+        )? > 0)
     }
 
     /// Select due tasks wholly in SQL. Do not duplicate this predicate in
@@ -460,18 +597,21 @@ impl TaskStore {
         let mut stmt = conn.prepare(
             "SELECT c.id, c.name, c.description, c.repo_scope, c.mount_scope, c.overlays, c.interval_secs,
                     c.status, c.agent, c.model, c.backoff_until, c.created_at, c.updated_at,
-                    c.last_run_at,
+                    c.last_run_at, c.trigger_requested_at,
                     (SELECT r2.status FROM squad_runs r2
                       WHERE r2.task_id = c.id
                       ORDER BY r2.started_at DESC LIMIT 1)
              FROM squad_tasks c
              WHERE c.status = 'active'
-               AND (c.backoff_until IS NULL OR c.backoff_until <= :now)
-               AND (c.last_run_at IS NULL
-                    OR (julianday(:now) - julianday(c.last_run_at)) * 86400.0 >= c.interval_secs)
+               AND (c.trigger_requested_at IS NOT NULL
+                    OR ((c.backoff_until IS NULL OR c.backoff_until <= :now)
+                        AND (c.last_run_at IS NULL
+                             OR (julianday(:now) - julianday(c.last_run_at)) * 86400.0
+                                >= c.interval_secs)))
                AND NOT EXISTS (SELECT 1 FROM squad_runs r
                                WHERE r.task_id = c.id AND r.status = 'running')
-             ORDER BY c.last_run_at IS NOT NULL, c.last_run_at ASC",
+             ORDER BY c.trigger_requested_at IS NULL,
+                      c.last_run_at IS NOT NULL, c.last_run_at ASC",
         )?;
         let now = timestamp(now);
         let rows = stmt.query_map(&[(":now", &now)], task_from_row)?;
@@ -491,8 +631,15 @@ impl TaskStore {
              VALUES (?1, ?2, 'running', ?3, ?4)",
             params![id.as_str(), task_id, session_id, timestamp(started_at)],
         )?;
+        // Opening the run is what honours a pending `squad trigger`, so the
+        // request is cleared here and not in the scheduler: a trigger fires
+        // exactly one evaluation, and clearing it in the same place the run
+        // row is created means no path can start a run and leave the request
+        // standing for the next tick to serve a second time.
         conn.execute(
-            "UPDATE squad_tasks SET last_run_at = ?1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE squad_tasks
+                SET last_run_at = ?1, updated_at = ?1, trigger_requested_at = NULL
+              WHERE id = ?2",
             params![timestamp(started_at), task_id],
         )?;
         Ok(id)
@@ -614,6 +761,7 @@ struct RawTask {
     created_at: String,
     updated_at: String,
     last_run_at: Option<String>,
+    trigger_requested_at: Option<String>,
     last_run_status: Option<String>,
 }
 
@@ -633,7 +781,8 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<RawTask> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         last_run_at: row.get(13)?,
-        last_run_status: row.get(14)?,
+        trigger_requested_at: row.get(14)?,
+        last_run_status: row.get(15)?,
     })
 }
 
@@ -658,6 +807,7 @@ fn task_from_raw(raw: RawTask) -> Result<Task, DataError> {
         created_at: timestamp_parse(&raw.created_at)?,
         updated_at: timestamp_parse(&raw.updated_at)?,
         last_run_at: timestamp_parse_opt(raw.last_run_at)?,
+        trigger_requested_at: timestamp_parse_opt(raw.trigger_requested_at)?,
         last_run_status: raw
             .last_run_status
             .as_deref()
@@ -776,6 +926,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         }
     }

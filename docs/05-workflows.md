@@ -1094,6 +1094,18 @@ When a step declares its own `agent` and/or `model`, the box shows the resolved 
 
 Steps that declare **neither** an `agent` nor a `model` field inherit the project-default agent and model, so they carry no label — an unlabelled box always means "project defaults". If a step overrides only one of the two, the label shows just that part. The label is truncated to fit narrow boxes.
 
+### Setup and teardown steps
+
+Setup and teardown steps get their own dedicated column at the start and end of the overview — never mixed in with the main steps' columns, however those happen to be grouped by `depends_on`. Each box carries the same status glyph and colour as any other step, with a `[setup]` or `[teardown]` title on the top border instead of an `agent/model` label:
+
+```
+╭[setup]──────────╮   ╭claude/opus-4-8──╮   ╭[teardown]────────╮
+│ ✓ install deps  │ → │ ● implement     │ → │ ○ push and clean │
+╰─────────────────╯   ╰─────────────────╯   ╰─────────────────╯
+```
+
+Multiple setup (or teardown) steps share that one leading (or trailing) column, and collapse to a `N steps…` summary in the minimized overview the same way a parallel group of main steps does — the `[setup]`/`[teardown]` title stays on the collapsed box too.
+
 ### Remediation in progress
 
 When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.

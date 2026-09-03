@@ -111,11 +111,17 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
         ("squad", "status"),
         ("squad", "logs"),
         ("squad", "add"),
+        // WI 0110: `squad edit` is API-allowed for the same reason `add` is —
+        // the daemon re-executes it from the remote gateway.
+        ("squad", "edit"),
         ("squad", "list"),
         ("squad", "show"),
         ("squad", "remove"),
         ("squad", "pause"),
         ("squad", "resume"),
+        // `squad trigger` is API-allowed for the same reason `pause`/`resume`
+        // are: the remote gateway reaches the daemon by re-executing it.
+        ("squad", "trigger"),
     ];
     assert_eq!(
         allowed.as_slice(),

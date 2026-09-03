@@ -114,6 +114,21 @@ pub struct WorkflowStepView {
     /// renderer (steps with the same sorted `depends_on` set sit in the
     /// same topological column).
     pub depends_on: Vec<String>,
+    /// Which phase this step belongs to. `Setup`/`Teardown` steps get their
+    /// own dedicated first/last column in the overview rather than being
+    /// grouped by `depends_on` topology alongside `Agent` steps.
+    pub kind: WorkflowStepKind,
+}
+
+/// The phase a [`WorkflowStepView`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStepKind {
+    /// A `setup:` step, run once before the main workflow steps.
+    Setup,
+    /// An ordinary workflow step, grouped into columns by `depends_on`.
+    Agent,
+    /// A `teardown:` step, run once after the main workflow steps.
+    Teardown,
 }
 
 /// Cross-thread shared workflow view state.

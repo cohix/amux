@@ -128,10 +128,17 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
             ))
         }
         SquadOutcome::Task(task) => Some(format!("Created task {}.", task.name)),
+        SquadOutcome::Updated(task) => Some(format!("Updated task {}.", task.name)),
         SquadOutcome::Removed { name, removed_dir } => Some(match removed_dir {
             Some(path) => format!("Removed task {name} (deleted {}).", path.display()),
             None => format!("Removed task {name}."),
         }),
+        // "on its next tick", not "now": the daemon evaluates on a fixed
+        // cadence, so promising an immediate start would be a promise the
+        // scheduler does not make.
+        SquadOutcome::Triggered { name } => Some(format!(
+            "Triggered task {name}; it will be evaluated on the next scheduler tick."
+        )),
         SquadOutcome::Ok => None,
         SquadOutcome::Status(status) => {
             if !status.running {

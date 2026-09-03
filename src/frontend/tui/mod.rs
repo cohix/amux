@@ -52,7 +52,7 @@ pub use per_command::remote::{
 #[cfg(test)]
 mod tests;
 
-use app::App;
+use app::{App, SquadTabStart};
 use dialogs::Dialog;
 use tabs::Tab;
 
@@ -99,7 +99,7 @@ pub async fn run(
             (app, true)
         }
         InitialTab::Squad => match App::build_squad_tab(&ctx.engines, &runtime_handle) {
-            Ok(build) => {
+            Ok(SquadTabStart::Ready(build)) => {
                 let key_setup = build.key_setup;
                 let mut app = App::new(
                     catalogue,
@@ -111,12 +111,26 @@ pub async fn run(
                 app.squad_gateway = Some(build.gateway);
                 // First run: the bearer key was minted a moment ago and lives
                 // only in memory. Show it before the event loop starts.
-                if let Some(body) = key_setup {
+                if let Some(key_setup) = key_setup {
                     app.active_dialog = Some(Dialog::Notice {
                         title: "squad authentication".to_string(),
-                        body,
+                        body: key_setup.body,
+                        copy_key: Some(key_setup.key),
+                        copy_zshrc_snippet: Some(key_setup.zshrc_snippet),
                     });
                 }
+                (app, false)
+            }
+            // The daemon is up, but this process holds no key for it. Open on
+            // the working directory rather than on a squad tab that would only
+            // ever render a 401, and put the one recovery in front of the user;
+            // accepting it builds the squad tab through the ordinary path.
+            Ok(SquadTabStart::KeyMissing) => {
+                let session = ctx.session.read().await.clone();
+                let tab = Tab::new(session);
+                let mut app =
+                    App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
+                app.active_dialog = Some(Dialog::SquadKeyMissing);
                 (app, false)
             }
             Err(message) => {

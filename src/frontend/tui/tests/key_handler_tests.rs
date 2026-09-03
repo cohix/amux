@@ -399,6 +399,7 @@ fn ctrl_w_with_no_workflow_is_silent_noop() {
 #[test]
 fn ctrl_w_during_running_step_sends_engine_request() {
     use crate::engine::workflow::EngineRequest;
+    use crate::frontend::tui::tabs::WorkflowStepKind;
     use crate::frontend::tui::tabs::WorkflowStepView;
     use crate::frontend::tui::tabs::WorkflowViewState;
 
@@ -412,6 +413,7 @@ fn ctrl_w_during_running_step_sends_engine_request() {
             agent: None,
             model: None,
             depends_on: vec![],
+            kind: WorkflowStepKind::Agent,
         }],
         current_step: Some("build".into()),
         max_concurrent: None,
@@ -546,7 +548,7 @@ fn cycle_to_hidden_does_not_send_resize() {
 
 #[test]
 fn scroll_down_reveals_hidden_parallel_steps() {
-    use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
     use crossterm::event::{MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
@@ -561,6 +563,7 @@ fn scroll_down_reveals_hidden_parallel_steps() {
                 agent: None,
                 model: None,
                 depends_on: vec![],
+                kind: WorkflowStepKind::Agent,
             })
             .collect(),
         current_step: None,
@@ -593,7 +596,7 @@ fn scroll_down_reveals_hidden_parallel_steps() {
 
 #[test]
 fn scroll_clamped_at_bounds() {
-    use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
     use crossterm::event::{MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
@@ -605,6 +608,7 @@ fn scroll_clamped_at_bounds() {
             agent: None,
             model: None,
             depends_on: vec![],
+            kind: WorkflowStepKind::Agent,
         }],
         current_step: None,
         max_concurrent: None,
@@ -788,6 +792,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -1266,5 +1271,539 @@ fn squad_detail_modal_a_routes_to_start_squad_attach() {
             .contains("squad requires a container runtime"),
         "'a' in the modal must route to start_squad_attach: {:?}",
         app.status_bar.text
+    );
+}
+
+// ─── WI 0110: task editing, detach, and the daemon-start confirmation ────────
+
+#[test]
+fn squad_list_e_dispatches_the_edit_interview_for_the_selected_task() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+    // Select the second card, so a wrong dispatch would name the wrong task.
+    if let Some(state) = app.active_tab_mut().squad.as_mut() {
+        state.selected = 1;
+    }
+
+    press_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+    assert!(
+        app.active_tab().command_result_rx.is_some(),
+        "'e' in the squad list must dispatch `squad edit --interview`"
+    );
+    assert!(
+        app.active_dialog.is_none(),
+        "the edit interview's own dialogs come from the command thread, not the key"
+    );
+}
+
+#[test]
+fn squad_list_e_is_a_noop_when_the_list_is_empty() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    press_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    assert!(app.active_tab().command_result_rx.is_none());
+}
+
+#[test]
+fn squad_detail_modal_e_edits_the_modals_task() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+
+    open_squad_detail(&mut app, "task-b");
+    press_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+    assert!(app.active_dialog.is_none(), "'e' closes the modal");
+    assert!(
+        app.active_tab().command_result_rx.is_some(),
+        "'e' in the modal must dispatch `squad edit`, exactly as the list key does"
+    );
+}
+
+/// WI 0110: Ctrl-\ is intercepted before the ContainerMaximized passthrough, in
+/// every focus context, so it can never reach an agent's PTY the way Ctrl-C
+/// deliberately does.
+#[test]
+fn ctrl_backslash_maps_to_detach_in_every_context_and_ctrl_c_still_reaches_the_pty() {
+    use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
+    for ctx in [
+        FocusContext::CommandBox,
+        FocusContext::ExecutionWindow,
+        FocusContext::ContainerMaximized,
+        FocusContext::SquadList,
+    ] {
+        assert_eq!(
+            map_key(
+                KeyEvent {
+                    code: KeyCode::Char('\\'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                ctx,
+            ),
+            Action::DetachContainers,
+            "ctrl-\\ must detach in {ctx:?}"
+        );
+        // A terminal without the kitty keyboard protocol enhancement reports
+        // the raw FS byte (0x1c); crossterm's legacy decoder maps that byte
+        // to Ctrl+'4', not the literal key. This is the encoding most real
+        // terminals actually send, so it must detach too.
+        assert_eq!(
+            map_key(
+                KeyEvent {
+                    code: KeyCode::Char('4'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                ctx,
+            ),
+            Action::DetachContainers,
+            "ctrl-\\'s legacy-terminal encoding (ctrl+'4') must detach in {ctx:?}"
+        );
+    }
+    // The contrast that motivates the binding: Ctrl-C is still forwarded.
+    assert!(matches!(
+        map_key(
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            FocusContext::ContainerMaximized,
+        ),
+        Action::ForwardToPty(_)
+    ));
+}
+
+/// On an ordinary tab, detaching leaves the command and its container running
+/// and merely stops keys going to the PTY — the container is minimized, not
+/// signalled, and Ctrl-M brings it back.
+#[test]
+fn ctrl_backslash_minimizes_an_ordinary_tabs_container_without_touching_it() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+    let mut app = make_app();
+    app.focus = Focus::ExecutionWindow;
+    let tab = app.active_tab_mut();
+    tab.start_container("claude".into(), "awman-test".into(), 80, 24);
+    tab.container_window_state = ContainerWindowState::Maximized;
+    assert!(app.active_tab().container_overlay_active());
+
+    press_key(&mut app, KeyCode::Char('\\'), KeyModifiers::CONTROL);
+
+    assert_eq!(
+        app.active_tab().container_window_state,
+        ContainerWindowState::Minimized,
+        "detach minimizes the container view"
+    );
+    assert_eq!(
+        app.active_tab().container_slots.len(),
+        1,
+        "the container itself is left running — only the view changed"
+    );
+    assert_eq!(app.focus, Focus::CommandBox);
+}
+
+/// Detaching a squad attach session drops the local view and its slots and
+/// returns to the task grid, leaving the daemon's containers alone.
+#[test]
+fn ctrl_backslash_ends_a_squad_attach_session_and_returns_to_the_grid() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a"]);
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.squad
+            .as_mut()
+            .expect("squad tab")
+            .begin_attach("task-a");
+    }
+
+    press_key(&mut app, KeyCode::Char('\\'), KeyModifiers::CONTROL);
+
+    let tab = app.active_tab();
+    assert!(
+        tab.squad.as_ref().unwrap().attached_task.is_none(),
+        "the attach session is over"
+    );
+    assert!(
+        tab.container_slots.is_empty(),
+        "its slots are dropped, so the task grid renders again"
+    );
+    assert!(
+        app.status_bar.text.contains("still running"),
+        "the user is told the containers survived: {:?}",
+        app.status_bar.text
+    );
+}
+
+/// WI 0110: `y` on the daemon-start confirmation is what actually opens the
+/// tab; `n` leaves no tab and says so. The sandbox-refusal app is used so the
+/// build attempt fails deterministically without touching a real daemon — the
+/// assertion is about which branch ran, not about the daemon.
+#[test]
+fn the_daemon_start_confirmation_opens_no_tab_until_it_is_accepted() {
+    let mut app = make_app_no_container_runtime();
+    let tabs_before = app.tabs.len();
+
+    app.active_dialog = Some(Dialog::SquadStartConfirm);
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none());
+    assert_eq!(app.tabs.len(), tabs_before, "declining opens no tab");
+    assert!(
+        app.status_bar.text.contains("not started"),
+        "declining says so: {:?}",
+        app.status_bar.text
+    );
+
+    app.active_dialog = Some(Dialog::SquadStartConfirm);
+    press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none());
+    assert!(
+        app.status_bar
+            .text
+            .contains("squad requires a container runtime"),
+        "accepting runs the build, which this app refuses for its runtime: {:?}",
+        app.status_bar.text
+    );
+}
+
+/// A sandbox-class runtime cannot back squad at all, so the refusal is
+/// reported instead of a confirmation whose "yes" could not be honoured.
+#[test]
+fn opening_the_squad_tab_refuses_a_sandbox_runtime_without_asking_to_start_a_daemon() {
+    let mut app = make_app_no_container_runtime();
+    app.open_or_focus_squad_tab();
+    assert!(
+        app.active_dialog.is_none(),
+        "no daemon-start question is raised when squad cannot run at all"
+    );
+    assert!(app
+        .status_bar
+        .text
+        .contains("squad requires a container runtime"));
+}
+
+// ─── `t` — evaluate a task now, ignoring its schedule ───────────────────────
+
+#[test]
+fn squad_list_t_triggers_the_selected_task() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+    // Select the second card, so a wrong dispatch would name the wrong task.
+    if let Some(state) = app.active_tab_mut().squad.as_mut() {
+        state.selected = 1;
+    }
+
+    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+
+    assert!(
+        app.active_tab().command_result_rx.is_some(),
+        "'t' in the squad list must dispatch `squad trigger`"
+    );
+    assert!(
+        app.active_dialog.is_none(),
+        "triggering asks nothing: it changes no stored schedule and starts \
+         nothing that is not already scheduled to happen"
+    );
+}
+
+#[test]
+fn squad_list_t_is_a_noop_when_the_list_is_empty() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+    assert!(app.active_tab().command_result_rx.is_none());
+}
+
+/// Plain `t` is squad-list-scoped. Ctrl-T is the global new-tab binding and
+/// must keep that meaning on the squad tab.
+#[test]
+fn ctrl_t_on_the_squad_tab_still_opens_a_new_tab_rather_than_triggering() {
+    use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
+    let key = crossterm::event::KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    assert!(
+        !matches!(map_key(key, FocusContext::SquadList), Action::SquadTrigger),
+        "Ctrl-T keeps its global meaning on the squad tab"
+    );
+}
+
+#[test]
+fn squad_detail_modal_t_triggers_the_modals_task() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+
+    open_squad_detail(&mut app, "task-b");
+    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+
+    assert!(app.active_dialog.is_none(), "'t' closes the modal");
+    assert!(
+        app.active_tab().command_result_rx.is_some(),
+        "'t' in the modal must dispatch `squad trigger`, exactly as the list key does"
+    );
+}
+
+/// Accepting the daemon-start confirmation must not freeze the TUI.
+///
+/// Starting a daemon spawns a process and then waits up to ten seconds for it
+/// to publish an endpoint. That wait used to run on the event-loop thread, so
+/// the terminal could not redraw for its whole duration: the confirmation the
+/// user had just answered stayed painted on screen, looking hung, and then
+/// vanished with only a status-bar line to say whether anything had happened.
+/// The wait now runs on the runtime, and the tab is installed later, by
+/// `poll_squad_startup`.
+///
+/// Answering `y` is never exercised against a real daemon here — that would
+/// spawn a background process from a unit test. What is asserted instead is
+/// the part that is observable without one: the key returns having installed
+/// no tab, and a start that is already in flight makes a second `y` inert, so
+/// two presses can never spawn two daemons.
+#[test]
+fn a_daemon_start_already_in_flight_makes_a_second_confirmation_inert() {
+    let mut app = make_app();
+    let tabs_before = app.tabs.len();
+    // A start is outstanding: the channel a real `y` would have installed.
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::SquadStartConfirm);
+
+    let started = std::time::Instant::now();
+    press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "answering the confirmation must not block the event loop: took {elapsed:?}"
+    );
+    assert_eq!(
+        app.tabs.len(),
+        tabs_before,
+        "the tab appears only once the daemon answers, in poll_squad_startup"
+    );
+    assert!(
+        app.squad_startup_rx.is_some(),
+        "the outstanding start is left alone rather than replaced by a second one"
+    );
+}
+
+/// The progress modal is what the user looks at while the daemon starts, and
+/// `poll_squad_startup` is what takes it away — never a key press, and never
+/// a redraw that happens to come first.
+#[test]
+fn the_progress_modal_survives_until_the_daemon_answers() {
+    let mut app = make_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::Loading {
+        title: "Starting squad daemon".to_string(),
+    });
+
+    app.tick_all_tabs();
+    assert!(
+        matches!(app.active_dialog, Some(Dialog::Loading { .. })),
+        "a tick with no answer yet leaves the progress modal up"
+    );
+
+    drop(tx);
+    app.tick_all_tabs();
+    assert!(
+        !matches!(app.active_dialog, Some(Dialog::Loading { .. })),
+        "a start that ends — even by dying — must take its progress modal with it"
+    );
+    assert!(app.squad_startup_rx.is_none());
+}
+
+/// A daemon that fails to start is reported in a modal, not only in the status
+/// bar: the user asked an explicit question, and the answer must not be
+/// something they can miss.
+#[test]
+fn a_failed_daemon_start_is_reported_in_a_modal() {
+    let mut app = make_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Err(
+        "failed to start the squad daemon: did not become ready within 10 seconds".to_string(),
+    ))
+    .unwrap();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::Loading {
+        title: "Starting squad daemon".to_string(),
+    });
+
+    app.poll_squad_startup();
+
+    match &app.active_dialog {
+        Some(Dialog::Notice { title, body, .. }) => {
+            assert!(title.contains("did not start"), "{title:?}");
+            assert!(body.contains("did not become ready"), "{body:?}");
+        }
+        other => panic!(
+            "a failed start must replace the progress modal with the reason, not {:?}",
+            other.is_some()
+        ),
+    }
+    assert!(
+        app.squad_startup_rx.is_none(),
+        "the start is no longer in flight"
+    );
+}
+
+// ─── the missing-key recovery ───────────────────────────────────────────────
+
+/// A gateway pointing nowhere. `poll_squad_startup` never calls it in the
+/// `Missing` arm — it discards it and raises the dialog — so a real endpoint
+/// is not needed to prove which arm ran.
+fn unreachable_gateway() -> crate::command::commands::squad::gateway::RemoteTaskGateway {
+    use crate::command::commands::http_core::HttpCore;
+    use crate::command::commands::squad::gateway::RemoteTaskGateway;
+    RemoteTaskGateway::new(HttpCore::new("http://127.0.0.1:1", "v1", None).unwrap())
+}
+
+/// A daemon this process cannot authenticate to gets the recovery dialog, not
+/// a tab. A tab would poll, be refused with 401, and render nothing but that.
+#[test]
+fn a_daemon_with_no_usable_key_raises_the_recovery_instead_of_opening_a_tab() {
+    use crate::command::commands::squad::daemon::SquadKeyState;
+
+    let mut app = make_app();
+    let tabs_before = app.tabs.len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok((unreachable_gateway(), SquadKeyState::Missing)))
+        .unwrap();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::Loading {
+        title: "Starting squad daemon".to_string(),
+    });
+
+    app.poll_squad_startup();
+
+    assert!(
+        matches!(app.active_dialog, Some(Dialog::SquadKeyMissing)),
+        "a missing key must raise its own recovery, not a generic failure"
+    );
+    assert_eq!(
+        app.tabs.len(),
+        tabs_before,
+        "no squad tab is opened for a daemon every request would be refused by"
+    );
+}
+
+/// Declining the recovery opens no tab and says why, rather than leaving the
+/// user staring at an unexplained absence.
+#[test]
+fn declining_the_key_recovery_opens_no_tab_and_says_so() {
+    let mut app = make_app();
+    let tabs_before = app.tabs.len();
+    app.active_dialog = Some(Dialog::SquadKeyMissing);
+
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+
+    assert!(app.active_dialog.is_none());
+    assert_eq!(app.tabs.len(), tabs_before);
+    assert!(
+        app.status_bar.text.contains("key") && app.status_bar.text.contains("was not opened"),
+        "declining must say what happened: {:?}",
+        app.status_bar.text
+    );
+}
+
+/// A refresh already in flight makes a second `y` inert, so two presses cannot
+/// mint two keys and restart the daemon twice.
+///
+/// The accepting press is deliberately not exercised against a real daemon:
+/// `y` terminates and restarts one, which a unit test must not do.
+#[test]
+fn a_key_refresh_already_in_flight_makes_a_second_acceptance_inert() {
+    let mut app = make_app();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::SquadKeyMissing);
+
+    press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+
+    assert!(
+        app.squad_startup_rx.is_some(),
+        "the outstanding refresh is left alone rather than replaced"
+    );
+    assert_eq!(app.tabs.len(), 1, "no tab appears until the refresh lands");
+}
+
+/// A refresh ends where a first run does — a key to display — and takes the
+/// same drain, so the recovery finishes by showing the user the key they were
+/// missing.
+#[test]
+fn a_completed_key_refresh_opens_the_tab_and_displays_the_new_key() {
+    use crate::command::commands::squad::daemon::SquadKeyState;
+
+    let mut app = make_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok((
+        unreachable_gateway(),
+        SquadKeyState::Minted {
+            setup: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
+            key: "deadbeef".to_string(),
+        },
+    )))
+    .unwrap();
+    app.squad_startup_rx = Some(rx);
+    app.active_dialog = Some(Dialog::Loading {
+        title: "Refreshing the squad key".to_string(),
+    });
+
+    app.poll_squad_startup();
+
+    assert!(
+        app.tabs.iter().any(|tab| tab.is_squad),
+        "a usable key means the squad tab opens"
+    );
+    match &app.active_dialog {
+        Some(Dialog::Notice { body, .. }) => assert!(
+            body.contains("deadbeef"),
+            "the new key must be displayed — it exists nowhere else: {body}"
+        ),
+        other => panic!(
+            "a minted key must be shown, not swallowed (dialog present: {})",
+            other.is_some()
+        ),
+    }
+}
+
+/// `c` and `z` copy the key/snippet to the clipboard but must not dismiss the
+/// notice — the user may want both before acknowledging it, and a copy is
+/// not itself an acknowledgment. Only Enter (or Esc) closes it.
+#[test]
+fn copying_the_squad_key_or_snippet_does_not_dismiss_the_notice() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "squad authentication".to_string(),
+        body: "deadbeef".to_string(),
+        copy_key: Some("deadbeef".to_string()),
+        copy_zshrc_snippet: Some("export AWMAN_SQUAD_KEY=deadbeef".to_string()),
+    });
+
+    press_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(
+        matches!(app.active_dialog, Some(Dialog::Notice { .. })),
+        "copying the key must not close the notice"
+    );
+
+    press_key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+    assert!(
+        matches!(app.active_dialog, Some(Dialog::Notice { .. })),
+        "copying the snippet must not close the notice"
+    );
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        app.active_dialog.is_none(),
+        "Enter still dismisses the notice"
     );
 }

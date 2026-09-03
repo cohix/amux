@@ -545,6 +545,27 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
+        // WI 0110: Ctrl-\ leaves the container view without signalling any
+        // container. A squad attach session ends outright (its local attach
+        // clients are killed, the daemon's containers keep running); an
+        // ordinary command's maximized container is merely minimized, so it
+        // keeps streaming into its status bar and Ctrl-M brings it back. In
+        // neither case does a byte reach the agent's PTY — that is the whole
+        // difference from Ctrl-C.
+        Action::DetachContainers => {
+            if crate::frontend::tui::squad_attach::detach_squad_attach(app) {
+                return;
+            }
+            if app.active_tab().container_overlay_active() {
+                app.active_tab_mut().container_window_state = tabs::ContainerWindowState::Minimized;
+                app.focus = Focus::CommandBox;
+                app.status_bar.text =
+                    "Detached from the container. It is still running — ctrl-m to return."
+                        .to_string();
+                app.needs_redraw = true;
+            }
+        }
+
         // ── squad list actions (WI 0102) ───────────────────────────────
         // Each either opens a dialog or dispatches through `spawn_command`
         // into Layer 2. None calls a gateway method directly — the keys are a
@@ -595,6 +616,19 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 },
             );
         }
+        // WI 0110: `e` is `n`'s counterpart for an existing task — the same
+        // Layer-2 interview, reached through the same `spawn_command` path,
+        // with the task name as its argument.
+        Action::SquadEdit => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                squad_edit_by_name(app, &name);
+            }
+        }
         Action::SquadPause => {
             let name = app
                 .active_tab()
@@ -613,6 +647,16 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .and_then(|state| state.selected_name());
             if let Some(name) = name {
                 squad_dispatch_by_name(app, "resume", &name);
+            }
+        }
+        Action::SquadTrigger => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                squad_dispatch_by_name(app, "trigger", &name);
             }
         }
         Action::SquadDelete => {
@@ -782,6 +826,34 @@ fn copy_selection_to_clipboard(app: &mut App) {
     }
 }
 
+/// Copy `text` to the clipboard for a dialog's `[c]`/`[z]` copy action (WI
+/// 0111) and report the outcome via `status_log`. Unlike a mouse-selection
+/// copy, a dialog has no selection state to clear on success, so this needs
+/// its own success feedback: `label` (e.g. "squad key") names what was
+/// copied.
+pub(super) fn copy_dialog_text_to_clipboard(app: &mut App, label: &str, text: &str) {
+    let (level, message) = match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        Ok(()) => (
+            crate::data::message::MessageLevel::Info,
+            format!("{label} copied to clipboard"),
+        ),
+        Err(e) => (
+            crate::data::message::MessageLevel::Error,
+            format!("clipboard unavailable: {e}"),
+        ),
+    };
+    app.active_tab_mut()
+        .status_log
+        .lock()
+        .map(|mut log| {
+            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                level,
+                text: message,
+            })
+        })
+        .ok();
+}
+
 // ─── Command submission ──────────────────────────────────────────────────────
 
 /// Handle command submission from the command box.
@@ -824,6 +896,29 @@ pub(super) fn squad_dispatch_by_name(app: &mut App, subcommand: &str, name: &str
         crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
             path: vec!["squad".into(), subcommand.into()],
             flags: Default::default(),
+            arguments,
+        },
+    );
+}
+
+/// Dispatch `squad edit <name> --interview` through the ordinary Layer-2 path
+/// (WI 0110). `pub(super)` so the detail modal can edit the task it is showing.
+pub(super) fn squad_edit_by_name(app: &mut App, name: &str) {
+    let mut arguments = std::collections::BTreeMap::new();
+    arguments.insert(
+        "name".to_string(),
+        crate::command::dispatch::parsed_input::ArgValue::Single(name.to_string()),
+    );
+    let mut flags = std::collections::BTreeMap::new();
+    flags.insert(
+        "interview".to_string(),
+        crate::command::dispatch::parsed_input::FlagValue::Bool(true),
+    );
+    app.spawn_command(
+        &format!("squad edit {name} --interview"),
+        crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
+            path: vec!["squad".into(), "edit".into()],
+            flags,
             arguments,
         },
     );

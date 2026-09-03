@@ -1,5 +1,6 @@
 //! The single Layer-2 squad command family.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -10,11 +11,12 @@ use crate::command::commands::squad::daemon::{
     SquadStatusFlags, SquadStopFlags,
 };
 use crate::command::commands::squad::gateway::{
-    CreateTask, DaemonStatus, TaskDetail, TaskGateway, DEFAULT_RUN_HISTORY_LIMIT,
+    CreateTask, DaemonStatus, TaskDetail, TaskGateway, UpdateTask, DEFAULT_RUN_HISTORY_LIMIT,
 };
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::config::global::GlobalConfig;
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
 use crate::data::fs::SquadPaths;
 use crate::data::message::UserMessageSink;
@@ -119,6 +121,75 @@ pub trait SquadCommandFrontend: UserMessageSink + Send + Sync {
         Err(interview_unavailable())
     }
 
+    // ── Task agent pool (WI 0110) ──────────────────────────────────────
+    //
+    // These collect the task-scoped `config.json`. Like the steps above they
+    // only collect: the map they build is validated by `SquadConfig::validate`
+    // before the daemon writes it.
+
+    /// Whether to keep using the global `squad` settings for this task. Only
+    /// asked when a global `squad` block exists; `true` skips the two questions
+    /// below and writes no task config. Defaulting to `true` means a frontend
+    /// that cannot ask inherits the global pool, which is what every task did
+    /// before task configs existed.
+    fn ask_use_global_squad_config(&mut self) -> Result<bool, CommandError> {
+        Ok(true)
+    }
+
+    /// One more model for `agent`, or `None` to finish. Called repeatedly, like
+    /// [`ask_task_overlay`](Self::ask_task_overlay).
+    fn ask_agent_model(
+        &mut self,
+        _agent: &str,
+        _existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        Ok(None)
+    }
+
+    /// One more agent this task may use, or `None` to finish. Its models are
+    /// collected by [`ask_agent_model`](Self::ask_agent_model) straight after.
+    fn ask_additional_agent(
+        &mut self,
+        _existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        Ok(None)
+    }
+
+    // ── Task edit (WI 0110) ────────────────────────────────────────────
+    //
+    // The edit interview asks the same fields creation does, prefilled with
+    // what the task currently carries, so submitting an unchanged box is a
+    // no-op rather than a silent reset.
+
+    fn ask_edited_description(&mut self, _current: &str) -> Result<String, CommandError> {
+        Err(interview_unavailable())
+    }
+    fn ask_edited_interval(&mut self, _current: &str) -> Result<String, CommandError> {
+        Err(interview_unavailable())
+    }
+    /// The leader agent as edited: `None` clears it back to the squad default.
+    fn ask_edited_agent(&mut self, _current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Err(interview_unavailable())
+    }
+    /// The leader model as edited: `None` clears it back to the squad default.
+    fn ask_edited_model(&mut self, _current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Err(interview_unavailable())
+    }
+    /// Whether to replace the task's overlays. `false` keeps the stored list
+    /// untouched; `true` starts the ordinary overlay loop from empty, so the
+    /// answer collected there replaces it wholesale.
+    fn ask_replace_overlays(&mut self, _current: &[String]) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+    /// Whether to replace the task's agent pool. `false` keeps whatever
+    /// `config.json` the task has (or has not) got.
+    fn ask_replace_agent_pool(
+        &mut self,
+        _current: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+
     /// Whether this frontend is the user's own session on the host that chose
     /// the paths in the request — and therefore whether the process's current
     /// directory is the user's and a human is there to answer a mount-scope
@@ -167,11 +238,25 @@ pub enum SquadSubcommand {
     Status(SquadStatusFlags),
     Logs(SquadLogsFlags),
     Add(SquadAddRequest),
+    /// Change an existing task (WI 0110). `interview` collects `update`'s
+    /// fields through the frontend instead of taking them from flags.
+    Edit {
+        name: String,
+        interview: bool,
+        update: UpdateTask,
+    },
     List,
     Show(String),
-    Remove { name: String, yes: bool },
+    Remove {
+        name: String,
+        yes: bool,
+    },
     Pause(String),
     Resume(String),
+    /// Evaluate a task on the next scheduler tick, whatever its interval and
+    /// backoff say. Carries only the task name: a trigger has nothing to
+    /// configure, and deliberately changes no stored schedule.
+    Trigger(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +277,18 @@ pub enum SquadOutcome {
     Task(Task),
     Detail(TaskDetail),
     Tasks(Vec<Task>),
+    /// A task asked to run ahead of its schedule by `squad trigger`. It
+    /// names the task so a frontend can confirm *which* one was triggered
+    /// without holding onto the request, and is distinct from
+    /// [`SquadOutcome::Ok`] so "triggered" is never rendered as a bare
+    /// success with nothing to say.
+    Triggered {
+        name: String,
+    },
+    /// A task as it stands after `squad edit` (WI 0110). Distinct from
+    /// [`SquadOutcome::Task`] so a frontend can say "updated" rather than
+    /// "created" without inspecting anything.
+    Updated(Task),
     Removed {
         name: String,
         /// The persistent task directory that was deleted, when one was.
@@ -308,6 +405,33 @@ impl Command for SquadCommand {
                         };
                         Ok(SquadOutcome::Task(gateway.create(req).await?))
                     }
+                    SquadSubcommand::Edit {
+                        name,
+                        interview,
+                        update,
+                    } => {
+                        let update = if interview {
+                            // The interview needs the task as it stands to
+                            // prefill its prompts, so it starts from a read
+                            // rather than from the flags.
+                            let current = gateway.get(&name).await?;
+                            let pool = read_task_agent_pool(&name)?;
+                            collect_task_edit_interview(frontend.as_mut(), &current, &pool)?
+                        } else {
+                            update
+                        };
+                        // Refusing an empty edit is the point: a request that
+                        // changes nothing would otherwise report success while
+                        // only moving `updated_at`.
+                        if update.is_empty() {
+                            return Err(CommandError::Other(format!(
+                                "squad edit {name}: nothing to change — pass at least one field \
+                                 flag (--description/--interval/--agent/--model/--overlay/\
+                                 --agent-models or a --clear-* flag), or use --interview"
+                            )));
+                        }
+                        Ok(SquadOutcome::Updated(gateway.update(&name, update).await?))
+                    }
                     SquadSubcommand::List => Ok(SquadOutcome::Tasks(gateway.list().await?)),
                     SquadSubcommand::Show(name) => {
                         // One response shape for both gateways: the task
@@ -335,6 +459,10 @@ impl Command for SquadCommand {
                     SquadSubcommand::Resume(name) => {
                         gateway.set_status(&name, TaskStatus::Active).await?;
                         Ok(SquadOutcome::Ok)
+                    }
+                    SquadSubcommand::Trigger(name) => {
+                        gateway.trigger(&name).await?;
+                        Ok(SquadOutcome::Triggered { name })
                     }
                     _ => unreachable!("daemon commands handled above"),
                 }
@@ -365,6 +493,7 @@ fn collect_task_interview(
     let overlays = collect_overlays(frontend)?;
     let agent = frontend.ask_task_agent()?;
     let model = frontend.ask_task_model()?;
+    let agents_to_models = collect_agent_pool(frontend, agent.as_deref())?;
     // The mount scope only distinguishes anything inside a git repository. A
     // default or non-repo custom workspace has one possible answer, so asking
     // would be a prompt with no alternative; the gateway overrides it with
@@ -382,7 +511,159 @@ fn collect_task_interview(
         agent,
         model,
         overlays,
+        agents_to_models,
     })
+}
+
+/// Collect the task's own agent pool (WI 0110).
+///
+/// Asked in three steps, and only the ones that can matter:
+///
+/// 1. When a global `squad` block already exists, the user is asked whether to
+///    use it. Answering yes returns an empty map — "no task config" — so the
+///    task inherits that block whole, exactly as every task did before task
+///    configs existed. With no global block there is nothing to inherit, so the
+///    question is skipped rather than offered as a choice between one option.
+/// 2. Extra models for the leader agent, whichever agent the task chose (or the
+///    one `squad.defaultLeader` names when the task chose none). This is the
+///    "additional model options for the default agent" half.
+/// 3. Extra agents, each followed by its own models.
+///
+/// A run of "no" answers yields an empty map and no file is written, so the
+/// interview is only as long as the user makes it.
+fn collect_agent_pool(
+    frontend: &mut dyn SquadCommandFrontend,
+    task_agent: Option<&str>,
+) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
+    let global = GlobalConfig::load().unwrap_or_default().squad;
+    if global.is_some() && frontend.ask_use_global_squad_config()? {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut pool: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Which agent the "default agent" questions are about: the task's own, else
+    // whatever `squad.defaultLeader` names. With neither, there is no agent to
+    // add models *to*, so step 2 is skipped and only extra agents are asked for.
+    let leader = task_agent.map(str::to_string).or_else(|| {
+        global
+            .as_ref()
+            .and_then(|cfg| cfg.default_leader.as_deref())
+            .map(|spec| {
+                spec.split_once("::")
+                    .map(|(agent, _)| agent)
+                    .unwrap_or(spec)
+                    .to_string()
+            })
+    });
+    if let Some(leader) = leader {
+        let models = collect_models_for_agent(frontend, &leader)?;
+        if !models.is_empty() {
+            pool.insert(leader, models);
+        }
+    }
+
+    loop {
+        let known: Vec<String> = pool.keys().cloned().collect();
+        let Some(agent) = frontend.ask_additional_agent(&known)? else {
+            break;
+        };
+        let models = collect_models_for_agent(frontend, &agent)?;
+        // An agent with no models still belongs in the pool: it names an agent
+        // the leader may use, with its model left to the agent's own default.
+        pool.entry(agent).or_default().extend(models);
+    }
+    Ok(pool)
+}
+
+/// The model loop for one agent: ask until a blank answer ends it.
+fn collect_models_for_agent(
+    frontend: &mut dyn SquadCommandFrontend,
+    agent: &str,
+) -> Result<Vec<String>, CommandError> {
+    let mut models: Vec<String> = Vec::new();
+    while let Some(model) = frontend.ask_agent_model(agent, &models)? {
+        if !models.iter().any(|existing| existing == &model) {
+            models.push(model);
+        }
+    }
+    Ok(models)
+}
+
+/// The agent pool a task currently carries, read from its own `config.json`.
+/// Empty when the task has none (it inherits the global block) — the same
+/// answer the interview's "use the global settings" branch produces.
+fn read_task_agent_pool(name: &str) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
+    let paths = SquadPaths::from_process_env()?;
+    let document = GlobalConfig::load_path(&paths.task_config_file(name)?)?;
+    Ok(document
+        .squad
+        .and_then(|squad| squad.agents_to_models)
+        .map(|map| map.into_iter().collect())
+        .unwrap_or_default())
+}
+
+/// Collect an edit interactively, prefilled from the task as it stands.
+///
+/// Every step returns the current value unchanged when the user submits the box
+/// as-is, and only fields that actually differ reach the [`UpdateTask`] — so an
+/// interview the user walks through without changing anything is refused as an
+/// empty edit rather than silently rewriting the task with its own values.
+fn collect_task_edit_interview(
+    frontend: &mut dyn SquadCommandFrontend,
+    current: &Task,
+    current_pool: &BTreeMap<String, Vec<String>>,
+) -> Result<UpdateTask, CommandError> {
+    let mut update = UpdateTask::default();
+
+    let description = frontend.ask_edited_description(&current.description)?;
+    if description != current.description {
+        update.description = Some(description);
+    }
+
+    let interval_raw = frontend.ask_edited_interval(&format!("{}s", current.interval_secs))?;
+    let interval_secs =
+        crate::command::dispatch::parse_squad_interval(&["squad", "edit"], &interval_raw)?;
+    if interval_secs != current.interval_secs {
+        update.interval_secs = Some(interval_secs);
+    }
+
+    let agent = frontend.ask_edited_agent(current.agent.as_deref())?;
+    if agent != current.agent {
+        update.agent = Some(agent);
+    }
+    let model = frontend.ask_edited_model(current.model.as_deref())?;
+    if model != current.model {
+        update.model = Some(model);
+    }
+
+    // Overlays and the agent pool are list-valued, so they are replace-or-keep
+    // rather than prefilled: there is no sensible "edit this list in place"
+    // prompt, and a blank answer in the collection loops already means "done".
+    if frontend.ask_replace_overlays(&current.overlays)? {
+        let overlays = collect_overlays(frontend)?;
+        if overlays != current.overlays {
+            update.overlays = Some(overlays);
+        }
+    }
+    if frontend.ask_replace_agent_pool(current_pool)? {
+        let pool = collect_agent_pool(frontend, update_agent_or(&update, current))?;
+        if &pool != current_pool {
+            update.agents_to_models = Some(pool);
+        }
+    }
+
+    Ok(update)
+}
+
+/// The leader agent an in-progress edit will end up with: the edited value
+/// where the edit set one, else what the task already carries. The agent-pool
+/// questions are about that agent, so they must see the edit's answer rather
+/// than the stale stored one.
+fn update_agent_or<'a>(update: &'a UpdateTask, current: &'a Task) -> Option<&'a str> {
+    match &update.agent {
+        Some(edited) => edited.as_deref(),
+        None => current.agent.as_deref(),
+    }
 }
 
 /// The two-choice workspace step, plus the custom path's warn/keep loop.

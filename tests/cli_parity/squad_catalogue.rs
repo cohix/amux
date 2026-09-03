@@ -82,6 +82,8 @@ fn every_squad_subcommand_has_the_contract_shape() {
             vec![],
             vec![
                 "agent",
+                // WI 0110: the task-scoped agent pool, shared with `squad edit`.
+                "agent-models",
                 "description",
                 "interval",
                 "interview",
@@ -96,11 +98,35 @@ fn every_squad_subcommand_has_the_contract_shape() {
                 "workspace",
             ],
         ),
+        // WI 0110: `squad edit` carries every field a task may change after
+        // creation. `name` stays an argument; `workspace`/`mount-scope` are
+        // absent because they are captured once and never edited.
+        (
+            "edit",
+            vec!["name"],
+            vec![
+                "agent",
+                "agent-models",
+                "clear-agent",
+                "clear-agent-models",
+                "clear-model",
+                "clear-overlays",
+                "description",
+                "interval",
+                "interview",
+                "model",
+                "non-interactive",
+                "overlay",
+            ],
+        ),
         ("list", vec![], vec!["json"]),
         ("show", vec!["name"], vec!["json"]),
         ("remove", vec!["name"], vec!["yes"]),
         ("pause", vec!["name"], vec![]),
         ("resume", vec!["name"], vec![]),
+        // `trigger` carries no flags: an out-of-schedule evaluation has
+        // nothing to configure, and it deliberately changes no stored field.
+        ("trigger", vec!["name"], vec![]),
         ("attach", vec!["name"], vec!["container"]),
     ];
 

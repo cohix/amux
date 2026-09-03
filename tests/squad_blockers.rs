@@ -19,7 +19,7 @@ use awman::command::commands::squad::commands::{
     SquadAddRequest, SquadCommand, SquadCommandFrontend, SquadOutcome, SquadSubcommand,
     TaskWorkspaceChoice,
 };
-use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway};
+use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
 use awman::command::commands::Command;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
@@ -65,6 +65,7 @@ fn sample_task(name: &str) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -73,6 +74,7 @@ fn sample_task(name: &str) -> Task {
 #[derive(Default)]
 struct RecordingGateway {
     created: Mutex<Vec<CreateTask>>,
+    updated: Mutex<Vec<(String, UpdateTask)>>,
     deleted: Mutex<Vec<String>>,
 }
 
@@ -81,6 +83,11 @@ impl TaskGateway for RecordingGateway {
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         let task = sample_task(&req.name);
         self.created.lock().unwrap().push(req);
+        Ok(task)
+    }
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        let task = sample_task(name);
+        self.updated.lock().unwrap().push((name.to_string(), req));
         Ok(task)
     }
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
@@ -93,6 +100,9 @@ impl TaskGateway for RecordingGateway {
         Ok(vec![])
     }
     async fn set_status(&self, _name: &str, _status: TaskStatus) -> Result<(), CommandError> {
+        Ok(())
+    }
+    async fn trigger(&self, _name: &str) -> Result<(), CommandError> {
         Ok(())
     }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
@@ -537,6 +547,9 @@ impl TaskGateway for SharedRecording {
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         self.0.create(req).await
     }
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        self.0.update(name, req).await
+    }
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
         self.0.list().await
     }
@@ -548,6 +561,9 @@ impl TaskGateway for SharedRecording {
     }
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
         self.0.set_status(name, status).await
+    }
+    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
+        self.0.trigger(name).await
     }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.0.delete(name).await

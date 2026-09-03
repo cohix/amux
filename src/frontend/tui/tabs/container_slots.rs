@@ -334,4 +334,29 @@ impl Tab {
         self.focused_slot_idx = 0;
         self.command_result_rx = None;
     }
+
+    /// Tear down an attach session's view of a tab (WI 0110), leaving every
+    /// container running.
+    ///
+    /// Unlike [`clear_container_slots`](Self::clear_container_slots) this is
+    /// *not* "the command is over": nothing here signals, kills, or waits on a
+    /// container. It drops the local view — slots, queued slot events, the
+    /// workflow snapshot, the summary bar — and re-arms
+    /// `suppress_container_auto_open` so a slot event still in flight cannot
+    /// immediately reopen the overlay the user just left.
+    pub fn end_attach_session(&mut self) {
+        self.container_slots.clear();
+        self.dormant_slots.clear();
+        self.focused_slot_idx = 0;
+        self.last_container_summary = None;
+        self.container_window_state = ContainerWindowState::Hidden;
+        self.suppress_container_auto_open = true;
+        self.execution_phase = ExecutionPhase::Idle;
+        if let Ok(mut events) = self.container_slot_events.lock() {
+            events.clear();
+        }
+        if let Ok(mut view) = self.workflow_state.lock() {
+            *view = None;
+        }
+    }
 }

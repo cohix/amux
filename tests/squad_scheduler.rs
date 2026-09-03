@@ -94,6 +94,7 @@ fn task(name: &str, interval_secs: u64) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }

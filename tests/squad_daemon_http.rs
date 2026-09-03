@@ -353,6 +353,7 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         })
         .unwrap();

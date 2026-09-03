@@ -191,6 +191,116 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         }
     }
 
+    // ── Task agent pool (WI 0110) ──────────────────────────────────────
+
+    fn ask_use_global_squad_config(&mut self) -> Result<bool, CommandError> {
+        Ok(super::per_command::helpers::yes_no(
+            "use the global squad agent/model settings for this task? \
+             (no = choose this task's own agents and models)",
+            true,
+        ))
+    }
+
+    fn ask_agent_model(
+        &mut self,
+        agent: &str,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let prompt = format!(
+            "add a model for {agent} ({} so far)? [blank to finish]",
+            existing.len()
+        );
+        match super::per_command::helpers::read_line(&prompt) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    fn ask_additional_agent(
+        &mut self,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let prompt = format!(
+            "add another agent this task may use ({} so far)? [blank to finish]",
+            existing.len()
+        );
+        match super::per_command::helpers::read_line(&prompt) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    // ── Task edit (WI 0110) ────────────────────────────────────────────
+
+    fn ask_edited_description(&mut self, current: &str) -> Result<String, CommandError> {
+        eprintln!("awman: current description:\n{current}");
+        require_multiline_input("new task description? (blank line then Ctrl-D keeps the current)")
+            .map(|edited| {
+                if edited.trim().is_empty() {
+                    current.to_string()
+                } else {
+                    edited
+                }
+            })
+    }
+
+    fn ask_edited_interval(&mut self, current: &str) -> Result<String, CommandError> {
+        match super::per_command::helpers::read_line(&format!("evaluation interval [{current}]?")) {
+            Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+            Some(_) => Ok(current.to_string()),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: "evaluation interval".into(),
+            }),
+        }
+    }
+
+    fn ask_edited_agent(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Ok(edited_optional(
+            "leader agent",
+            current,
+            super::per_command::helpers::read_line,
+        ))
+    }
+
+    fn ask_edited_model(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Ok(edited_optional(
+            "leader model",
+            current,
+            super::per_command::helpers::read_line,
+        ))
+    }
+
+    fn ask_replace_overlays(&mut self, current: &[String]) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(none)".to_string()
+        } else {
+            current.join(", ")
+        };
+        Ok(super::per_command::helpers::yes_no(
+            &format!("replace the task's overlays? current: {shown}"),
+            false,
+        ))
+    }
+
+    fn ask_replace_agent_pool(
+        &mut self,
+        current: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(inherits the global squad settings)".to_string()
+        } else {
+            current
+                .iter()
+                .map(|(agent, models)| format!("{agent}={}", models.join(",")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        Ok(super::per_command::helpers::yes_no(
+            &format!("replace the task's agents and models? current: {shown}"),
+            false,
+        ))
+    }
+
     fn ask_task_mount_scope(
         &mut self,
     ) -> Result<crate::data::fs::task_store::MountScope, CommandError> {
@@ -670,6 +780,27 @@ fn ensure_watch_signal_handler_installed() {
             let _ = tokio::signal::ctrl_c().await;
             WATCH_INTERRUPTED.store(true, Ordering::SeqCst);
         });
+    }
+}
+
+/// One optional-field edit prompt (WI 0110): show the current value, accept a
+/// replacement, keep the current value on a blank submission, and accept the
+/// literal `-` as "clear this back to the squad default".
+///
+/// The explicit clear token is what makes `Option<Option<_>>` answerable from a
+/// line-oriented prompt: blank already means "keep", so clearing needs a token
+/// of its own rather than a second question. The TUI needs no such token — its
+/// box arrives prefilled, so emptying it says the same thing.
+fn edited_optional(
+    label: &str,
+    current: Option<&str>,
+    read_line: fn(&str) -> Option<String>,
+) -> Option<String> {
+    let shown = current.unwrap_or("default");
+    match read_line(&format!("{label} [{shown}] ('-' to clear)?")) {
+        Some(value) if value.trim() == "-" => None,
+        Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => current.map(str::to_string),
     }
 }
 

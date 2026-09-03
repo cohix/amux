@@ -1,11 +1,13 @@
 //! Workflow Overview — horizontal display of workflow step progression.
 //!
 //! Layout:
-//! - Steps are grouped into **topological columns** ("stages") by sorted
-//!   `depends_on` signature (steps that share the same dependencies sit in
-//!   the same column).
+//! - Agent steps are grouped into **topological columns** ("stages") by
+//!   sorted `depends_on` signature (steps that share the same dependencies
+//!   sit in the same column). Setup and teardown steps are never part of
+//!   that DAG — they get their own dedicated leading/trailing column instead.
 //! - Each step renders as a **3-row rounded box** with a status glyph, the
-//!   step name, and the resolved `agent/model` on the top border.
+//!   step name, and a top-border title: the resolved `agent/model` for an
+//!   agent step, or `[setup]`/`[teardown]` for a setup/teardown step.
 //! - **Inter-column `→` arrows** sit on the middle row of the first row of
 //!   boxes, joining adjacent columns.
 //!
@@ -27,7 +29,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::data::workflow_state::{PhaseStepStatus, StepState, WorkflowState};
-use crate::frontend::tui::tabs::{WorkflowOverviewState, WorkflowStepView, WorkflowViewState};
+use crate::frontend::tui::tabs::{
+    WorkflowOverviewState, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+};
 
 /// Rows occupied by one step box (rounded border + one content row).
 pub const STEP_BOX_HEIGHT: u16 = 3;
@@ -117,6 +121,16 @@ pub fn render_workflow_overview(
         } else {
             vec![build_minimized_row(col_steps)]
         };
+        // A setup/teardown column is homogeneous by construction (see
+        // `build_workflow_columns`), so its phase label applies to every
+        // box in the column — the maximized-mode step box and the
+        // minimized-mode `N steps…` summary alike — as a top-edge title
+        // rather than text prepended to the step name.
+        let column_title = match col_steps.first().map(|s| s.kind) {
+            Some(WorkflowStepKind::Setup) => Some("[setup]".to_string()),
+            Some(WorkflowStepKind::Teardown) => Some("[teardown]".to_string()),
+            _ => None,
+        };
         // When the stage does not fit, the last visible slot is spent on the
         // `+ N more…` marker rather than on a step box — so that slot's step
         // counts as hidden too.
@@ -157,17 +171,19 @@ pub fn render_workflow_overview(
                     };
                     let (label, style) =
                         step_box_label_and_style(&name, &step.status, is_current, box_w);
-                    let title =
-                        step_agent_model_title(step.agent.as_deref(), step.model.as_deref(), box_w);
+                    let title = column_title.clone().or_else(|| {
+                        step_agent_model_title(step.agent.as_deref(), step.model.as_deref(), box_w)
+                    });
                     (label, style, title)
                 }
                 ColumnRow::Stage { count, status } => {
                     let name = format!("{count} steps\u{2026}");
                     // A stage summary stands for several steps that may run
                     // under different agents/models, so it carries no single
-                    // agent/model label — press Ctrl-O to see them.
+                    // agent/model label — press Ctrl-O to see them. A setup/
+                    // teardown column keeps its phase label even collapsed.
                     let (label, style) = step_box_label_and_style(&name, status, false, box_w);
-                    (label, style, None)
+                    (label, style, column_title.clone())
                 }
             };
 
@@ -318,11 +334,12 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
 
     for ps in &state.setup_step_states {
         steps.push(WorkflowStepView {
-            name: format!("[setup] {}", ps.description),
+            name: ps.description.clone(),
             status: phase_step_status_to_str(&ps.status).to_string(),
             agent: None,
             model: None,
             depends_on: Vec::new(),
+            kind: WorkflowStepKind::Setup,
         });
     }
 
@@ -339,16 +356,18 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
             agent: info.agent.clone(),
             model: info.model.clone(),
             depends_on: info.depends_on.clone(),
+            kind: WorkflowStepKind::Agent,
         });
     }
 
     for ps in &state.teardown_step_states {
         steps.push(WorkflowStepView {
-            name: format!("[teardown] {}", ps.description),
+            name: ps.description.clone(),
             status: phase_step_status_to_str(&ps.status).to_string(),
             agent: None,
             model: None,
             depends_on: Vec::new(),
+            kind: WorkflowStepKind::Teardown,
         });
     }
 
@@ -389,19 +408,28 @@ fn phase_step_status_to_str(status: &PhaseStepStatus) -> &'static str {
     }
 }
 
-/// Group steps into columns by topological depth. Steps at the same depth
-/// form a parallel group (same column). Depth is the longest path from any
-/// root (step with no dependencies) to this step. Steps that share the exact
-/// same set of dependencies at the same depth are grouped together — steps
-/// that depend on members of the previous parallel group all land in the next
+/// Group steps into columns. Setup and teardown steps are never part of the
+/// dependency DAG — they always run first and last — so they get their own
+/// dedicated leading/trailing column rather than being grouped by topological
+/// depth alongside the agent steps.
+///
+/// Agent steps are grouped by topological depth: steps at the same depth form
+/// a parallel group (same column). Depth is the longest path from any root
+/// (step with no dependencies) to this step. Steps that share the exact same
+/// set of dependencies at the same depth are grouped together — steps that
+/// depend on members of the previous parallel group all land in the next
 /// column regardless of which specific member they depend on.
 fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
     use std::collections::HashMap;
 
+    // Only agent steps participate in the `depends_on` DAG — a setup or
+    // teardown pseudo-step's name is a free-text description, never a
+    // dependency target.
     let step_names: HashMap<&str, usize> = state
         .steps
         .iter()
         .enumerate()
+        .filter(|(_, s)| s.kind == WorkflowStepKind::Agent)
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
 
@@ -410,6 +438,9 @@ fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepVie
     while changed {
         changed = false;
         for (i, step) in state.steps.iter().enumerate() {
+            if step.kind != WorkflowStepKind::Agent {
+                continue;
+            }
             for dep in &step.depends_on {
                 if let Some(&dep_idx) = step_names.get(dep.as_str()) {
                     let new_depth = depths[dep_idx] + 1;
@@ -422,20 +453,46 @@ fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepVie
         }
     }
 
-    let max_depth = depths.iter().copied().max().unwrap_or(0);
-    let mut columns: Vec<Vec<&WorkflowStepView>> = Vec::with_capacity(max_depth + 1);
+    let agent_indices: Vec<usize> = state
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == WorkflowStepKind::Agent)
+        .map(|(i, _)| i)
+        .collect();
+    let max_depth = agent_indices.iter().map(|&i| depths[i]).max().unwrap_or(0);
+
+    let mut columns: Vec<Vec<&WorkflowStepView>> = Vec::with_capacity(max_depth + 3);
+
+    let setup: Vec<&WorkflowStepView> = state
+        .steps
+        .iter()
+        .filter(|s| s.kind == WorkflowStepKind::Setup)
+        .collect();
+    if !setup.is_empty() {
+        columns.push(setup);
+    }
+
     for d in 0..=max_depth {
-        let col: Vec<&WorkflowStepView> = state
-            .steps
+        let col: Vec<&WorkflowStepView> = agent_indices
             .iter()
-            .enumerate()
-            .filter(|(i, _)| depths[*i] == d)
-            .map(|(_, s)| s)
+            .filter(|&&i| depths[i] == d)
+            .map(|&i| &state.steps[i])
             .collect();
         if !col.is_empty() {
             columns.push(col);
         }
     }
+
+    let teardown: Vec<&WorkflowStepView> = state
+        .steps
+        .iter()
+        .filter(|s| s.kind == WorkflowStepKind::Teardown)
+        .collect();
+    if !teardown.is_empty() {
+        columns.push(teardown);
+    }
+
     columns
 }
 
@@ -539,6 +596,18 @@ mod tests {
             agent: None,
             model: None,
             depends_on: deps.into_iter().map(|s| s.into()).collect(),
+            kind: WorkflowStepKind::Agent,
+        }
+    }
+
+    fn phase_step(kind: WorkflowStepKind, name: &str, status: &str) -> WorkflowStepView {
+        WorkflowStepView {
+            name: name.into(),
+            status: status.into(),
+            agent: None,
+            model: None,
+            depends_on: Vec::new(),
+            kind,
         }
     }
 
@@ -581,6 +650,41 @@ mod tests {
         assert_eq!(cols[0].len(), 1); // a
         assert_eq!(cols[1].len(), 2); // b, c
         assert_eq!(cols[2].len(), 2); // d, e
+    }
+
+    #[test]
+    fn build_workflow_columns_gives_setup_and_teardown_their_own_first_and_last_column() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "clone repo", "done"),
+            step("a", "done", vec![]),
+            step("b", "running", vec!["a"]),
+            phase_step(WorkflowStepKind::Teardown, "clean up", "pending"),
+        ]);
+        let cols = build_workflow_columns(&v);
+        // setup | a | b | teardown — never merged with the first/last agent
+        // column, regardless of the agent steps' own depth-0/depth-1 split.
+        assert_eq!(cols.len(), 4);
+        assert_eq!(cols[0].len(), 1);
+        assert_eq!(cols[0][0].name, "clone repo");
+        assert_eq!(cols[0][0].kind, WorkflowStepKind::Setup);
+        assert_eq!(cols[1][0].name, "a");
+        assert_eq!(cols[2][0].name, "b");
+        assert_eq!(cols[3].len(), 1);
+        assert_eq!(cols[3][0].name, "clean up");
+        assert_eq!(cols[3][0].kind, WorkflowStepKind::Teardown);
+    }
+
+    #[test]
+    fn build_workflow_columns_multiple_setup_steps_share_the_leading_column() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "clone repo", "done"),
+            phase_step(WorkflowStepKind::Setup, "install deps", "running"),
+            step("a", "pending", vec![]),
+        ]);
+        let cols = build_workflow_columns(&v);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].len(), 2, "both setup steps share one column");
+        assert_eq!(cols[1][0].name, "a");
     }
 
     const ROOMY: u16 = 200;
@@ -877,6 +981,45 @@ mod tests {
             text.contains("claude/opus-4-8"),
             "expected agent/model title on the box border, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn overview_shows_setup_and_teardown_as_top_edge_titles_not_body_text() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "clone repo", "done"),
+            step("build", "running", vec![]),
+            phase_step(WorkflowStepKind::Teardown, "clean up", "pending"),
+        ]);
+        let text = render_overview_text(&v, 80, 3);
+        assert!(
+            text.contains("[setup]"),
+            "setup column must carry a [setup] title, got:\n{text}"
+        );
+        assert!(
+            text.contains("[teardown]"),
+            "teardown column must carry a [teardown] title, got:\n{text}"
+        );
+        assert!(
+            !text.contains("[setup] clone repo") && !text.contains("[teardown] clean up"),
+            "the phase label must not be prepended to the body text, got:\n{text}"
+        );
+        assert!(text.contains("clone repo"), "got:\n{text}");
+        assert!(text.contains("clean up"), "got:\n{text}");
+    }
+
+    #[test]
+    fn minimized_setup_column_keeps_its_title_when_collapsed_to_a_stage_summary() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "clone repo", "done"),
+            phase_step(WorkflowStepKind::Setup, "install deps", "running"),
+            step("build", "pending", vec![]),
+        ]);
+        let text = render_overview_text_in(&v, 80, 3, WorkflowOverviewState::Minimized);
+        assert!(
+            text.contains("[setup]"),
+            "collapsed setup stage must still carry its title, got:\n{text}"
+        );
+        assert!(text.contains("2 steps\u{2026}"), "got:\n{text}");
     }
 
     #[test]

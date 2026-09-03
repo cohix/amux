@@ -20,7 +20,7 @@ use crate::data::workflow_state::{StepState, WorkflowState};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::frontend::attach::{list_task_containers, no_run_in_progress};
-use crate::frontend::tui::app::App;
+use crate::frontend::tui::app::{App, Focus};
 use crate::frontend::tui::per_command::TuiContainerProxy;
 use crate::frontend::tui::tabs::{
     ContainerSlotEvent, ContainerSlotIo, ExecutionPhase, SharedContainerSlotEvents,
@@ -437,7 +437,10 @@ pub fn start_squad_attach(app: &mut App, task: &str) {
         command: format!("squad attach {task}"),
     };
     tab.suppress_container_auto_open = false;
-    squad_state.attached_task = Some(task.to_string());
+    // WI 0110: the session gets its own cancellation token (a child of the
+    // tab's), so Ctrl-\ can end just this attach — its local attach clients
+    // and its workflow poller — without stopping the task-list poller.
+    let cancel = squad_state.begin_attach(task);
     squad_state
         .daemon_reachable
         .store(initially_reachable, Ordering::Relaxed);
@@ -446,7 +449,6 @@ pub fn start_squad_attach(app: &mut App, task: &str) {
     let slot_events = tab.container_slot_events.clone();
     let status_log = tab.status_log.clone();
     let reachable = squad_state.daemon_reachable.clone();
-    let cancel = squad_state.cancel.clone();
     let evaluation_metadata = squad_state
         .snapshot
         .lock()
@@ -508,11 +510,37 @@ pub fn start_squad_attach(app: &mut App, task: &str) {
         }
     }
     let poll_task = poller.start(cancel);
-    squad_state.set_poll_handle(poll_task);
+    squad_state.set_attach_handle(poll_task);
 }
 
 fn push_slot_event(events: &SharedContainerSlotEvents, event: ContainerSlotEvent) {
     if let Ok(mut queue) = events.lock() {
         queue.push_back(event);
     }
+}
+
+/// End the squad attach session owning the active tab, leaving every container
+/// running (WI 0110). Returns `false` when the tab has no attach session, so
+/// the caller can fall back to the ordinary container-view detach.
+///
+/// Cancelling the attach-scoped token stops the *local* attach clients — the
+/// `docker attach` processes this awman started — and the session's workflow
+/// poller. It never reaches the containers: they were started by the squad
+/// daemon and go on running exactly as they do when the CLI's `squad attach`
+/// is detached from. The task-list poller keeps its own token and keeps
+/// refreshing the grid the user lands back on.
+pub fn detach_squad_attach(app: &mut App) -> bool {
+    let tab = app.active_tab_mut();
+    let Some(state) = tab.squad.as_mut() else {
+        return false;
+    };
+    let Some(task) = state.end_attach() else {
+        return false;
+    };
+    tab.end_attach_session();
+    app.focus = Focus::ExecutionWindow;
+    app.status_bar.text =
+        format!("Detached from {task}. Its containers are still running — press 'a' to reattach.");
+    app.needs_redraw = true;
+    true
 }

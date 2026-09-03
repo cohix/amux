@@ -12,6 +12,38 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
         .map(|g| g.is_some())
         .unwrap_or(false);
 
+    // A squad tab renders the card grid in place of the execution window, so
+    // the execution-window hints below ("Exit code", "press ↑ to focus the
+    // window") describe something that is not on screen. What is worth saying
+    // there instead is the last squad action that failed: every squad key
+    // binding dispatches through `spawn_command`, whose failure lands in the
+    // tab's `ExecutionPhase` and in a status log the grid never renders. Put
+    // it here and a key that "did nothing" says why.
+    //
+    // Once an attach session owns the tab's slots the container view is on
+    // screen instead of the grid (see `render.rs`'s matching
+    // `container_slots.is_empty()` check), so fall through to the ordinary
+    // hints below — including `ctrl-\ detach` — instead of returning early.
+    if tab.is_squad && tab.container_slots.is_empty() {
+        let spans = match &tab.execution_phase {
+            ExecutionPhase::Error { command, message } => {
+                vec![Span::styled(
+                    format!(" {} ", squad_failure_text(command, message)),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )]
+            }
+            _ => vec![Span::styled(
+                " \u{00b7} ctrl-g git ",
+                Style::default().fg(Color::DarkGray),
+            )],
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black)),
+            area,
+        );
+        return;
+    }
+
     let mut spans: Vec<Span> = match (&tab.execution_phase, app.focus, tab.container_window_state) {
         // Running + ExecWindow + Maximized container
         (
@@ -19,16 +51,20 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
             Focus::ExecutionWindow,
             ContainerWindowState::Maximized,
         ) => {
+            // WI 0110: `ctrl-\ detach` is advertised wherever keys are being
+            // forwarded to a container, because that is exactly where Ctrl-C
+            // would otherwise be the only way out — and Ctrl-C reaches the
+            // agent.
             if workflow_active {
                 vec![Span::styled(
-                    " ctrl-m minimize  \u{00b7}  ctrl-w workflow controls ",
+                    " ctrl-m minimize  \u{00b7}  ctrl-\\ detach  \u{00b7}  ctrl-w workflow controls ",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )]
             } else {
                 vec![Span::styled(
-                    " ctrl-m minimize  \u{00b7}  scroll \u{2195} history ",
+                    " ctrl-m minimize  \u{00b7}  ctrl-\\ detach  \u{00b7}  scroll \u{2195} history ",
                     Style::default().fg(Color::Yellow),
                 )]
             }
@@ -159,4 +195,16 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     frame.render_widget(bar, area);
+}
+
+/// The hint-bar text for a squad action that failed. `command` is the command
+/// line the key binding dispatched (`squad pause nightly`); it is empty only
+/// when a failure arrives before one was recorded, which is why the fallback
+/// still names squad rather than reading as a bare error.
+pub(crate) fn squad_failure_text(command: &str, message: &str) -> String {
+    if command.is_empty() {
+        format!("squad action failed: {message}")
+    } else {
+        format!("{command} failed: {message}")
+    }
 }

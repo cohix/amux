@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
-use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway};
+use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::parsed_input::parse as parse_command_box;
 use awman::command::dispatch::{BuiltCommand, Dispatch, Engines};
@@ -58,6 +58,10 @@ struct RecordingGateway {
     /// Dispatch actually resolved (interval, workspace, overlays) and not just
     /// that a call happened.
     created: Arc<Mutex<Vec<CreateTask>>>,
+    /// Every `UpdateTask` that reached the gateway (WI 0110), so a test can
+    /// assert what Dispatch resolved — clears in particular, which a call
+    /// name alone cannot distinguish from an unmentioned field.
+    updated: Arc<Mutex<Vec<UpdateTask>>>,
 }
 
 impl RecordingGateway {
@@ -67,6 +71,13 @@ impl RecordingGateway {
 
     fn created(&self) -> Vec<CreateTask> {
         self.created
+            .lock()
+            .expect("recording gateway mutex")
+            .clone()
+    }
+
+    fn updated(&self) -> Vec<UpdateTask> {
+        self.updated
             .lock()
             .expect("recording gateway mutex")
             .clone()
@@ -97,6 +108,7 @@ fn task(name: &str) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -110,6 +122,15 @@ impl TaskGateway for RecordingGateway {
             .expect("recording gateway mutex")
             .push(request.clone());
         Ok(task(&request.name))
+    }
+
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        self.push(format!("update:{name}"));
+        self.updated
+            .lock()
+            .expect("recording gateway mutex")
+            .push(req);
+        Ok(task(name))
     }
 
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
@@ -145,6 +166,11 @@ impl TaskGateway for RecordingGateway {
                 TaskStatus::Paused => "paused",
             }
         ));
+        Ok(())
+    }
+
+    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
+        self.push(format!("trigger:{name}"));
         Ok(())
     }
 
@@ -301,6 +327,12 @@ async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
             "squad show recorded",
             vec!["get:recorded".to_string(), "runs:recorded:20".to_string()],
         ),
+        // WI 0110: a scripted edit is one `update` call, exactly like the
+        // other CRUD verbs, with no frontend-side validation of its own.
+        (
+            "squad edit recorded --description updated --interval 10m",
+            vec!["update:recorded".to_string()],
+        ),
         ("squad remove recorded", vec!["delete:recorded".to_string()]),
         (
             "squad pause recorded",
@@ -309,6 +341,13 @@ async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
         (
             "squad resume recorded",
             vec!["set_status:recorded:active".to_string()],
+        ),
+        // `squad trigger` is its own gateway verb, not a `set_status` or an
+        // `update`: it changes no stored schedule, so nothing about the task's
+        // configuration is rewritten to make it run.
+        (
+            "squad trigger recorded",
+            vec!["trigger:recorded".to_string()],
         ),
     ];
 
@@ -969,4 +1008,94 @@ fn json_cli_failure_is_a_structured_error_with_nonzero_exit() {
     assert!(body["error"]
         .as_str()
         .is_some_and(|message| !message.is_empty()));
+}
+
+/// WI 0110: `squad edit` with no field flags would only bump `updated_at`, so
+/// Layer 2 refuses it outright rather than reporting a successful no-op. The
+/// gateway must never be reached.
+#[tokio::test]
+async fn squad_edit_with_no_fields_is_refused_before_the_gateway() {
+    let env = helpers::IsolatedEnv::new();
+    let session = env.open_session();
+    let gateway = Arc::new(RecordingGateway::default());
+
+    let error = run_cli(
+        "squad edit recorded",
+        &session,
+        engines_at(env.home_dir.path()),
+        gateway.clone(),
+    )
+    .await
+    .expect_err("an edit that changes nothing must be refused");
+
+    assert!(
+        error.to_string().contains("nothing to change"),
+        "the refusal should say what is missing: {error}"
+    );
+    assert!(
+        gateway.calls().is_empty(),
+        "no gateway call may be made for an empty edit: {:?}",
+        gateway.calls()
+    );
+}
+
+/// The clear flags are how an edit says "fall back to the squad default", and
+/// they must survive the trip through Dispatch as `Some(None)` rather than
+/// being indistinguishable from an unmentioned field.
+#[tokio::test]
+async fn squad_edit_clear_flags_reach_the_gateway_as_explicit_clears() {
+    let env = helpers::IsolatedEnv::new();
+    let session = env.open_session();
+    let gateway = Arc::new(RecordingGateway::default());
+
+    run_cli(
+        "squad edit recorded --clear-agent --clear-model --clear-overlays --clear-agent-models",
+        &session,
+        engines_at(env.home_dir.path()),
+        gateway.clone(),
+    )
+    .await
+    .expect("clear-only edits are real edits");
+
+    let update = gateway
+        .updated()
+        .pop()
+        .expect("the edit must reach the gateway");
+    assert_eq!(update.agent, Some(None));
+    assert_eq!(update.model, Some(None));
+    assert_eq!(update.overlays, Some(Vec::new()));
+    assert_eq!(update.agents_to_models, Some(Default::default()));
+}
+
+/// `--agent-models` is parsed at the dispatch boundary, so Layer 2 and the
+/// daemon only ever see the assembled pool.
+#[tokio::test]
+async fn squad_edit_agent_models_specs_reach_the_gateway_as_a_pool() {
+    let env = helpers::IsolatedEnv::new();
+    let session = env.open_session();
+    let gateway = Arc::new(RecordingGateway::default());
+
+    run_cli(
+        "squad edit recorded --agent-models claude=opus,sonnet --agent-models codex=gpt-5",
+        &session,
+        engines_at(env.home_dir.path()),
+        gateway.clone(),
+    )
+    .await
+    .expect("an agent-models edit must reach the gateway");
+
+    let pool = gateway
+        .updated()
+        .pop()
+        .expect("the edit must reach the gateway")
+        .agents_to_models
+        .expect("the pool must be carried");
+    assert_eq!(
+        pool.get("claude").map(Vec::as_slice),
+        Some(["opus", "sonnet"].map(String::from).as_slice())
+    );
+    assert_eq!(
+        pool.get("codex").map(Vec::as_slice),
+        Some(["gpt-5"].map(String::from).as_slice())
+    );
 }

@@ -82,6 +82,7 @@ impl NewCommandFrontend for TuiCommandFrontend {
         let response = self.ask_dialog(DialogRequest::MultilineInput {
             title: "Step prompt".into(),
             prompt: "Enter the step prompt (Ctrl+Enter to submit):".into(),
+            default_text: None,
         })?;
         match response {
             DialogResponse::Text(t) => Ok(t),
@@ -128,6 +129,7 @@ impl NewCommandFrontend for TuiCommandFrontend {
         let response = self.ask_dialog(DialogRequest::MultilineInput {
             title: "Skill body".into(),
             prompt: "Enter the skill body content (Ctrl+Enter to submit):".into(),
+            default_text: None,
         })?;
         match response {
             DialogResponse::Text(t) => Ok(t),
