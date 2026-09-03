@@ -841,15 +841,19 @@ fn squad_list_app() -> App {
     app
 }
 
+/// WI 0112: the squad shortcut lives in the dialog's key-hint row (asserted
+/// by the render tests), not in the prompt body.
 #[test]
-fn ctrl_t_new_tab_dialog_shows_press_ctrl_s_hint() {
+fn ctrl_t_new_tab_dialog_prompt_is_the_working_directory_question_alone() {
     let mut app = make_app();
     press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
     match &app.active_dialog {
-        Some(Dialog::TextInput { prompt, .. }) => {
+        Some(Dialog::TextInput { title, prompt, .. }) => {
+            assert_eq!(title, crate::frontend::tui::dialogs::NEW_TAB_DIALOG_TITLE);
+            assert_eq!(prompt, "Working directory:");
             assert!(
-                prompt.contains("Press Ctrl-S to open squad"),
-                "New Tab prompt must hint at squad: {prompt:?}"
+                !prompt.contains("Ctrl-S"),
+                "the squad hint belongs in the hint row, not the prompt: {prompt:?}"
             );
         }
         _ => panic!("Ctrl-T must open the New Tab TextInput dialog"),
@@ -1806,4 +1810,123 @@ fn copying_the_squad_key_or_snippet_does_not_dismiss_the_notice() {
         app.active_dialog.is_none(),
         "Enter still dismisses the notice"
     );
+}
+
+// ─── WI 0112 Part 4: the grid always holds focus on the squad tab ──────────
+
+#[test]
+fn the_squad_grid_takes_focus_on_the_first_tick_and_arrows_work_without_up() {
+    let mut app = squad_list_app();
+    set_squad_tasks(&mut app, &["a", "b", "c"]);
+    app.active_tab_mut().squad.as_mut().unwrap().grid_columns = 1;
+    app.focus = Focus::CommandBox;
+    app.tick_all_tabs();
+    assert_eq!(app.focus, Focus::ExecutionWindow);
+    press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.active_tab().squad.as_ref().unwrap().selected, 1);
+    assert_eq!(app.active_tab().scroll_offset, 0);
+}
+
+#[test]
+fn keys_reach_the_squad_grid_even_when_focus_still_says_command_box() {
+    // Belt and braces: before the tick normalises focus, the context is
+    // already the squad list.
+    let mut app = squad_list_app();
+    set_squad_tasks(&mut app, &["a", "b"]);
+    app.active_tab_mut().squad.as_mut().unwrap().grid_columns = 1;
+    app.focus = Focus::CommandBox;
+    press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.active_tab().squad.as_ref().unwrap().selected, 1);
+}
+
+#[test]
+fn esc_on_the_squad_grid_does_nothing() {
+    let mut app = squad_list_app();
+    set_squad_tasks(&mut app, &["a", "b"]);
+    app.tick_all_tabs();
+    press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(app.focus, Focus::ExecutionWindow);
+    assert_eq!(app.active_tab().squad.as_ref().unwrap().selected, 1);
+    assert!(app.active_dialog.is_none());
+}
+
+#[test]
+fn unbound_letters_on_the_squad_grid_never_reach_the_command_box() {
+    let mut app = squad_list_app();
+    set_squad_tasks(&mut app, &["a"]);
+    app.tick_all_tabs();
+    press_char(&mut app, 'x');
+    press_char(&mut app, 'z');
+    assert_eq!(app.command_input.text, "");
+}
+
+#[test]
+fn leaving_the_squad_tab_restores_the_command_box_and_returning_refocuses_the_grid() {
+    let mut app = squad_list_app();
+    app.tick_all_tabs();
+    assert_eq!(app.focus, Focus::ExecutionWindow);
+
+    press_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert!(!app.active_tab().is_squad);
+    app.tick_all_tabs();
+    assert_eq!(
+        app.focus,
+        Focus::CommandBox,
+        "a normal tab gets its command box back"
+    );
+
+    press_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(app.active_tab().is_squad);
+    app.tick_all_tabs();
+    assert_eq!(
+        app.focus,
+        Focus::ExecutionWindow,
+        "the grid is focused again"
+    );
+}
+
+#[test]
+fn a_normal_to_normal_tab_switch_leaves_focus_alone() {
+    let mut app = make_app();
+    app.add_tab(make_session());
+    app.tick_all_tabs();
+    app.focus = Focus::ExecutionWindow;
+    press_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    app.tick_all_tabs();
+    assert_eq!(
+        app.focus,
+        Focus::ExecutionWindow,
+        "unchanged, as before WI 0112"
+    );
+}
+
+#[test]
+fn closing_a_tab_that_lands_on_the_squad_tab_focuses_the_grid() {
+    let mut app = make_app();
+    push_squad_tab(&mut app); // index 1
+    let normal = app.add_tab(make_session()); // index 2
+    app.active_tab = normal;
+    app.focus = Focus::CommandBox;
+    app.tick_all_tabs();
+    app.close_active_tab();
+    assert!(app.active_tab().is_squad);
+    app.tick_all_tabs();
+    assert_eq!(app.focus, Focus::ExecutionWindow);
+}
+
+#[test]
+fn detaching_a_squad_attach_session_refocuses_the_grid_on_the_next_tick() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+    let mut app = squad_list_app();
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+    }
+    app.focus = Focus::CommandBox;
+    app.active_tab_mut().end_attach_session();
+    app.tick_all_tabs();
+    assert!(app.active_tab().container_slots.is_empty());
+    assert_eq!(app.focus, Focus::ExecutionWindow);
 }

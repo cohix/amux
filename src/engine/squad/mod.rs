@@ -27,7 +27,8 @@ pub use evaluator::{
     EvaluationOutcome, EvaluationRequest, NoRunProgress, RunProgress, TaskEvaluator,
 };
 pub use launcher::{
-    drive_unattended_agent, ensure_directory_workspace_project, LeaderRunSpec, SquadAgentLauncher,
+    drive_unattended_agent, ensure_directory_workspace_project, LeaderExit, LeaderRunSpec,
+    SquadAgentLauncher, UnattendedExit,
 };
 pub use scheduler::{SchedulerStatus, SquadScheduler, TICK_INTERVAL};
 pub use verdict::{

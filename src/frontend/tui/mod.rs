@@ -39,6 +39,7 @@ pub mod pty;
 mod region_scroll;
 pub mod render;
 pub mod squad_attach;
+pub mod squad_indicator;
 pub mod squad_poll;
 pub mod tabs;
 pub mod text_edit;
@@ -194,7 +195,22 @@ pub async fn run(
         }
     }
 
-    match event_loop::run_event_loop(&mut app) {
+    // WI 0112: the bottom-row squad indicator probes the daemon for the
+    // life of the event loop, on every tab, whether or not a squad tab ever
+    // opens. Started here — never in `App::new` — so unit-test apps stay
+    // free of filesystem side effects.
+    let indicator_cancel = tokio_util::sync::CancellationToken::new();
+    let indicator_handle = {
+        let _guard = app.runtime_handle.enter();
+        squad_indicator::SquadIndicatorPoller::new(app.squad_indicator.clone())
+            .start(indicator_cancel.clone())
+    };
+
+    let result = event_loop::run_event_loop(&mut app);
+    indicator_cancel.cancel();
+    indicator_handle.abort();
+
+    match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("awman: TUI error: {e}");

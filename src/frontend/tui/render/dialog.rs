@@ -104,9 +104,16 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                     height: 1,
                     ..inner
                 };
+                // The New Tab dialog is the one place `Ctrl-S` opens the
+                // squad tab (see the key handler's intercept, keyed off the
+                // same title), so it is the one place the hint row says so.
+                let hint = if title == dialogs::NEW_TAB_DIALOG_TITLE {
+                    "  [Enter] submit   [Esc] cancel   [Ctrl+S] open squad"
+                } else {
+                    "  [Enter] submit   [Esc] cancel"
+                };
                 frame.render_widget(
-                    Paragraph::new("  [Enter] submit   [Esc] cancel")
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
                     hint_area,
                 );
             }

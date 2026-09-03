@@ -9,6 +9,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::frontend::tui::text_edit::TextEdit;
 
+/// Title of the `Ctrl-T` New Tab dialog. The key handler's `Ctrl-S` intercept
+/// and the renderer's `[Ctrl+S] open squad` hint are both keyed off this one
+/// string, so the shortcut and its advertisement can never disagree.
+pub(crate) const NEW_TAB_DIALOG_TITLE: &str = "New Tab";
+
 /// A dialog request sent from the command thread to the event loop.
 #[derive(Debug)]
 pub enum DialogRequest {

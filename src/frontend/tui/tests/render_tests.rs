@@ -2,6 +2,7 @@
 //! green-corner indicator, and the status-bar +/- summary.
 
 use super::*;
+use ratatui::style::Color;
 
 // ─── Git sidebar ──────────────────────────────────────────────────────────
 
@@ -209,6 +210,40 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         trigger_requested_at: None,
         last_run_status: None,
     }
+}
+
+/// WI 0112 Part 1: the New Tab dialog advertises `Ctrl+S` in its key-hint
+/// row, beside Enter/Esc, and no longer in the prompt body.
+#[test]
+fn the_new_tab_dialog_hint_row_advertises_ctrl_s_to_open_squad() {
+    let mut app = make_app();
+    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        text.contains("[Enter] submit   [Esc] cancel   [Ctrl+S] open squad"),
+        "the hint row must carry the squad shortcut: {text}"
+    );
+    assert!(
+        !text.contains("Press Ctrl-S"),
+        "the prompt body must not repeat the hint: {text}"
+    );
+}
+
+/// Every other text-input dialog keeps the plain two-key hint.
+#[test]
+fn a_command_text_input_dialog_keeps_the_plain_hint_row() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::TextInput {
+        title: "Task name".to_string(),
+        prompt: "Name:".to_string(),
+        editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(text.contains("[Enter] submit   [Esc] cancel"), "{text}");
+    assert!(
+        !text.contains("[Ctrl+S] open squad"),
+        "only the New Tab dialog advertises the squad shortcut: {text}"
+    );
 }
 
 #[test]
@@ -1083,5 +1118,330 @@ fn the_missing_key_dialog_explains_the_recovery_and_its_key_bindings() {
     assert!(
         text.contains("old key will stop working"),
         "the cost of refreshing must be stated before it is accepted: {text}"
+    );
+}
+
+// ─── WI 0112: squad indicator, card colours, inactive command box ──────────
+
+/// Render and also report whether the terminal cursor was left visible.
+fn render_app_with_cursor(
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, bool) {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::frontend::tui::render::render_frame(app, frame))
+        .unwrap();
+    let visible = terminal.backend().cursor_visible();
+    (terminal.backend().buffer().clone(), visible)
+}
+
+/// The last row of the buffer, trimmed of trailing spaces.
+fn bottom_row(buf: &ratatui::buffer::Buffer) -> String {
+    let area = *buf.area();
+    let y = area.height - 1;
+    (0..area.width)
+        .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// Colour of the cell holding the first occurrence of `symbol` on row `y`.
+fn fg_of_symbol_on_row(buf: &ratatui::buffer::Buffer, y: u16, symbol: &str) -> Option<Color> {
+    let area = *buf.area();
+    (0..area.width)
+        .map(|x| buf.cell((x, y)).unwrap())
+        .find(|c| c.symbol() == symbol)
+        .map(|c| c.fg)
+}
+
+fn set_indicator(app: &App, state: crate::frontend::tui::squad_indicator::SquadIndicator) {
+    *app.squad_indicator.lock().unwrap() = state;
+}
+
+#[test]
+fn the_squad_indicator_is_pinned_to_the_right_of_the_bottom_row_in_every_state() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    for (state, colour) in [
+        (SquadIndicator::Unknown, Color::DarkGray),
+        (SquadIndicator::NotRunning, Color::DarkGray),
+        (SquadIndicator::Unreachable, Color::Yellow),
+        (SquadIndicator::Failed, Color::Red),
+        (SquadIndicator::Running, Color::Blue),
+        (SquadIndicator::Healthy, Color::Green),
+    ] {
+        let mut app = make_app();
+        set_indicator(&app, state);
+        let buf = render_app(&mut app, 80, 24);
+        let row = bottom_row(&buf);
+        assert!(
+            row.ends_with("squad \u{25cf}"),
+            "{state:?}: the indicator must be the last thing on the bottom row: {row:?}"
+        );
+        assert_eq!(
+            fg_of_symbol_on_row(&buf, 23, "\u{25cf}"),
+            Some(colour),
+            "{state:?}: circle colour"
+        );
+        assert!(
+            row.contains("CWD:"),
+            "{state:?}: the CWD context still renders to the left: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn the_squad_indicator_renders_on_the_squad_tab_too() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_indicator(&app, SquadIndicator::Failed);
+    let buf = render_app(&mut app, 80, 24);
+    assert!(bottom_row(&buf).ends_with("squad \u{25cf}"));
+    assert_eq!(fg_of_symbol_on_row(&buf, 23, "\u{25cf}"), Some(Color::Red));
+}
+
+#[test]
+fn the_squad_indicator_stays_right_aligned_when_suggestions_are_showing() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    let mut app = make_app();
+    set_indicator(&app, SquadIndicator::Healthy);
+    for c in "cha".chars() {
+        press_char(&mut app, c);
+    }
+    app.update_suggestions();
+    assert!(!app.suggestion_row.is_empty(), "test needs suggestions");
+    let buf = render_app(&mut app, 60, 24);
+    let row = bottom_row(&buf);
+    assert!(row.contains("chat"), "suggestions render: {row:?}");
+    assert!(
+        row.ends_with("squad \u{25cf}"),
+        "the indicator still owns the right edge: {row:?}"
+    );
+}
+
+#[test]
+fn a_long_cwd_is_truncated_so_the_squad_indicator_fits() {
+    let mut app = make_app();
+    let buf = render_app(&mut app, 30, 24);
+    let row = bottom_row(&buf);
+    assert!(row.ends_with("squad \u{25cf}"), "{row:?}");
+    assert!(row.chars().count() <= 30);
+}
+
+#[test]
+fn a_row_too_narrow_for_the_word_draws_only_the_circle() {
+    let mut app = make_app();
+    let buf = render_app(&mut app, 6, 24);
+    let row = bottom_row(&buf);
+    assert!(row.ends_with('\u{25cf}'), "{row:?}");
+    assert!(!row.contains("squad"), "{row:?}");
+}
+
+/// Cells of the card whose title contains `name`: the top border row `y`
+/// and the x-range of the card, found from the rounded corners around the
+/// title.
+fn card_frame(buf: &ratatui::buffer::Buffer, name: &str) -> (u16, u16, u16) {
+    let area = *buf.area();
+    for y in 0..area.height {
+        let row: String = (0..area.width)
+            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect();
+        if let Some(pos) = row.find(name) {
+            let chars: Vec<&str> = (0..area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect();
+            let title_x = row[..pos].chars().count();
+            let left = (0..title_x)
+                .rev()
+                .find(|&x| chars[x] == "\u{256d}")
+                .expect("card has a top-left corner");
+            let right = (title_x..chars.len())
+                .find(|&x| chars[x] == "\u{256e}")
+                .expect("card has a top-right corner");
+            return (y, left as u16, right as u16);
+        }
+    }
+    panic!("no card titled {name}");
+}
+
+fn squad_app_with(tasks: Vec<crate::data::fs::task_store::Task>, selected: usize) -> App {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab_mut().squad.as_mut().unwrap();
+        state.selected = selected;
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = tasks;
+        snap.loaded = true;
+    }
+    app
+}
+
+/// WI 0112 Part 3: unselected cards are dashed, the selected card is solid
+/// and carries the `➡` marker; neither axis expresses the other.
+#[test]
+fn the_selected_card_is_solid_with_an_arrow_and_the_others_are_dashed() {
+    let mut app = squad_app_with(vec![fake_task("alpha"), fake_task("beta")], 1);
+    let buf = render_app(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("\u{27a1} beta"),
+        "selected title carries the arrow: {text}"
+    );
+    assert!(
+        !text.contains("\u{27a1} alpha"),
+        "unselected title does not: {text}"
+    );
+
+    let (y_a, left_a, right_a) = card_frame(&buf, "alpha");
+    let (y_b, left_b, right_b) = card_frame(&buf, "beta");
+    // Top edge just left of the top-right corner (the title occupies the
+    // cells after the top-left one), and the side edge one row down.
+    assert_eq!(
+        buf.cell((right_a - 1, y_a)).unwrap().symbol(),
+        "\u{254c}",
+        "dashed top"
+    );
+    assert_eq!(
+        buf.cell((left_a, y_a + 1)).unwrap().symbol(),
+        "\u{2506}",
+        "dashed side"
+    );
+    assert_eq!(
+        buf.cell((right_b - 1, y_b)).unwrap().symbol(),
+        "\u{2500}",
+        "solid top"
+    );
+    assert_eq!(
+        buf.cell((left_b, y_b + 1)).unwrap().symbol(),
+        "\u{2502}",
+        "solid side"
+    );
+}
+
+#[test]
+fn card_border_colour_follows_task_state_for_selected_and_unselected_cards() {
+    use crate::data::fs::task_store::{RunStatus, TaskStatus};
+    let now = chrono::Utc::now();
+    let mut paused = fake_task("paused-one");
+    paused.status = TaskStatus::Paused;
+    let mut running = fake_task("running-one");
+    running.last_run_at = Some(now);
+    running.last_run_status = Some(RunStatus::Running);
+    let mut triggered = fake_task("trig-one");
+    triggered.last_run_at = Some(now);
+    triggered.last_run_status = Some(RunStatus::WorkflowExecuted);
+    triggered.trigger_requested_at = Some(now);
+    let mut failed = fake_task("failed-one");
+    failed.last_run_at = Some(now);
+    failed.last_run_status = Some(RunStatus::Failed);
+    let never = fake_task("never-one");
+    let mut active = fake_task("active-one");
+    active.last_run_at = Some(now);
+    active.last_run_status = Some(RunStatus::WorkflowExecuted);
+
+    let expected = [
+        ("paused-one", Color::DarkGray),
+        ("running-one", Color::Blue),
+        ("trig-one", Color::Magenta),
+        ("failed-one", Color::Red),
+        ("never-one", Color::Yellow),
+        ("active-one", Color::Green),
+    ];
+    for selected in [0usize, 3] {
+        let mut app = squad_app_with(
+            vec![
+                paused.clone(),
+                running.clone(),
+                triggered.clone(),
+                failed.clone(),
+                never.clone(),
+                active.clone(),
+            ],
+            selected,
+        );
+        let buf = render_app(&mut app, 120, 40);
+        for (name, colour) in expected {
+            let (y, left, _) = card_frame(&buf, name);
+            assert_eq!(
+                buf.cell((left, y)).unwrap().fg,
+                colour,
+                "{name} border colour (selected index {selected})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_paused_card_is_dashed_when_unselected_and_solid_when_selected_in_grey_both_times() {
+    use crate::data::fs::task_store::TaskStatus;
+    let mut paused = fake_task("paused-one");
+    paused.status = TaskStatus::Paused;
+    let other = fake_task("other-one");
+
+    let mut app = squad_app_with(vec![paused.clone(), other.clone()], 1);
+    let buf = render_app(&mut app, 100, 30);
+    let (y, left, right) = card_frame(&buf, "paused-one");
+    assert_eq!(buf.cell((right - 1, y)).unwrap().symbol(), "\u{254c}");
+    assert_eq!(buf.cell((left, y)).unwrap().fg, Color::DarkGray);
+
+    let mut app = squad_app_with(vec![paused, other], 0);
+    let buf = render_app(&mut app, 100, 30);
+    let (y, left, right) = card_frame(&buf, "paused-one");
+    assert_eq!(buf.cell((right - 1, y)).unwrap().symbol(), "\u{2500}");
+    assert_eq!(buf.cell((left, y)).unwrap().fg, Color::DarkGray);
+}
+
+/// WI 0112 Part 4: the command box is inactive on the squad grid, explains
+/// the keys, and never places the cursor.
+#[test]
+fn the_command_box_is_inactive_and_cursorless_on_the_squad_tab() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.tick_all_tabs();
+    let (buf, cursor_visible) = render_app_with_cursor(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(text.contains("command (inactive)"), "{text}");
+    assert!(
+        text.contains(
+            "Use \u{2191} \u{2193} \u{2190} \u{2192} and Enter to navigate the squad tab"
+        ),
+        "{text}"
+    );
+    assert!(!cursor_visible, "no cursor on the squad grid");
+
+    // A normal tab is unchanged: focused box, cursor placed.
+    app.active_tab = 0;
+    app.tick_all_tabs();
+    let (buf, cursor_visible) = render_app_with_cursor(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(text.contains(" command "), "{text}");
+    assert!(!text.contains("navigate the squad tab"), "{text}");
+    assert!(cursor_visible, "the ordinary command box shows its cursor");
+}
+
+#[test]
+fn the_command_box_is_ordinary_during_a_squad_attach_session() {
+    use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "squad attach task-a".into(),
+        };
+    }
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        !text.contains("navigate the squad tab"),
+        "attach sessions use the ordinary command box: {text}"
     );
 }

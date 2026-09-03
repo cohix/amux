@@ -117,6 +117,9 @@ type = "clone_repo"
 url = "https://github.com/example/repo.git"
 # branch = "main"        # Optional.
 # into = "subdir-name"   # Optional. Target directory name. Defaults to repo name.
+# conflict_mode = "skip" # Optional. What to do if the target dir already holds a
+                         # clone of this url: "skip" (default; log and succeed),
+                         # "replace" (delete and re-clone), or "error" (fail).
 ```
 
 ### `poll_ci`

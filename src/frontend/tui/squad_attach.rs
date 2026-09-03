@@ -433,6 +433,14 @@ pub fn start_squad_attach(app: &mut App, task: &str) {
     }
     tab.dialog_request_rx = None;
     tab.dialog_response_tx = None;
+    // A stale receiver from an earlier generic dispatch (e.g. `squad
+    // pause`/`resume`/`edit`) must not survive into this session: whenever it
+    // eventually resolves, `poll_command_completion` labels it with whatever
+    // `execution_phase` is current — now "squad attach {task}" — and tears
+    // the freshly-created slots straight back down via
+    // `close_container_overlay`/`clear_container_slots`, which reads as an
+    // attach that "completed successfully" with nothing ever rendered.
+    tab.command_result_rx = None;
     tab.execution_phase = ExecutionPhase::Running {
         command: format!("squad attach {task}"),
     };

@@ -65,6 +65,20 @@ pub struct WorkflowStep {
     pub abort_on_failure: bool,
 }
 
+/// How a `clone_repo` setup step handles a target directory that already
+/// holds a clone of the requested URL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneConflictMode {
+    /// Leave the existing clone in place and succeed (default).
+    #[default]
+    Skip,
+    /// Delete the existing clone and clone a fresh copy.
+    Replace,
+    /// Fail the step.
+    Error,
+}
+
 /// A setup phase step — executed before the main workflow steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -75,6 +89,8 @@ pub enum SetupStep {
         branch: Option<String>,
         #[serde(default)]
         into: Option<String>,
+        #[serde(default)]
+        conflict_mode: CloneConflictMode,
     },
     CheckoutCreateBranch {
         branch: String,
@@ -530,6 +546,58 @@ body = "Automated PR from awman workflow"
             TeardownStep::CreatePullRequest { title, body, .. }
                 if title.as_deref() == Some("feat: implement my feature") && body.as_deref() == Some("Automated PR from awman workflow")
         ));
+    }
+
+    #[test]
+    fn parse_clone_repo_conflict_mode() {
+        let toml = r#"
+name = "wf"
+
+[[setup]]
+type = "clone_repo"
+url = "https://github.com/org/a"
+
+[[setup]]
+type = "clone_repo"
+url = "https://github.com/org/b"
+conflict_mode = "replace"
+
+[[setup]]
+type = "clone_repo"
+url = "https://github.com/org/c"
+conflict_mode = "error"
+
+[[steps]]
+name = "s"
+prompt = "p"
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert!(matches!(
+            &wf.setup[0].step,
+            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Skip, .. }
+        ));
+        assert!(matches!(
+            &wf.setup[1].step,
+            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Replace, .. }
+        ));
+        assert!(matches!(
+            &wf.setup[2].step,
+            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Error, .. }
+        ));
+
+        let bad = r#"
+name = "wf"
+
+[[setup]]
+type = "clone_repo"
+url = "https://github.com/org/a"
+conflict_mode = "overwrite"
+
+[[steps]]
+name = "s"
+prompt = "p"
+"#;
+        assert!(Workflow::parse(bad, WorkflowFormat::Toml).is_err());
     }
 
     #[test]

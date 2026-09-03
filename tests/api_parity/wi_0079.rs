@@ -1571,6 +1571,7 @@ async fn real_network_workflow_state_404_when_no_state_file() {
 fn workflow_state_to_view_state_maps_all_phases() {
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowState};
+    use awman::frontend::tui::tabs::WorkflowStepKind;
     use awman::frontend::tui::workflow_view::workflow_state_to_view_state;
 
     fn ws(name: &str, deps: &[&str]) -> WorkflowStep {
@@ -1614,9 +1615,10 @@ fn workflow_state_to_view_state_maps_all_phases() {
         view.steps.len()
     );
 
-    // Setup steps come first with [setup] prefix.
-    assert!(
-        view.steps[0].name.starts_with("[setup]"),
+    // Setup steps come first, marked by kind.
+    assert_eq!(
+        view.steps[0].kind,
+        WorkflowStepKind::Setup,
         "first step must be a setup step; got '{}'",
         view.steps[0].name
     );
@@ -1652,9 +1654,10 @@ fn workflow_state_to_view_state_maps_all_phases() {
         view.steps[3].name
     );
 
-    // Teardown comes last with [teardown] prefix.
-    assert!(
-        view.steps[4].name.starts_with("[teardown]"),
+    // Teardown comes last, marked by kind.
+    assert_eq!(
+        view.steps[4].kind,
+        WorkflowStepKind::Teardown,
         "last step must be a teardown step; got '{}'",
         view.steps[4].name
     );

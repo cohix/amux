@@ -318,11 +318,11 @@ happen to have `awman` open.
 
 Two ways to get there:
 
-- **`Ctrl-S` from the New Tab dialog.** Press **Ctrl-T** to open a new tab,
-  and the prompt shows a second line — "Press Ctrl-S to open squad" —
-  alongside the usual working-directory prompt. Pressing **Ctrl-S** while
-  that dialog is focused closes the dialog and opens (or focuses) the squad
-  tab instead of creating a directory-bound tab. This doesn't change what
+- **`Ctrl-S` from the New Tab dialog.** Press **Ctrl-T** to open a new tab;
+  the key-hint row under the text box reads `[Enter] submit   [Esc] cancel
+  [Ctrl+S] open squad`. Pressing **Ctrl-S** while that dialog is focused
+  closes the dialog and opens (or focuses) the squad tab instead of creating
+  a directory-bound tab. This doesn't change what
   `Ctrl-S` does anywhere else — outside that dialog it keeps its usual
   meanings (cycling parallel container slots, submitting multiline dialogs).
 - **Bare `awman squad` in a terminal.** Run `awman squad` with no subcommand
@@ -396,6 +396,13 @@ to a repository.
 
 ### Key bindings in the task list
 
+The card grid always has focus on the squad tab: the arrow keys work the
+moment the tab opens, with no need to press **↑** first. The command box
+under the grid is permanently inactive there — it reads `command (inactive)`
+and says to use the arrows and **Enter** — and **Esc** does nothing, since
+there is nothing to hand focus to. Switching back to a normal tab returns
+focus to that tab's command box.
+
 | Key | Action |
 |-----|--------|
 | **↑ / ↓ / ← / →** | Move between task cards |
@@ -420,8 +427,51 @@ command box, so a key never just appears to do nothing.
 Global shortcuts (**Ctrl-T**, **Ctrl-A**, **Ctrl-D**, **Ctrl-M**, **Ctrl-O**,
 **Ctrl-W**, **Ctrl-,**, **Ctrl-C**) keep their usual meaning while the task list has
 focus — none of them are repurposed for squad. You can also type
-`squad <subcommand> ...` directly into the command box at any time; the keys
+`squad <subcommand> ...` into the command box of any *other* tab; the keys
 above are shortcuts over the same path, not a separate one.
+
+### Card colours
+
+Each card's outline colour is the task's state, and the selected card is the
+one drawn with a **solid** outline and a `➡` before its name — every other
+card is drawn dashed. Colour and selection are independent: a selected card
+keeps its state colour, and a paused card is dashed or solid for the same
+reason any other card is.
+
+| Colour | Meaning |
+|--------|---------|
+| Grey | Paused |
+| Blue | A run is in progress right now |
+| Magenta | A [trigger](#triggering-a-task-now) is waiting for the next tick |
+| Red | The most recent run failed |
+| Yellow | Has never run |
+| Green | Active, last run finished normally |
+
+The first matching row wins from the top: a paused task is grey even if its
+last run failed, a running task is blue even if a trigger is pending, and a
+triggered task is magenta until the trigger is honoured. Every colour is also
+spelled out in the card's body (`Next: paused`, `Outcome: failed`,
+`Last run: —`, `Next: triggered — next tick`), so nothing depends on colour
+alone.
+
+### The squad indicator
+
+The bottom row of the TUI — the one showing `CWD:` under the command box —
+always ends with `squad ●`, on every tab, whether or not the squad tab is
+open. The circle's colour is the daemon's health, re-probed every ten
+seconds:
+
+| Colour | Meaning |
+|--------|---------|
+| Grey | No squad daemon is running |
+| Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating to the daemon](#authenticating-to-the-daemon)), a connection refused, a timeout, or any other error |
+| Red | Reachable, and some task's most recent run failed |
+| Blue | Reachable, and a task is executing right now |
+| Green | Reachable, nothing failed, nothing running |
+
+Red wins over blue when both apply: a failure needs attention and persists,
+while a running task is transient. The indicator is only a summary — open the
+squad tab (or run `awman squad list`) to see which task.
 
 ---
 
@@ -536,6 +586,19 @@ guardrails to every run rather than leaving them optional:
   auto-advance are recorded in the daemon log (never each tick). Agents still
   run in a terminal-sized PTY so attaching later shows the real interactive
   agent interface.
+- **A run's status follows what actually happened.** A run is recorded as
+  `failed` — and the task backs off — when its generated workflow exits
+  non-zero: a step container that crashes, a setup step marked
+  `abort_on_failure` that fails, any teardown step failure, or an engine
+  error. A container that the yolo countdown moved past is *not* a failure,
+  for workflow steps and for the evaluation leader alike: the step is marked
+  succeeded and the run continues. If the countdown kills the leader before
+  it has written a verdict, the run is recorded as `not triggered` with a
+  warning in the daemon log rather than as a failure. A leader that exits
+  non-zero on its own is a failed run even if it had already written a
+  verdict. A setup step *without* `abort_on_failure` that fails does not fail
+  the run — the workflow author marked it best-effort — but its failure is
+  still logged with the path to its output.
 - **The durable workspace is preserved.** Squad never clears task files
   between runs. The task workspace is also mounted at the stable
   `context(workflow)` location, including for custom-workspace tasks.
@@ -659,10 +722,39 @@ Each run keeps the output of each container in its own file:
 ~/.awman/squad/tasks/<name>/runs/<run-id>/<container-name>.log
 ```
 
-The evaluation agent and every generated-workflow container use this layout.
-The files are written as the run progresses, so output remains available even
-if a run stops unexpectedly. The daemon log and these per-container logs are
-separate: use the latter when you need an agent's detailed terminal output.
+The evaluation agent and every generated-workflow agent container use this
+layout. A workflow's setup and teardown steps write to the same directory,
+one file per step in execution order:
+
+```text
+~/.awman/squad/tasks/<name>/runs/<run-id>/setup-<n>-<step>.log
+~/.awman/squad/tasks/<name>/runs/<run-id>/teardown-<n>-<step>.log
+```
+
+`<n>` is the step's position in its phase and `<step>` is derived from the
+step's description (`setup-1-clone-repo.log`, `teardown-2-create-pr.log`).
+Each file starts with a header naming the step, then carries the command's
+full stdout and stderr; an `on_failure` remediation attempt is appended to
+the original step's file under a separator, so a step's whole history reads
+top to bottom in one place.
+
+All of these files are written as the run progresses, so output remains
+available even if a run stops unexpectedly. The daemon log and these per-step
+logs are separate: use the latter when you need an agent's or a step's
+detailed output.
+
+When any step fails — setup, agent, or teardown — the daemon log records it
+as an error line that names the file to open, in the same `log_path=…` form
+used when a container launches:
+
+```text
+ERROR squad setup step failed task=nightly run_id=… step=clone_repo exit_code=128 log_path=/home/you/.awman/squad/tasks/nightly/runs/…/setup-1-clone-repo.log
+```
+
+A failed evaluation's error text (as shown by `awman squad runs <name>` and
+by the task detail modal in the TUI) ends with the leader's log path for the
+same reason, and a failed run's closing `squad task run finished` line names
+the run directory even when the failure happened before any step ran.
 
 Container *image build* output is kept out of the daemon log the same way.
 Each build a task triggers writes its full output to its own file:

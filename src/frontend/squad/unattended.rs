@@ -13,10 +13,13 @@
 //!   agents were already validated against the repo at creation time.
 //!
 //! Agent output goes to a per-container file in the task run directory rather
-//! than the daemon log. This module holds no policy of its own: every value it
-//! returns is either a constant or the task's own captured setting.
+//! than the daemon log, and so does every setup/teardown step's output
+//! (`setup-<n>-<step>.log` / `teardown-<n>-<step>.log`, WI 0112 Part 5).
+//! Every failure line this frontend writes to the daemon log names the file
+//! to open. This module holds no policy of its own: every value it returns
+//! is either a constant or the task's own captured setting.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -105,6 +108,67 @@ pub struct UnattendedFrontend {
     pending_log_files: VecDeque<SharedLogFile>,
     /// The task's captured mount scope, returned verbatim when asked.
     mount_scope: MountScopeDecision,
+    /// The setup/teardown step whose output is being written right now (WI
+    /// 0112 Part 5). `None` outside a phase step, which is the normal state
+    /// while agent steps run.
+    phase_log: Option<PhaseLog>,
+    /// How many setup / teardown steps have started, for the `<n>` in the
+    /// step log's filename. The engine fires the hooks strictly in definition
+    /// order and never concurrently, so a counter is reliable.
+    setup_steps_seen: usize,
+    teardown_steps_seen: usize,
+    /// The workflow step the engine most recently reported `Running`. The
+    /// engine fires that *before* it launches the step's container, so the
+    /// next `AgentStatus::Running` belongs to this step.
+    current_step: Option<String>,
+    /// Container log path per workflow step name, so a step's failure line
+    /// can name the file.
+    step_logs: HashMap<String, PathBuf>,
+    /// The most recently opened container log, for the remediation separator.
+    last_container_log: Option<PathBuf>,
+}
+
+/// One setup/teardown step's open log file (WI 0112 Part 5).
+struct PhaseLog {
+    path: PathBuf,
+    file: File,
+}
+
+/// The `<step>` part of a phase-step log filename: the step description
+/// lower-cased, runs of anything outside `[a-z0-9]` collapsed to one `-`,
+/// trimmed, capped at 40 characters. Empty when nothing survives.
+pub(crate) fn step_log_slug(description: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in description.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else {
+            pending_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    slug.truncate(40);
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// `setup-3-clone-repo.log`, or `setup-3.log` when the slug is empty.
+pub(crate) fn step_log_file_name(phase: &str, index: usize, description: &str) -> String {
+    let slug = step_log_slug(description);
+    if slug.is_empty() {
+        format!("{phase}-{index}.log")
+    } else {
+        format!("{phase}-{index}-{slug}.log")
+    }
 }
 
 impl UnattendedFrontend {
@@ -122,6 +186,12 @@ impl UnattendedFrontend {
             run_log_dir: std::env::temp_dir().join("awman-unattended-test-logs"),
             pending_log_files: VecDeque::new(),
             mount_scope,
+            phase_log: None,
+            setup_steps_seen: 0,
+            teardown_steps_seen: 0,
+            current_step: None,
+            step_logs: HashMap::new(),
+            last_container_log: None,
         }
     }
 
@@ -145,7 +215,122 @@ impl UnattendedFrontend {
             run_log_dir: run_log_dir.to_path_buf(),
             pending_log_files: VecDeque::new(),
             mount_scope,
+            phase_log: None,
+            setup_steps_seen: 0,
+            teardown_steps_seen: 0,
+            current_step: None,
+            step_logs: HashMap::new(),
+            last_container_log: None,
         })
+    }
+
+    // ── setup / teardown step logs (WI 0112 Part 5) ──────────────────────
+
+    /// Open the log file for a phase step that has just started, write its
+    /// header, and record the start in the daemon log. An open failure is
+    /// logged and the step runs unlogged rather than not at all.
+    fn begin_phase_step(&mut self, phase: &str, index: usize, description: &str) {
+        self.finish_phase_log();
+        let path = self
+            .run_log_dir
+            .join(step_log_file_name(phase, index, description));
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "# {phase} step {index}: {description}\n# started {}",
+                    chrono::Utc::now().to_rfc3339()
+                );
+                let _ = file.flush();
+                tracing::info!(
+                    task = %self.task,
+                    run_id = %self.run_id,
+                    step = description,
+                    log_path = %path.display(),
+                    "squad {phase} step started"
+                );
+                self.phase_log = Some(PhaseLog { path, file });
+            }
+            Err(error) => tracing::error!(
+                task = %self.task,
+                run_id = %self.run_id,
+                step = description,
+                log_path = %path.display(),
+                error = %error,
+                "squad failed to open {phase} step log"
+            ),
+        }
+    }
+
+    /// One output line from the running phase step. Flushed per line, the
+    /// same durability rule `spawn_file_drain` applies to agent output.
+    fn phase_step_line(&mut self, line: &str) {
+        if let Some(log) = self.phase_log.as_mut() {
+            let _ = writeln!(log.file, "{line}");
+            let _ = log.file.flush();
+        }
+    }
+
+    /// A remediation attempt for the running phase step: a separator into the
+    /// *same* file, so the original output and every retry read in order. The
+    /// remediation agent's own container log is named once it is known.
+    fn phase_step_fixing(&mut self, phase: &str, description: &str, attempt: u32, of: u32) {
+        let agent_log = self
+            .last_container_log
+            .as_ref()
+            .map(|p| format!(" (agent log: {})", p.display()))
+            .unwrap_or_default();
+        self.phase_step_line(&format!(
+            "# on_failure remediation attempt {attempt}/{of}{agent_log}"
+        ));
+        tracing::info!(
+            task = %self.task,
+            run_id = %self.run_id,
+            step = description,
+            attempt,
+            of,
+            "squad {phase} step remediation started"
+        );
+    }
+
+    fn phase_step_completed(&mut self, phase: &str, description: &str) {
+        let path = self.finish_phase_log();
+        tracing::info!(
+            task = %self.task,
+            run_id = %self.run_id,
+            step = description,
+            log_path = %path.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "squad {phase} step succeeded"
+        );
+    }
+
+    /// The step failed for good (remediation, if any, is exhausted). The
+    /// engine's `stderr` argument is appended — it is the launch error when
+    /// the command never ran, and would otherwise be lost — and the error
+    /// line names the file.
+    fn phase_step_failed(&mut self, phase: &str, description: &str, exit_code: i32, stderr: &str) {
+        if !stderr.is_empty() {
+            self.phase_step_line(&format!("# failed (exit {exit_code}):"));
+            self.phase_step_line(stderr.trim_end());
+        }
+        let path = self.finish_phase_log();
+        tracing::error!(
+            task = %self.task,
+            run_id = %self.run_id,
+            step = description,
+            exit_code,
+            log_path = %path.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+            error = stderr.lines().next().unwrap_or(""),
+            "squad {phase} step failed"
+        );
+    }
+
+    /// Flush and close the open phase log, returning its path.
+    fn finish_phase_log(&mut self) -> Option<PathBuf> {
+        let log = self.phase_log.take()?;
+        let PhaseLog { path, mut file } = log;
+        let _ = file.flush();
+        Some(path)
     }
 
     fn prepare_container_log(&mut self, container_name: &str) {
@@ -176,6 +361,12 @@ impl UnattendedFrontend {
                     log_path = %path.display(),
                     "squad agent container launched"
                 );
+                // WI 0112 Part 5: remember which step this container serves,
+                // so the step's failure line can name this file.
+                if let Some(step) = self.current_step.clone() {
+                    self.step_logs.insert(step, path.clone());
+                }
+                self.last_container_log = Some(path);
             }
             Err(error) => tracing::error!(
                 task = %self.task,
@@ -190,6 +381,14 @@ impl UnattendedFrontend {
 }
 
 type SharedLogFile = Arc<Mutex<File>>;
+
+impl Drop for UnattendedFrontend {
+    /// A frontend torn down mid-step (the workflow aborted) still flushes
+    /// whatever the open phase log holds.
+    fn drop(&mut self) {
+        self.finish_phase_log();
+    }
+}
 
 impl UserMessageSink for UnattendedFrontend {
     fn write_message(&mut self, message: UserMessage) {
@@ -297,6 +496,34 @@ impl WorkflowFrontend for UnattendedFrontend {
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
+        match status {
+            // The engine reports `Running` before it launches the container,
+            // so the next `AgentStatus::Running` is this step's.
+            WorkflowStepStatus::Running => {
+                self.current_step = Some(step.name.clone());
+            }
+            // WI 0112 Part 5: a step container that exited non-zero on its
+            // own is an error line that names its log. (A yolo-countdown kill
+            // never arrives here as `Failed`: the engine marks that step
+            // succeeded and moves on.)
+            WorkflowStepStatus::Failed { exit_code } => {
+                let log_path = self
+                    .step_logs
+                    .get(&step.name)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                tracing::error!(
+                    task = %self.task,
+                    run_id = %self.run_id,
+                    step = %step.name,
+                    exit_code,
+                    log_path = %log_path,
+                    "squad workflow step failed"
+                );
+                return;
+            }
+            _ => {}
+        }
         tracing::info!(
             task = %self.task,
             run_id = %self.run_id,
@@ -307,6 +534,42 @@ impl WorkflowFrontend for UnattendedFrontend {
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
+
+    // ── setup / teardown steps (WI 0112 Part 5) ──────────────────────────
+
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.setup_steps_seen += 1;
+        self.begin_phase_step("setup", self.setup_steps_seen, description);
+    }
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.phase_step_line(line);
+    }
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.phase_step_completed("setup", description);
+    }
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.phase_step_failed("setup", description, exit_code, stderr);
+    }
+    fn on_setup_step_fixing(&mut self, description: &str, attempt: u32, of: u32) {
+        self.phase_step_fixing("setup", description, attempt, of);
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.teardown_steps_seen += 1;
+        self.begin_phase_step("teardown", self.teardown_steps_seen, description);
+    }
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.phase_step_line(line);
+    }
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.phase_step_completed("teardown", description);
+    }
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.phase_step_failed("teardown", description, exit_code, stderr);
+    }
+    fn on_teardown_step_fixing(&mut self, description: &str, attempt: u32, of: u32) {
+        self.phase_step_fixing("teardown", description, attempt, of);
+    }
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         tracing::info!(task = %self.task, run_id = %self.run_id, ?outcome, "squad workflow completed");
@@ -473,6 +736,192 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── WI 0112 Part 5: setup/teardown step logs and failure lines ──────
+
+    fn run_frontend(tmp: &Path) -> UnattendedFrontend {
+        UnattendedFrontend::for_run(
+            "task",
+            &RunId("run-0112".into()),
+            tmp,
+            "workflow",
+            MountScopeDecision::MountGitRoot,
+        )
+        .unwrap()
+    }
+
+    fn step(name: &str) -> WorkflowStep {
+        WorkflowStep {
+            name: name.to_string(),
+            depends_on: Vec::new(),
+            prompt_template: String::new(),
+            agent: None,
+            model: None,
+            overlays: None,
+            abort_on_failure: false,
+        }
+    }
+
+    #[test]
+    fn step_log_slugs_are_safe_lower_case_and_capped() {
+        assert_eq!(step_log_slug("clone_repo"), "clone-repo");
+        assert_eq!(
+            step_log_slug("Run shell: git   status && ls"),
+            "run-shell-git-status-ls"
+        );
+        assert_eq!(step_log_slug("///"), "");
+        assert_eq!(step_log_slug("-a-"), "a");
+        let long = step_log_slug(&"x".repeat(100));
+        assert_eq!(long.len(), 40);
+        assert_eq!(
+            step_log_file_name("setup", 2, "clone_repo"),
+            "setup-2-clone-repo.log"
+        );
+        assert_eq!(step_log_file_name("teardown", 1, "///"), "teardown-1.log");
+    }
+
+    #[test]
+    fn a_setup_step_writes_its_output_to_a_numbered_file_and_logs_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("setup-1-clone-repo-git-example.log");
+        let log = captured_tracing(|| {
+            let mut frontend = run_frontend(tmp.path());
+            frontend.on_setup_step_started("clone_repo git@example");
+            frontend.on_setup_step_output("Cloning into 'example'...");
+            frontend.on_setup_step_output("done.");
+            frontend.on_setup_step_completed("clone_repo git@example");
+        });
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.starts_with("# setup step 1: clone_repo git@example\n"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("Cloning into 'example'...\ndone.\n"),
+            "{contents}"
+        );
+        assert!(log.contains("squad setup step started"), "{log}");
+        assert!(log.contains("squad setup step succeeded"), "{log}");
+        assert!(log.contains(&path.display().to_string()), "{log}");
+        assert!(!log.contains("ERROR"), "{log}");
+    }
+
+    #[test]
+    fn a_failed_setup_step_appends_the_error_and_names_the_file_in_an_error_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("setup-1-clone-repo.log");
+        let log = captured_tracing(|| {
+            let mut frontend = run_frontend(tmp.path());
+            frontend.on_setup_step_started("clone_repo");
+            frontend.on_setup_step_output("Cloning...");
+            frontend.on_setup_step_failed("clone_repo", 128, "fatal: not a git repository\n");
+        });
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.ends_with("# failed (exit 128):\nfatal: not a git repository\n"),
+            "{contents}"
+        );
+        let error_line = log
+            .lines()
+            .find(|l| l.contains("squad setup step failed"))
+            .unwrap_or_else(|| panic!("no failure line in {log}"));
+        assert!(error_line.contains("ERROR"), "{error_line}");
+        assert!(error_line.contains("exit_code=128"), "{error_line}");
+        assert!(
+            error_line.contains(&format!("log_path={}", path.display())),
+            "{error_line}"
+        );
+        assert!(
+            error_line.contains("fatal: not a git repository"),
+            "{error_line}"
+        );
+    }
+
+    #[test]
+    fn identical_steps_are_numbered_and_teardown_has_its_own_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = run_frontend(tmp.path());
+        frontend.on_setup_step_started("run_shell");
+        frontend.on_setup_step_completed("run_shell");
+        frontend.on_setup_step_started("run_shell");
+        frontend.on_setup_step_completed("run_shell");
+        frontend.on_teardown_step_started("create_pr");
+        frontend.on_teardown_step_completed("create_pr");
+        assert!(tmp.path().join("setup-1-run-shell.log").exists());
+        assert!(tmp.path().join("setup-2-run-shell.log").exists());
+        assert!(tmp.path().join("teardown-1-create-pr.log").exists());
+    }
+
+    #[test]
+    fn remediation_output_lands_in_the_same_file_under_a_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = run_frontend(tmp.path());
+        frontend.on_setup_step_started("run_shell");
+        frontend.on_setup_step_output("first try");
+        frontend.on_setup_step_fixing("run_shell", 1, 2);
+        frontend.on_setup_step_output("second try");
+        frontend.on_setup_step_completed("run_shell");
+        let contents = std::fs::read_to_string(tmp.path().join("setup-1-run-shell.log")).unwrap();
+        let first = contents.find("first try").unwrap();
+        let sep = contents
+            .find("# on_failure remediation attempt 1/2")
+            .unwrap();
+        let second = contents.find("second try").unwrap();
+        assert!(first < sep && sep < second, "{contents}");
+        assert!(
+            !tmp.path().join("setup-2-run-shell.log").exists(),
+            "no second file"
+        );
+    }
+
+    #[test]
+    fn a_failed_agent_step_is_an_error_line_naming_its_container_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let container = "awman-squad-task-abcdef01";
+        let log = captured_tracing(|| {
+            let mut frontend = run_frontend(tmp.path());
+            frontend.report_step_status(&step("build"), WorkflowStepStatus::Running);
+            frontend.report_status(AgentStatus::Running {
+                container_name: container.to_string(),
+            });
+            frontend
+                .report_step_status(&step("build"), WorkflowStepStatus::Failed { exit_code: 2 });
+            frontend.report_step_status(&step("test"), WorkflowStepStatus::Running);
+            frontend.report_step_status(&step("test"), WorkflowStepStatus::Succeeded);
+        });
+        let failed = log
+            .lines()
+            .find(|l| l.contains("squad workflow step failed"))
+            .unwrap_or_else(|| panic!("no failure line in {log}"));
+        assert!(failed.contains("ERROR"), "{failed}");
+        assert!(failed.contains("step=build"), "{failed}");
+        assert!(failed.contains("exit_code=2"), "{failed}");
+        assert!(
+            failed.contains(&format!(
+                "log_path={}",
+                tmp.path().join(format!("{container}.log")).display()
+            )),
+            "{failed}"
+        );
+        let succeeded = log
+            .lines()
+            .find(|l| l.contains("step=test") && l.contains("Succeeded"))
+            .unwrap_or_else(|| panic!("no success line in {log}"));
+        assert!(succeeded.contains("INFO"), "{succeeded}");
+    }
+
+    #[test]
+    fn dropping_the_frontend_mid_step_flushes_the_open_step_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut frontend = run_frontend(tmp.path());
+            frontend.on_teardown_step_started("push_branch");
+            frontend.on_teardown_step_output("pushing...");
+        }
+        let contents =
+            std::fs::read_to_string(tmp.path().join("teardown-1-push-branch.log")).unwrap();
+        assert!(contents.contains("pushing..."), "{contents}");
+    }
 
     /// Collect everything written to `tracing` while `body` runs, as text.
     fn captured_tracing(body: impl FnOnce()) -> String {

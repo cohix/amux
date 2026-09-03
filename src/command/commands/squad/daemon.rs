@@ -328,6 +328,23 @@ impl SquadSupervisor {
         self.gateway_from_meta_with(key.as_ref())
     }
 
+    /// A gateway to the running daemon for a read-only health probe (WI
+    /// 0112's TUI indicator), or `None` when no endpoint sidecar exists.
+    ///
+    /// Unlike [`Self::gateway_from_meta`] this **never mints a key**: it uses
+    /// `AWMAN_SQUAD_KEY` or a key this process already minted, and otherwise
+    /// sends no bearer token at all so the daemon's `401` is what the probe
+    /// reports. A poller that ran every few seconds through `provision_key`
+    /// could write a `squad_key.hash` nobody was ever shown; this cannot. It
+    /// also never touches the one-shot key disclosure (`key_state`).
+    pub fn probe_gateway(&self) -> Result<Option<RemoteTaskGateway>, CommandError> {
+        let key = match self.env.squad_key() {
+            Some(key) => Some(ApiKey::from_string(key.to_string())),
+            None => self.generated_key(),
+        };
+        self.gateway_from_meta_with(key.as_ref())
+    }
+
     fn gateway_from_meta_with(
         &self,
         key: Option<&ApiKey>,
@@ -856,6 +873,34 @@ mod tests {
             decide_key_state(None, false, false, false),
             SquadKeyState::Ready
         ));
+    }
+
+    /// WI 0112 Part 2: the TUI indicator's probe runs every few seconds and
+    /// must never mint a key as a side effect — with no hash, no env key and
+    /// no sidecar it hands back nothing and writes nothing.
+    #[test]
+    fn the_probe_gateway_never_mints_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let supervisor = SquadSupervisor::from_env(&env).unwrap();
+
+        assert!(
+            supervisor.probe_gateway().unwrap().is_none(),
+            "no endpoint sidecar means no gateway"
+        );
+        assert!(
+            supervisor
+                .process
+                .paths()
+                .read_key_hash()
+                .unwrap()
+                .is_none(),
+            "a probe must not write squad_key.hash"
+        );
+        assert!(
+            supervisor.generated_key().is_none(),
+            "a probe must not mint a key"
+        );
     }
 
     /// The end the supervisor actually reaches: a hash on disk that this

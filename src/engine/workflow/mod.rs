@@ -5003,6 +5003,7 @@ mod tests {
                 url: "https://example.com/repo".into(),
                 branch: None,
                 into: None,
+                conflict_mode: Default::default(),
             },
             SetupStep::PullBranch {
                 remote: None,

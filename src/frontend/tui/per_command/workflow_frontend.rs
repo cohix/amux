@@ -246,7 +246,11 @@ impl WorkflowFrontend for TuiCommandFrontend {
                 .filter(|s| s.kind == WorkflowStepKind::Teardown)
                 .cloned()
                 .collect();
-            view.steps = setup.into_iter().chain(main_steps).chain(teardown).collect();
+            view.steps = setup
+                .into_iter()
+                .chain(main_steps)
+                .chain(teardown)
+                .collect();
             view.current_step = steps
                 .iter()
                 .find(|s| matches!(s.status, WorkflowStepStatus::Running))
@@ -343,7 +347,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_setup_step_started(&mut self, description: &str) {
         self.messages.info(format!("setup: {description}"));
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "running");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Setup,
+            description,
+            "running",
+        );
     }
 
     fn on_setup_step_output(&mut self, line: &str) {
@@ -352,7 +361,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_setup_step_completed(&mut self, description: &str) {
         self.messages.success(format!("setup: {description}"));
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "done");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Setup,
+            description,
+            "done",
+        );
     }
 
     fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -362,12 +376,22 @@ impl WorkflowFrontend for TuiCommandFrontend {
             format!("setup failed: {description} (exit {exit_code}): {stderr}")
         };
         self.messages.error_msg(msg);
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Setup, description, "error");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Setup,
+            description,
+            "error",
+        );
     }
 
     fn on_teardown_step_started(&mut self, description: &str) {
         self.messages.info(format!("teardown: {description}"));
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "running");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Teardown,
+            description,
+            "running",
+        );
     }
 
     fn on_teardown_step_output(&mut self, line: &str) {
@@ -376,7 +400,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn on_teardown_step_completed(&mut self, description: &str) {
         self.messages.success(format!("teardown: {description}"));
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "done");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Teardown,
+            description,
+            "done",
+        );
     }
 
     fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -386,7 +415,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
             format!("teardown failed: {description} (exit {exit_code}): {stderr}")
         };
         self.messages.error_msg(msg);
-        upsert_phase_step(&self.workflow_view, WorkflowStepKind::Teardown, description, "error");
+        upsert_phase_step(
+            &self.workflow_view,
+            WorkflowStepKind::Teardown,
+            description,
+            "error",
+        );
     }
 
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
@@ -1285,7 +1319,11 @@ mod tests {
 
         let guard = frontend.workflow_view.lock().unwrap();
         let view = guard.as_ref().expect("workflow view must be seeded");
-        assert_eq!(view.steps.len(), 1, "the started step is updated in place, not duplicated");
+        assert_eq!(
+            view.steps.len(),
+            1,
+            "the started step is updated in place, not duplicated"
+        );
         assert_eq!(view.steps[0].kind, WorkflowStepKind::Setup);
         assert_eq!(view.steps[0].status, "error");
     }

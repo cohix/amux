@@ -475,6 +475,39 @@ impl AgentInstance for AppleContainerInstance {
     }
 }
 
+/// Resize the PTY behind an attach client's resize request, guaranteeing the
+/// agent receives a SIGWINCH even when the requested size equals the PTY's
+/// current size.
+///
+/// The attach rendezvous relies on the client's initial resize as its repaint
+/// trigger (see `attach_socket.rs`): the agent gets WINCH, redraws, and the
+/// fresh client's screen fills. But the kernel only delivers SIGWINCH when the
+/// size actually *changes* — so a client reattaching at the same terminal
+/// dimensions as a previous session (the ordinary detach → reattach flow)
+/// would otherwise get a silent no-op resize, no repaint, and a blank screen
+/// until the agent spontaneously produced output. Bounce through an
+/// off-by-one-row size first so every attach-client resize repaints.
+fn resize_pty_forcing_winch(master: &dyn portable_pty::MasterPty, cols: u16, rows: u16) {
+    let unchanged = master
+        .get_size()
+        .map(|size| size.cols == cols && size.rows == rows)
+        .unwrap_or(false);
+    if unchanged {
+        let _ = master.resize(portable_pty::PtySize {
+            rows: if rows > 1 { rows - 1 } else { rows + 1 },
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    }
+    let _ = master.resize(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+}
+
 /// Build a `BridgeConfig` for this container. The cancel callback runs
 /// `container stop <name>` so the startup-grace detector can kill a
 /// container that never produced output.
@@ -583,12 +616,7 @@ fn spawn_pty_bridged_apple(
         std::sync::Arc::new(move |cols, rows| {
             if let Some(master) = master_for_resize.upgrade() {
                 if let Ok(master) = master.lock() {
-                    let _ = master.resize(portable_pty::PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    resize_pty_forcing_winch(master.as_ref(), cols, rows);
                 }
             }
         });
@@ -1099,6 +1127,33 @@ mod apple_tests {
         let backend = AppleBackend::new();
         let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
         assert!(backend.image_home_dir(bogus).is_none());
+    }
+
+    /// A same-size attach resize must still land on the requested size after
+    /// its WINCH-forcing bounce, and a changed size must apply directly.
+    #[test]
+    #[cfg(unix)]
+    fn resize_forcing_winch_always_lands_on_the_requested_size() {
+        use portable_pty::{native_pty_system, PtySize};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // Unchanged size: the reattach case. The bounce must be invisible in
+        // the final state.
+        resize_pty_forcing_winch(pair.master.as_ref(), 80, 24);
+        let size = pair.master.get_size().expect("get_size");
+        assert_eq!((size.cols, size.rows), (80, 24));
+
+        // Changed size: the ordinary case.
+        resize_pty_forcing_winch(pair.master.as_ref(), 132, 50);
+        let size = pair.master.get_size().expect("get_size");
+        assert_eq!((size.cols, size.rows), (132, 50));
     }
 
     #[test]

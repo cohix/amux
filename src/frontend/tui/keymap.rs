@@ -180,7 +180,10 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
 /// `Ctrl-,` keep their global meaning here.
 fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
     match key.code {
-        KeyCode::Esc => Action::FocusCommandBox,
+        // WI 0112: the command box is permanently inactive on the squad tab,
+        // so there is nothing for Esc to hand focus to. It is deliberately
+        // unmapped rather than `FocusCommandBox`.
+        KeyCode::Esc => Action::None,
         KeyCode::Up => Action::ScrollUp,
         KeyCode::Down => Action::ScrollDown,
         KeyCode::Left if !ctrl => Action::SquadMoveLeft,
@@ -268,6 +271,21 @@ fn map_dialog_key(key: KeyEvent, ctrl: bool) -> Action {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    /// WI 0112 Part 4: the squad grid has no command box to hand focus to.
+    #[test]
+    fn esc_on_the_squad_list_is_unmapped() {
+        let action = map_key(
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            FocusContext::SquadList,
+        );
+        assert_eq!(action, Action::None);
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent {

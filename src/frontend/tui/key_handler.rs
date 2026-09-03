@@ -33,15 +33,17 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         // actively running.  Once the command finishes the overlay is closed, but
         // guard here too so a race can't leave the user unable to type.
         FocusContext::ContainerMaximized
-    } else if app.active_tab().is_squad
-        && app.active_tab().container_slots.is_empty()
-        && app.focus == Focus::ExecutionWindow
-    {
+    } else if app.active_tab().is_squad && app.active_tab().container_slots.is_empty() {
         // WI 0102: the squad task list holds focus. While an attach session
         // owns the tab's slots (`container_slots` non-empty) this falls through
         // to the ordinary ContainerMaximized/ExecutionWindow handling, so
         // Ctrl-S slot cycling and PTY passthrough behave exactly as in a normal
         // workflow run.
+        //
+        // WI 0112: the grid holds focus *regardless* of `app.focus`. The
+        // command box is permanently inactive on this tab, so there is no
+        // state in which a key should reach it; `App::tick_all_tabs` also
+        // normalises `focus` onto the grid, this is the belt to its braces.
         FocusContext::SquadList
     } else {
         match app.focus {
@@ -147,7 +149,10 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     // mapping for this — the binding is scoped to this one dialog.
     if key.code == KeyCode::Char('s')
         && key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(&app.active_dialog, Some(Dialog::TextInput { title, .. }) if title == "New Tab")
+        && matches!(
+            &app.active_dialog,
+            Some(Dialog::TextInput { title, .. }) if title == dialogs::NEW_TAB_DIALOG_TITLE
+        )
     {
         app.active_dialog = None;
         app.command_dialog_active = false;
@@ -172,9 +177,11 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .working_dir()
                 .to_string_lossy()
                 .to_string();
+            // The squad shortcut is advertised in the dialog's key-hint row
+            // (`render/dialog.rs`), next to Enter/Esc, not in the prompt.
             app.active_dialog = Some(Dialog::TextInput {
-                title: "New Tab".to_string(),
-                prompt: "Working directory:\nPress Ctrl-S to open squad".to_string(),
+                title: dialogs::NEW_TAB_DIALOG_TITLE.to_string(),
+                prompt: "Working directory:".to_string(),
                 editor: {
                     let mut ed = text_edit::TextEdit::new(false);
                     ed.set_text(&cwd);

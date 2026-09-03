@@ -481,7 +481,7 @@ async fn evaluate_task(args: EvaluateArgs) {
             task: task.clone(),
             run_id: run_id.clone(),
             task_dir,
-            run_log_dir,
+            run_log_dir: run_log_dir.clone(),
             guidance,
             agents_to_models,
             default_leader,
@@ -491,15 +491,30 @@ async fn evaluate_task(args: EvaluateArgs) {
         })
         .await;
 
-    let (run_status, detail, failed) = classify(&outcome);
+    let (run_status, detail, failed) = classify(&outcome, &run_log_dir);
     let finished_at = Utc::now();
-    tracing::info!(
-        task = %task.name,
-        run_id = %run_id,
-        status = ?run_status,
-        outcome = ?outcome_name(&outcome),
-        "squad task run finished"
-    );
+    if failed {
+        // WI 0112 Part 5: a failed run is an error line that says why and
+        // where to look, even when the failure happened before any step ran
+        // (so no per-step line carries a `log_path`).
+        tracing::error!(
+            task = %task.name,
+            run_id = %run_id,
+            status = ?run_status,
+            outcome = ?outcome_name(&outcome),
+            error = detail.error.as_deref().unwrap_or("(no detail)"),
+            log_dir = %run_log_dir.display(),
+            "squad task run finished"
+        );
+    } else {
+        tracing::info!(
+            task = %task.name,
+            run_id = %run_id,
+            status = ?run_status,
+            outcome = ?outcome_name(&outcome),
+            "squad task run finished"
+        );
+    }
     if let Err(error) = store.finish_run(&run_id, run_status, &detail, finished_at) {
         tracing::warn!(
             "squad: failed to record run outcome for {:?}: {error}",
@@ -554,22 +569,46 @@ fn outcome_name(outcome: &EvaluationOutcome) -> &'static str {
 
 /// Map an [`EvaluationOutcome`] onto the persisted run status, its detail row,
 /// and whether it counts as a failure for backoff purposes.
-fn classify(outcome: &EvaluationOutcome) -> (RunStatus, RunDetail, bool) {
+///
+/// WI 0112 Part 6: a generated workflow that exited non-zero is a failed run.
+/// That covers a step container exiting non-zero on its own, an aborting
+/// setup step, any teardown failure, an `abort_on_failure` abort, or an
+/// engine error — everything `exec workflow` itself reports as failure. A
+/// step the yolo countdown killed never reaches here as a failure: the engine
+/// marks it succeeded and moves on, so the overall exit code stays 0. The
+/// workflow paths stay on the row either way, so the state file is still
+/// reachable from a failed run. `run_log_dir` is named in the error text.
+fn classify(
+    outcome: &EvaluationOutcome,
+    run_log_dir: &std::path::Path,
+) -> (RunStatus, RunDetail, bool) {
     match outcome {
         EvaluationOutcome::NotTriggered => (RunStatus::NotTriggered, RunDetail::default(), false),
         EvaluationOutcome::WorkflowExecuted {
             workflow_path,
             workflow_state_path,
-            ..
-        } => (
-            RunStatus::WorkflowExecuted,
-            RunDetail {
-                workflow_path: Some(workflow_path.clone()),
-                workflow_state_path: workflow_state_path.clone(),
-                error: None,
-            },
-            false,
-        ),
+            exit_code,
+        } => {
+            let workflow_failed = matches!(exit_code, Some(code) if *code != 0);
+            (
+                if workflow_failed {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::WorkflowExecuted
+                },
+                RunDetail {
+                    workflow_path: Some(workflow_path.clone()),
+                    workflow_state_path: workflow_state_path.clone(),
+                    error: exit_code.filter(|code| *code != 0).map(|code| {
+                        format!(
+                            "generated workflow exited with code {code}; see {}",
+                            run_log_dir.display()
+                        )
+                    }),
+                },
+                workflow_failed,
+            )
+        }
         EvaluationOutcome::Failed { error } => (
             RunStatus::Failed,
             RunDetail {
@@ -629,20 +668,26 @@ mod tests {
         assert_eq!(backoff_secs(86_400, u32::MAX), MAX_BACKOFF_SECS);
     }
 
+    fn executed(exit_code: Option<i32>) -> EvaluationOutcome {
+        EvaluationOutcome::WorkflowExecuted {
+            workflow_path: "/c/workflow.toml".into(),
+            workflow_state_path: Some("/state.json".into()),
+            exit_code,
+        }
+    }
+
     #[test]
     fn classify_maps_each_outcome() {
-        let (status, detail, failed) = classify(&EvaluationOutcome::NotTriggered);
+        let log_dir = std::path::Path::new("/runs/r1");
+        let (status, detail, failed) = classify(&EvaluationOutcome::NotTriggered, log_dir);
         assert_eq!(status, RunStatus::NotTriggered);
         assert!(!failed);
         assert!(detail.error.is_none());
 
-        let (status, detail, failed) = classify(&EvaluationOutcome::WorkflowExecuted {
-            workflow_path: "/c/workflow.toml".into(),
-            workflow_state_path: Some("/state.json".into()),
-            exit_code: Some(0),
-        });
+        let (status, detail, failed) = classify(&executed(Some(0)), log_dir);
         assert_eq!(status, RunStatus::WorkflowExecuted);
         assert!(!failed);
+        assert!(detail.error.is_none());
         assert_eq!(
             detail.workflow_path.as_deref(),
             Some("/c/workflow.toml".as_ref())
@@ -652,12 +697,50 @@ mod tests {
             Some("/state.json".as_ref())
         );
 
-        let (status, detail, failed) = classify(&EvaluationOutcome::Failed {
-            error: "boom".to_string(),
-        });
+        let (status, detail, failed) = classify(
+            &EvaluationOutcome::Failed {
+                error: "boom".to_string(),
+            },
+            log_dir,
+        );
         assert_eq!(status, RunStatus::Failed);
         assert!(failed);
         assert_eq!(detail.error.as_deref(), Some("boom"));
+    }
+
+    /// WI 0112 Part 6: a generated workflow that exited non-zero is a failed
+    /// run that backs the task off, and its paths stay on the row.
+    #[test]
+    fn classify_turns_a_non_zero_workflow_exit_into_a_failed_run() {
+        let log_dir = std::path::Path::new("/runs/r1");
+        for code in [1, 2, 137] {
+            let (status, detail, failed) = classify(&executed(Some(code)), log_dir);
+            assert_eq!(status, RunStatus::Failed, "exit {code}");
+            assert!(failed, "exit {code} backs off");
+            assert_eq!(
+                detail.error.as_deref(),
+                Some(format!("generated workflow exited with code {code}; see /runs/r1").as_str())
+            );
+            assert_eq!(
+                detail.workflow_path.as_deref(),
+                Some("/c/workflow.toml".as_ref()),
+                "the workflow path survives a failed classification"
+            );
+            assert_eq!(
+                detail.workflow_state_path.as_deref(),
+                Some("/state.json".as_ref())
+            );
+        }
+    }
+
+    /// A paused workflow (no exit code) cannot happen unattended, but the
+    /// mapping must not call it a failure if it ever did.
+    #[test]
+    fn classify_treats_a_workflow_without_an_exit_code_as_executed() {
+        let (status, detail, failed) = classify(&executed(None), std::path::Path::new("/r"));
+        assert_eq!(status, RunStatus::WorkflowExecuted);
+        assert!(!failed);
+        assert!(detail.error.is_none());
     }
 
     // ── The periodic running-agents summary (WI 0106 §3b) ─────────────────

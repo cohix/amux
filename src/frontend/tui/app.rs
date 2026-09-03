@@ -160,6 +160,15 @@ pub struct App {
     /// another query onto the same slot until the runtime CLI is swamped and
     /// no slot's numbers stay current.
     pub in_flight_stats: Arc<std::sync::Mutex<std::collections::HashSet<(usize, String)>>>,
+    /// The active tab index as of the previous tick (WI 0112). Lets the tick
+    /// notice a switch *away* from the squad tab and hand focus back to the
+    /// command box, without every tab-switching path having to know.
+    pub last_active_tab: usize,
+    /// Squad daemon health for the bottom-row indicator (WI 0112). Written by
+    /// the app-level `SquadIndicatorPoller` started in `tui::run`; read by
+    /// the renderer. Starts `Unknown` and stays so in unit tests, which never
+    /// start the poller.
+    pub squad_indicator: crate::frontend::tui::squad_indicator::SharedSquadIndicator,
 }
 
 impl App {
@@ -193,7 +202,38 @@ impl App {
             stats_tx,
             last_stats_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
             in_flight_stats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_active_tab: 0,
+            squad_indicator: Arc::new(std::sync::Mutex::new(
+                crate::frontend::tui::squad_indicator::SquadIndicator::Unknown,
+            )),
         }
+    }
+
+    /// Whether the active tab is the squad tab showing its card grid — the
+    /// state in which the command box is permanently inactive and the grid
+    /// always holds focus (WI 0112). False while an attach session owns the
+    /// tab's slots: the tab then behaves as an ordinary container tab.
+    pub fn squad_grid_active(&self) -> bool {
+        let tab = self.active_tab();
+        tab.is_squad && tab.container_slots.is_empty()
+    }
+
+    /// Keep `focus` consistent with the active tab (WI 0112), once per tick:
+    /// on the squad grid, focus is always the grid; leaving the squad tab for
+    /// a normal tab restores the command box. A normal-to-normal switch leaves
+    /// focus alone, exactly as before.
+    fn normalize_focus_for_active_tab(&mut self) {
+        if self.squad_grid_active() {
+            self.focus = Focus::ExecutionWindow;
+        } else if self.active_tab != self.last_active_tab
+            && self
+                .tabs
+                .get(self.last_active_tab)
+                .is_some_and(|tab| tab.is_squad)
+        {
+            self.focus = Focus::CommandBox;
+        }
+        self.last_active_tab = self.active_tab;
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -229,6 +269,9 @@ impl App {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+        // The removed index must not survive as `last_active_tab`, or a tab
+        // that later lands on it could be mistaken for the one that closed.
+        self.last_active_tab = self.last_active_tab.min(self.tabs.len().saturating_sub(1));
     }
 
     /// Focus the existing squad tab, or create the singleton one — asking
@@ -829,6 +872,7 @@ impl App {
         // result lands — before the tab loop, so a tab installed by this call
         // is polled on the very same tick it appears.
         self.poll_squad_startup();
+        self.normalize_focus_for_active_tab();
 
         let active = self.active_tab;
         for (idx, tab) in self.tabs.iter_mut().enumerate() {

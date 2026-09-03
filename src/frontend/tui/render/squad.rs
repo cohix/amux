@@ -236,33 +236,110 @@ fn render_empty_state(area: Rect, frame: &mut Frame) {
     );
 }
 
+/// What a task card's *colour* says about the task (WI 0112 Part 3). One
+/// axis only — selection is the other axis (dashed vs solid outline, the
+/// `➡` marker) and never expresses state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardStatus {
+    /// `TaskStatus::Paused`. The user switched it off; outranks everything.
+    Paused,
+    /// The most recent run is still going.
+    Running,
+    /// A `squad trigger` is waiting to be honoured on the next tick.
+    Triggered,
+    /// The most recent run ended `failed`.
+    Failed,
+    /// Has never run.
+    NeverRun,
+    /// Active, with an ordinary last outcome (or interrupted).
+    Active,
+}
+
+impl CardStatus {
+    pub(crate) fn color(self) -> Color {
+        match self {
+            Self::Paused => Color::DarkGray,
+            Self::Running => Color::Blue,
+            Self::Triggered => Color::Magenta,
+            Self::Failed => Color::Red,
+            Self::NeverRun => Color::Yellow,
+            Self::Active => Color::Green,
+        }
+    }
+}
+
+/// The card colour for `task`, first match wins. Paused is a user decision
+/// and outranks everything (the card should read "you switched this off"
+/// even if its last run failed). A running task cannot honour a trigger
+/// until it finishes, so running outranks triggered. Triggered outranks
+/// failed because the user has just acted on the task and wants to see the
+/// trigger acknowledged; the red returns if the triggered run fails too.
+pub(crate) fn card_status(task: &Task) -> CardStatus {
+    if task.status == TaskStatus::Paused {
+        return CardStatus::Paused;
+    }
+    if task.last_run_status == Some(RunStatus::Running) {
+        return CardStatus::Running;
+    }
+    if task.trigger_requested_at.is_some() {
+        return CardStatus::Triggered;
+    }
+    if task.last_run_status == Some(RunStatus::Failed) {
+        return CardStatus::Failed;
+    }
+    if task.last_run_at.is_none() {
+        return CardStatus::NeverRun;
+    }
+    CardStatus::Active
+}
+
+/// The outline every *unselected* card is drawn with: rounded corners with
+/// dashed edges. Ratatui has no dashed `BorderType`, so it is a custom set.
+/// The selected card uses the ordinary solid `BorderType::Rounded`; dashed
+/// versus solid means only "not selected" versus "selected".
+pub(crate) const DASHED_ROUNDED: ratatui::symbols::border::Set = ratatui::symbols::border::Set {
+    top_left: "\u{256d}",
+    top_right: "\u{256e}",
+    bottom_left: "\u{2570}",
+    bottom_right: "\u{256f}",
+    vertical_left: "\u{2506}",
+    vertical_right: "\u{2506}",
+    horizontal_top: "\u{254c}",
+    horizontal_bottom: "\u{254c}",
+};
+
 /// Render a single task as a rounded-rectangle card: name as the block
 /// title, then the same three fields the table used to show as columns
 /// (summary, last run, next evaluation) as body lines.
+///
+/// Colour comes from [`card_status`]; selection is a solid (not dashed)
+/// outline plus the same `➡` title marker the active tab carries.
 fn render_task_card(task: &Task, is_selected: bool, area: Rect, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (border_style, title_style) = if is_selected {
+    let color = card_status(task).color();
+    let border_style = Style::default().fg(color);
+    let (title_text, title_style) = if is_selected {
         (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            format!(" \u{27a1} {} ", task.name),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         )
     } else {
         (
-            Style::default().fg(Color::DarkGray),
+            format!(" {} ", task.name),
             Style::default().add_modifier(Modifier::BOLD),
         )
     };
     let block = Block::default()
-        .title(Span::styled(format!(" {} ", task.name), title_style))
+        .title(Span::styled(title_text, title_style))
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
         .border_style(border_style);
+    let block = if is_selected {
+        block.border_type(BorderType::Rounded)
+    } else {
+        block.border_set(DASHED_ROUNDED)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -402,9 +479,105 @@ fn next_evaluation(task: &Task) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        grid_card_width, grid_columns_for_width, truncate_to_width, CARD_MIN_WIDTH,
-        MAX_CARD_COLUMNS,
+        card_status, grid_card_width, grid_columns_for_width, truncate_to_width, CardStatus,
+        CARD_MIN_WIDTH, MAX_CARD_COLUMNS,
     };
+    use crate::data::fs::task_store::{MountScope, RunStatus, Task, TaskStatus};
+    use chrono::Utc;
+
+    fn task_with(
+        status: TaskStatus,
+        last_run_status: Option<RunStatus>,
+        has_run: bool,
+        triggered: bool,
+    ) -> Task {
+        let now = Utc::now();
+        Task {
+            id: "t".into(),
+            name: "t".into(),
+            description: "d".into(),
+            repo_scope: std::path::PathBuf::from("/workspace"),
+            mount_scope: MountScope::Directory,
+            overlays: Vec::new(),
+            interval_secs: 60,
+            status,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: has_run.then_some(now),
+            trigger_requested_at: triggered.then_some(now),
+            last_run_status,
+        }
+    }
+
+    /// WI 0112 Part 3: every row of the precedence table.
+    #[test]
+    fn card_status_follows_the_precedence_table() {
+        use TaskStatus::{Active, Paused};
+        assert_eq!(
+            card_status(&task_with(Paused, None, false, false)),
+            CardStatus::Paused
+        );
+        assert_eq!(
+            card_status(&task_with(Active, Some(RunStatus::Running), true, false)),
+            CardStatus::Running
+        );
+        assert_eq!(
+            card_status(&task_with(
+                Active,
+                Some(RunStatus::WorkflowExecuted),
+                true,
+                true
+            )),
+            CardStatus::Triggered
+        );
+        assert_eq!(
+            card_status(&task_with(Active, Some(RunStatus::Failed), true, false)),
+            CardStatus::Failed
+        );
+        assert_eq!(
+            card_status(&task_with(Active, None, false, false)),
+            CardStatus::NeverRun
+        );
+        for outcome in [
+            RunStatus::NotTriggered,
+            RunStatus::WorkflowExecuted,
+            RunStatus::Interrupted,
+        ] {
+            assert_eq!(
+                card_status(&task_with(Active, Some(outcome), true, false)),
+                CardStatus::Active,
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn card_status_combinations_resolve_in_order() {
+        use TaskStatus::{Active, Paused};
+        // Paused beats failed: the user switched it off.
+        assert_eq!(
+            card_status(&task_with(Paused, Some(RunStatus::Failed), true, false)),
+            CardStatus::Paused
+        );
+        // Running beats triggered: the trigger waits for the run to end.
+        assert_eq!(
+            card_status(&task_with(Active, Some(RunStatus::Running), true, true)),
+            CardStatus::Running
+        );
+        // Triggered beats failed: the trigger is acknowledged first.
+        assert_eq!(
+            card_status(&task_with(Active, Some(RunStatus::Failed), true, true)),
+            CardStatus::Triggered
+        );
+        // A never-run task that is triggered is triggered, not never-run.
+        assert_eq!(
+            card_status(&task_with(Active, None, false, true)),
+            CardStatus::Triggered
+        );
+    }
 
     #[test]
     fn a_single_column_card_is_capped_at_half_the_grid_width() {

@@ -614,7 +614,9 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         }) => {
             let copy = match c {
                 'c' => copy_key.clone().map(|text| ("squad key", text)),
-                'z' => copy_zshrc_snippet.clone().map(|text| ("zshrc snippet", text)),
+                'z' => copy_zshrc_snippet
+                    .clone()
+                    .map(|text| ("zshrc snippet", text)),
                 _ => None,
             };
             if let Some((label, text)) = copy {

@@ -52,7 +52,13 @@ The TUI is composed of three areas:
 
 - **Tab bar** (top) — one entry per open session, with colour-coded state
 - **Execution window** (middle) — shows command output; overlaid by the container window when an agent is running
-- **Command box** (bottom) — where you type subcommands
+- **Command box** (bottom) — where you type subcommands. On the [squad tab](#the-squad-tab) it is permanently inactive and the card grid holds focus instead.
+
+The single row under the command box shows the working directory (or the
+active worktree) and, pinned to its right edge on every tab, the `squad ●`
+indicator — a circle whose colour is the squad daemon's health (grey not
+running, green healthy, yellow unreachable, blue a task is running, red a
+task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicator).
 
 ---
 
@@ -619,8 +625,8 @@ tab inside this same multi-tab TUI rather than a separate program. Open it
 either of two ways:
 
 - Press **Ctrl+T** to open the New Tab dialog, then press **Ctrl-S** while
-  it's focused. The dialog's prompt shows a hint — "Press Ctrl-S to open
-  squad" — as a reminder. This doesn't add a second global `Ctrl-S` binding:
+  it's focused. The dialog's key-hint row lists it — `[Ctrl+S] open squad` —
+  beside Enter and Esc. This doesn't add a second global `Ctrl-S` binding:
   outside the New Tab dialog, `Ctrl-S` keeps its usual meanings (cycling
   parallel container slots, submitting multiline dialogs).
 - Run `awman squad` with no subcommand from a terminal (with a TTY attached
@@ -633,11 +639,13 @@ directory name, since it isn't bound to a project directory.
 
 Otherwise it's an ordinary tab: it takes part in **Ctrl-A**/**Ctrl-D** tab
 cycling, closes through the normal close-tab flow, and keeps its state
-while you're on a different tab. The command box below it still works
-exactly as it does on any other tab — you can type `squad <subcommand> ...`
-directly into it. The one difference is what fills the execution window
-above the command box: squad's task list instead of plain command
-output, and, once you attach to a running task, the same
+while you're on a different tab. Two things differ. The command box below
+it is permanently inactive — it reads `command (inactive)` with a reminder
+to use the arrow keys and **Enter** — because the task grid holds focus the
+whole time you're on the tab, so the arrows work immediately and **Esc**
+does nothing (type `squad <subcommand> ...` into any other tab's command box
+instead). And what fills the execution window is squad's task list instead
+of plain command output — or, once you attach to a running task, the same
 container / Workflow Overview view a regular workflow tab shows. **Ctrl-G** (the
 git sidebar) is a no-op here, since the tab has no repository to show.
 
