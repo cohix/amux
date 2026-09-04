@@ -113,10 +113,13 @@ impl NewCommandFrontend for TuiCommandFrontend {
         }
     }
 
+    /// Multi-line, through the same editor `new spec --interview` uses: this
+    /// text is the whole brief the interview agent works from, and a one-line
+    /// box cannot hold one.
     fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
-        let response = self.ask_dialog(DialogRequest::TextInput {
+        let response = self.ask_dialog(DialogRequest::MultilineInput {
             title: "Skill summary".into(),
-            prompt: "Enter a one-line skill summary:".into(),
+            prompt: "Describe what the skill should do (Ctrl+Enter to submit):".into(),
             default_text: None,
         })?;
         match response {
@@ -135,5 +138,38 @@ impl NewCommandFrontend for TuiCommandFrontend {
             DialogResponse::Text(t) => Ok(t),
             _ => Ok(String::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::tui::per_command::mount_scope::tests::make_frontend;
+
+    /// The skill summary is the entire brief the `--interview` agent works
+    /// from, so it gets the multi-line editor the spec summary and the squad
+    /// task description use — a one-line box could not hold one.
+    #[test]
+    fn the_skill_summary_step_opens_the_multiline_editor() {
+        let (mut frontend, req_rx, resp_tx) = make_frontend();
+        let handle = std::thread::spawn(move || {
+            let request = req_rx.recv().unwrap();
+            resp_tx
+                .send(DialogResponse::Text("line one\nline two".into()))
+                .unwrap();
+            request
+        });
+
+        let answer = frontend.ask_skill_summary().unwrap();
+        let request = handle.join().unwrap();
+
+        assert!(
+            matches!(request, DialogRequest::MultilineInput { .. }),
+            "the skill summary must open the multiline editor, got {request:?}"
+        );
+        assert_eq!(
+            answer, "line one\nline two",
+            "every line the user typed must reach the interview prompt"
+        );
     }
 }

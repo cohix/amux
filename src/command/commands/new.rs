@@ -12,7 +12,7 @@ use crate::command::commands::skill_library::{
 use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::data::fs::{SkillDirs, WorkflowDirs};
+use crate::data::fs::{SkillDirs, WorkflowDirs, SKILL_INTERVIEW_CONTAINER_DIR};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::engine::agent::AgentRunOptions;
@@ -666,12 +666,18 @@ impl Command for NewCommand {
                                 }
                             };
                         let summary = frontend.ask_skill_summary().unwrap_or_default();
-                        let path_str = path.display().to_string();
-                        let prompt = render_skill_interview_prompt(&path_str, &summary);
+                        // The agent container always mounts the repo at
+                        // `/workspace`, which a `--global` skill never lives
+                        // under. Mount the new skill's own directory at a
+                        // fixed container path instead, and point the prompt
+                        // at that path rather than at the host one.
+                        let container_file = skill_interview_container_file(&path);
+                        let prompt = render_skill_interview_prompt(&container_file, &summary);
                         let run_opts = AgentRunOptions {
                             initial_prompt: Some(prompt),
                             non_interactive: f.non_interactive,
                             env_passthrough: None,
+                            directory_overlays: vec![skill_interview_overlay(&dir)],
                             ..Default::default()
                         };
                         // Sandbox-class runtimes: agent spawn lands in WI 0090.
@@ -760,6 +766,35 @@ impl Command for NewCommand {
         };
         frontend.replay_queued();
         Ok(outcome)
+    }
+}
+
+/// Container-side path of the skill file the interview agent is told to edit.
+///
+/// Pairs with [`skill_interview_overlay`]: the skill's directory is mounted at
+/// [`SKILL_INTERVIEW_CONTAINER_DIR`], so the file the host wrote at
+/// `<dir>/SKILL.md` is reachable at `/awman/skill/SKILL.md` inside the
+/// container. Naming the host path in the prompt instead would send the agent
+/// to a path that does not exist there.
+fn skill_interview_container_file(host_path: &std::path::Path) -> String {
+    let name = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("SKILL.md");
+    format!("{SKILL_INTERVIEW_CONTAINER_DIR}/{name}")
+}
+
+/// Structural mount for `new skill --interview`: the new skill's own
+/// directory, read-write, at [`SKILL_INTERVIEW_CONTAINER_DIR`].
+///
+/// Not a user-supplied overlay — it is how the interview agent reaches the
+/// only file it is asked to write, so its container path is fixed and the
+/// prompt names it outright.
+fn skill_interview_overlay(dir: &std::path::Path) -> crate::engine::overlay::DirectorySpec {
+    crate::engine::overlay::DirectorySpec {
+        host: dir.to_string_lossy().into_owned(),
+        container: SKILL_INTERVIEW_CONTAINER_DIR.to_string(),
+        permission: crate::engine::container::options::OverlayPermission::ReadWrite,
     }
 }
 
@@ -1223,5 +1258,56 @@ mod tests {
         } else {
             panic!("unexpected outcome variant");
         }
+    }
+
+    /// `new skill --interview` hands the skill file to an agent running in a
+    /// container that only ever has the repo mounted at `/workspace`. A
+    /// `--global` skill lives under `~/.awman/skills/`, which is nowhere
+    /// inside that mount, so the skill's own directory has to be mounted at
+    /// the fixed container path and the prompt has to name the file there —
+    /// naming the host path sent the agent to a path the container has not
+    /// got.
+    #[test]
+    fn the_skill_interview_mounts_the_skill_dir_and_names_it_in_the_prompt() {
+        use crate::engine::container::options::OverlayPermission;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A global skill dir: deliberately outside any repo/workspace root.
+        let dir = tmp.path().join("awman-home/skills/my-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("SKILL.md");
+        std::fs::write(&file, "# Skill: my-skill\n").unwrap();
+
+        let overlay = skill_interview_overlay(&dir);
+        assert_eq!(overlay.host, dir.to_string_lossy());
+        assert_eq!(overlay.container, SKILL_INTERVIEW_CONTAINER_DIR);
+        assert_eq!(
+            overlay.permission,
+            OverlayPermission::ReadWrite,
+            "the interview agent has to write the skill file"
+        );
+
+        // The spec must survive the same resolution every overlay goes
+        // through, and land at exactly the path the prompt names.
+        let engines = make_engines(tmp.path());
+        let resolved = engines
+            .overlay_engine
+            .resolve_user_overlay(&overlay, tmp.path(), None)
+            .expect("the skill dir exists, so its overlay must resolve");
+        assert_eq!(
+            resolved.container_path,
+            std::path::Path::new(SKILL_INTERVIEW_CONTAINER_DIR)
+        );
+
+        let prompt =
+            render_skill_interview_prompt(&skill_interview_container_file(&file), "a summary");
+        assert!(
+            prompt.contains("/awman/skill/SKILL.md"),
+            "the prompt must point at the mounted skill file: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&*dir.to_string_lossy()),
+            "the host path must never reach the agent: {prompt}"
+        );
     }
 }

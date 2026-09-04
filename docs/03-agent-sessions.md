@@ -494,9 +494,11 @@ The `name` field is the skill's slug; the `description` is a single sentence; th
 awman new skill --interview
 ```
 
-Enter a brief summary of what the skill should do. A code agent writes the complete skill body for you, following the second-person imperative style and adding any necessary commands, code examples, or decision trees.
+Describe what the skill should do. A code agent writes the complete skill body for you, following the second-person imperative style and adding any necessary commands, code examples, or decision trees.
 
-In the TUI, the dialog replaces the Body field with a Summary field. Press **Ctrl-Enter** to start the interview agent.
+The summary is free-form and multi-line in both modes: in the TUI the Body field is replaced by a multi-line Summary editor (**Enter** starts a new line, **Ctrl-Enter** submits and starts the interview agent); on the CLI, type as many lines as you like and end with a blank line or **Ctrl-D**.
+
+The interview agent runs in a container with the new skill's own directory mounted at `/awman/skill`, and is told to edit `/awman/skill/SKILL.md` and nothing else. That mount is what makes `--interview` work together with `--global`: a global skill lives in `~/.awman/skills/`, outside the repo the container sees at `/workspace`, so without it the agent would have no path to the file it was asked to write.
 
 **TUI key bindings** (skill dialog):
 
