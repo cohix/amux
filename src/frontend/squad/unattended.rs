@@ -6,9 +6,11 @@
 //! * the mount-scope question is answered with the scope captured when the
 //!   task was created — it is never widened;
 //! * the workflow control board auto-advances rather than waiting for a key;
-//! * a step failure aborts the run rather than waiting for a choice;
+//! * a step failure is never put to a user: the engine's unattended path runs
+//!   its countdown, retries the step once, and fails the run on a second
+//!   failure (WI-0115 §3);
 //! * a persisted workflow state is discarded so every scheduled run starts
-//!   fresh;
+//!   over — the one frontend that deliberately declines to resume;
 //! * agent setup and credential consent are accepted, because the task's
 //!   agents were already validated against the repo at creation time.
 //!
@@ -31,7 +33,9 @@ use async_trait::async_trait;
 
 use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend};
 use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::squad::evaluation::SquadRunFrontends;
 use crate::command::commands::worktree_lifecycle::{
@@ -44,12 +48,11 @@ use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
-    WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome, WorkflowStepStatus,
+    YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -580,15 +583,10 @@ impl WorkflowFrontend for UnattendedFrontend {
         Ok(false)
     }
 
-    /// Nobody can choose, so a failed step ends the run; the scheduler records
-    /// the failure and backs the task off.
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &WorkflowStep,
-        _exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
-    }
+    // `supports_interactive_recovery` keeps its `false` default: nobody can
+    // choose, so a failed step gets the engine's one automatic retry and then
+    // ends the run (WI-0115 §3); the scheduler records the failure and backs
+    // the task off.
 }
 
 impl MountScopeFrontend for UnattendedFrontend {
@@ -721,15 +719,30 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
         );
     }
 
-    /// Start fresh: each scheduled evaluation is its own run, and resuming a
-    /// stale state unattended would silently skip steps.
-    fn ask_workflow_resume_or_fresh(
+    /// Start over: each scheduled evaluation is its own run, so picking up a
+    /// stale one unattended would silently skip steps this run is meant to
+    /// perform. Squad is the one frontend that deliberately does *not* take
+    /// `resume_from_stop_point`.
+    fn ask_workflow_resume(
         &mut self,
-        _workflow_name: &str,
-        _completed_steps: usize,
-        _total_steps: usize,
-    ) -> Result<bool, CommandError> {
-        Ok(false)
+        _prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        Ok(WorkflowResumeDecision::Fresh)
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
+        tracing::info!(
+            task = %self.task,
+            run_id = %self.run_id,
+            work_item,
+            reason,
+            "cannot resume the previous dynamic workflow"
+        );
+        Ok(())
     }
 }
 
@@ -1020,9 +1033,24 @@ mod tests {
     #[test]
     fn nothing_the_unattended_frontend_answers_can_block_or_destroy_work() {
         let mut frontend = UnattendedFrontend::new("c/leader".into());
-        assert!(
-            !frontend.ask_workflow_resume_or_fresh("wf", 1, 3).unwrap(),
-            "an unattended run must start fresh rather than resume stale state"
+        let resume_prompt = WorkflowResumePrompt::new(
+            "wf".into(),
+            None,
+            None,
+            false,
+            1,
+            3,
+            vec![
+                crate::command::commands::exec_workflow::WorkflowResumeStep {
+                    name: "b".into(),
+                    role: "the step that failed".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            frontend.ask_workflow_resume(&resume_prompt).unwrap(),
+            WorkflowResumeDecision::Fresh,
+            "an unattended run must start over rather than resume stale state"
         );
         let prompt = PostWorkflowWorktreePrompt {
             branch: "awman/squad".into(),

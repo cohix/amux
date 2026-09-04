@@ -1228,7 +1228,6 @@ impl App {
                     Dialog::KindSelect { title, options }
                 }
                 DialogRequest::WorkflowControlBoard(state) => Dialog::WorkflowControlBoard(state),
-                DialogRequest::WorkflowStepError(state) => Dialog::WorkflowStepError(state),
                 DialogRequest::WorkflowYoloCountdown(state) => Dialog::WorkflowYoloCountdown(state),
                 DialogRequest::WorkflowStepConfirm(state) => Dialog::WorkflowStepConfirm(state),
                 DialogRequest::AgentSetup(state) => Dialog::AgentSetup(state),

@@ -47,7 +47,6 @@ pub enum DialogRequest {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -121,7 +120,6 @@ pub enum Dialog {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -220,12 +218,10 @@ pub struct WorkflowControlBoardState {
     /// Live peers still running in the focused step's parallel group (excludes
     /// the focused step). Non-zero disables back/finish in the WCB.
     pub parallel_peers_running: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowStepErrorState {
-    pub step_name: String,
-    pub error_lines: Vec<String>,
+    /// Detail lines for the failure that opened this board (exit code, signal,
+    /// run duration), copied from `AvailableActions::step_failure`. Empty on an
+    /// ordinary between-steps board (WI-0115 §1).
+    pub failure_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -574,15 +574,24 @@ prompt = "p"
         let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
         assert!(matches!(
             &wf.setup[0].step,
-            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Skip, .. }
+            SetupStep::CloneRepo {
+                conflict_mode: CloneConflictMode::Skip,
+                ..
+            }
         ));
         assert!(matches!(
             &wf.setup[1].step,
-            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Replace, .. }
+            SetupStep::CloneRepo {
+                conflict_mode: CloneConflictMode::Replace,
+                ..
+            }
         ));
         assert!(matches!(
             &wf.setup[2].step,
-            SetupStep::CloneRepo { conflict_mode: CloneConflictMode::Error, .. }
+            SetupStep::CloneRepo {
+                conflict_mode: CloneConflictMode::Error,
+                ..
+            }
         ));
 
         let bad = r#"

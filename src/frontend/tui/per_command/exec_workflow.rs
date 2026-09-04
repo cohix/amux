@@ -1,6 +1,8 @@
 //! `ExecWorkflowCommandFrontend` impl for the TUI.
 
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
@@ -22,29 +24,57 @@ impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    fn ask_workflow_resume_or_fresh(
+    fn ask_workflow_resume(
         &mut self,
-        workflow_name: &str,
-        completed_steps: usize,
-        total_steps: usize,
-    ) -> Result<bool, CommandError> {
+        prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        // Keys are '1'..'3' over the offered start points, in the order the
+        // command layer built them (stopped / previous / next), plus 'f' to
+        // start over.
+        let mut keys: Vec<(char, String)> = prompt
+            .choice_labels()
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| (char::from_digit(i as u32 + 1, 10).unwrap_or('1'), label))
+            .collect();
+        keys.push(('f', prompt.fresh_label.clone()));
+
         let response = self.ask_dialog(DialogRequest::Custom {
-            title: "Existing workflow state".into(),
-            body: format!(
-                "Persisted state found for workflow '{}'.\n\n\
-                 Progress: {}/{} step(s) completed.\n\n\
-                 Resume from where it left off, or delete the state and start fresh?",
-                workflow_name, completed_steps, total_steps,
-            ),
-            keys: vec![
-                ('r', "Resume from saved state".into()),
-                ('f', "Delete state and start fresh".into()),
-            ],
+            title: prompt.title.clone(),
+            body: prompt.body.clone(),
+            keys,
         })?;
+
         Ok(match response {
-            DialogResponse::Char('f') | DialogResponse::Char('F') => false,
-            // Default to resume on dismiss (Esc) — safer than wiping state.
-            _ => true,
+            DialogResponse::Char(c) => match c.to_digit(10) {
+                Some(d) if d >= 1 => prompt
+                    .start_points
+                    .get(d as usize - 1)
+                    .map(|p| WorkflowResumeDecision::ResumeFrom(p.name.clone()))
+                    // 'f', or a digit past the offered list.
+                    .unwrap_or(WorkflowResumeDecision::Fresh),
+                _ => WorkflowResumeDecision::Fresh,
+            },
+            // Esc: starting over is the reversible choice — the worktree and
+            // its commits are left untouched until the user says otherwise.
+            _ => WorkflowResumeDecision::Fresh,
         })
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
+        self.ask_dialog(DialogRequest::Custom {
+            title: "Cannot resume previous workflow".into(),
+            body: format!(
+                "The worktree for work item {work_item:04} is still on disk, but the previous \
+                 dynamic workflow cannot be resumed:\n\n{reason}\n\n\
+                 A fresh dynamic workflow will be designed instead.",
+            ),
+            keys: vec![('c', "Continue — start a fresh dynamic workflow".into())],
+        })?;
+        Ok(())
     }
 }

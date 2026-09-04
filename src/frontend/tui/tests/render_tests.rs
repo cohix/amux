@@ -1445,3 +1445,75 @@ fn the_command_box_is_ordinary_during_a_squad_attach_session() {
         "attach sessions use the ordinary command box: {text}"
     );
 }
+
+// ─── WI-0115 §1: the step-failure control board ──────────────────────────
+
+/// A `WorkflowControlBoardState` with no failure and everything switched off.
+fn plain_control_board() -> crate::frontend::tui::dialogs::WorkflowControlBoardState {
+    crate::frontend::tui::dialogs::WorkflowControlBoardState {
+        step_name: "implement".into(),
+        focused_step_name: "implement".into(),
+        can_launch_next: true,
+        can_continue_current: false,
+        can_restart: true,
+        can_go_back: true,
+        can_finish: false,
+        continue_unavailable_reason: None,
+        cancel_to_previous_unavailable_reason: None,
+        finish_workflow_unavailable_reason: None,
+        restart_unavailable_reason: None,
+        can_dismiss: false,
+        launch_next_label: None,
+        parallel_peer_count: 0,
+        parallel_peers_running: 0,
+        failure_lines: Vec::new(),
+    }
+}
+
+#[test]
+fn failure_control_board_names_the_failed_step_and_shows_the_error() {
+    let mut app = make_app();
+    let mut state = plain_control_board();
+    state.failure_lines = vec!["Exit code: 1".into(), "Ran for 214s".into()];
+    state.launch_next_label = Some("Skip to 'review' (new container)".into());
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(state));
+
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("step failed"), "title must say so: {text}");
+    assert!(
+        text.contains("Failed step: implement"),
+        "the failed step must be named: {text}"
+    );
+    assert!(text.contains("Exit code: 1"), "error detail: {text}");
+    assert!(
+        text.contains("Restart failed step"),
+        "restart must be offered: {text}"
+    );
+    assert!(
+        text.contains("Cancel to prev"),
+        "back must be offered: {text}"
+    );
+    assert!(
+        text.contains("Skip to 'review'"),
+        "the next step must be named: {text}"
+    );
+    assert!(
+        text.contains("[^C] Cancel workflow"),
+        "Ctrl-C is the way out of a failure board: {text}"
+    );
+    assert!(
+        !text.contains("Finish workflow"),
+        "a failure board must never offer Finish: {text}"
+    );
+}
+
+#[test]
+fn control_board_without_a_failure_keeps_its_ordinary_title() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(plain_control_board()));
+
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("Workflow Control"), "{text}");
+    assert!(!text.contains("step failed"), "{text}");
+    assert!(text.contains("Restart current step"), "{text}");
+}

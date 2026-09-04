@@ -5,9 +5,7 @@ use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::data::session_manager::SessionManager;
 use crate::frontend::tui::app::{App, Focus};
-use crate::frontend::tui::dialogs::{
-    Dialog, DialogResponse, MountScopeState, WorkflowStepErrorState,
-};
+use crate::frontend::tui::dialogs::{Dialog, DialogResponse, MountScopeState};
 use crate::frontend::tui::tabs::Tab;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 

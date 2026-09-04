@@ -67,6 +67,17 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
+        // A single-key Custom dialog is an acknowledgement, not a choice —
+        // Enter accepts its one action. Multi-key Custom dialogs are real
+        // choices and keep requiring the letter, so Enter cannot pick one of
+        // several options by accident.
+        Some(Dialog::Custom { keys, .. }) if is_command && keys.len() == 1 => {
+            let ch = keys[0].0;
+            app.send_dialog_response(DialogResponse::Char(ch));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
         _ => {}
     }
 }
@@ -510,11 +521,6 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         }
 
         Some(Dialog::WorkflowControlBoard { .. }) => {
-            app.send_dialog_response(DialogResponse::Char(c));
-            app.active_dialog = None;
-            app.command_dialog_active = false;
-        }
-        Some(Dialog::WorkflowStepError { .. }) => {
             app.send_dialog_response(DialogResponse::Char(c));
             app.active_dialog = None;
             app.command_dialog_active = false;

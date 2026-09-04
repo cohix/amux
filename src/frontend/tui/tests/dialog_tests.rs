@@ -234,6 +234,45 @@ fn custom_dialog_accepts_listed_key() {
     assert!(app.active_dialog.is_none());
 }
 
+/// WI-0115 §2: the "cannot resume" notice is a single-key Custom dialog, and
+/// its rendered hint tells the user to press Enter.
+#[test]
+fn single_key_custom_dialog_accepts_enter() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(
+        &mut app,
+        Dialog::Custom {
+            title: "Cannot resume previous workflow".into(),
+            body: "state file is gone".into(),
+            keys: vec![('c', "Continue".into())],
+        },
+    );
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let response = rx.try_recv().unwrap();
+    assert!(matches!(response, DialogResponse::Char('c')));
+    assert!(app.active_dialog.is_none());
+}
+
+/// Enter must never pick one of several options for the user.
+#[test]
+fn multi_key_custom_dialog_ignores_enter() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(
+        &mut app,
+        Dialog::Custom {
+            title: "Choose".into(),
+            body: "Pick one".into(),
+            keys: vec![('1', "Resume".into()), ('f', "Fresh".into())],
+        },
+    );
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        rx.try_recv().is_err(),
+        "Enter must not choose between several options"
+    );
+    assert!(app.active_dialog.is_some());
+}
+
 #[test]
 fn custom_dialog_ignores_unlisted_key() {
     let mut app = make_app();
@@ -317,38 +356,6 @@ fn kind_select_digit_3_sends_index_2() {
     press_char(&mut app, '3');
     let response = rx.try_recv().unwrap();
     assert!(matches!(response, DialogResponse::Index(2)));
-}
-
-// ─── WorkflowStepError dialog ─────────────────────────────────────────────
-
-#[test]
-fn workflow_step_error_r_sends_char_r() {
-    let mut app = make_app();
-    let rx = setup_command_dialog(
-        &mut app,
-        Dialog::WorkflowStepError(WorkflowStepErrorState {
-            step_name: "build".into(),
-            error_lines: vec!["Step failed".into()],
-        }),
-    );
-    press_char(&mut app, 'r');
-    let response = rx.try_recv().unwrap();
-    assert!(matches!(response, DialogResponse::Char('r')));
-}
-
-#[test]
-fn workflow_step_error_a_sends_char_a() {
-    let mut app = make_app();
-    let rx = setup_command_dialog(
-        &mut app,
-        Dialog::WorkflowStepError(WorkflowStepErrorState {
-            step_name: "build".into(),
-            error_lines: vec!["Step failed".into()],
-        }),
-    );
-    press_char(&mut app, 'a');
-    let response = rx.try_recv().unwrap();
-    assert!(matches!(response, DialogResponse::Char('a')));
 }
 
 // ─── ListPicker scroll ────────────────────────────────────────────────────

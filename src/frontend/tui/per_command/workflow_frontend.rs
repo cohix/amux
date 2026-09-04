@@ -5,18 +5,15 @@ use std::time::Duration;
 use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 use crate::engine::workflow::EngineRequest;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
-use crate::frontend::tui::dialogs::{
-    DialogRequest, DialogResponse, WorkflowControlBoardState, WorkflowStepErrorState,
-};
+use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse, WorkflowControlBoardState};
 use crate::frontend::tui::tabs::{ContainerSlotEvent, WorkflowStepKind};
 
 impl WorkflowFrontend for TuiCommandFrontend {
@@ -25,11 +22,21 @@ impl WorkflowFrontend for TuiCommandFrontend {
         state: &WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
-        let step_name = state
-            .step_states
-            .iter()
-            .find(|(_, s)| matches!(s, crate::data::workflow_state::StepState::Running { .. }))
-            .map(|(name, _)| name.clone())
+        // On a failure board the failed step's container is already gone, so
+        // there is no Running step to name — the engine names it instead.
+        let step_name = available
+            .step_failure
+            .as_ref()
+            .map(|f| f.step_name.clone())
+            .or_else(|| {
+                state
+                    .step_states
+                    .iter()
+                    .find(|(_, s)| {
+                        matches!(s, crate::data::workflow_state::StepState::Running { .. })
+                    })
+                    .map(|(name, _)| name.clone())
+            })
             .unwrap_or_else(|| "current step".to_string());
 
         // Lightweight step confirm for the simple "advance to next step?" case.
@@ -57,34 +64,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
                     DialogResponse::Char('>') => NextAction::LaunchNext,
                     DialogResponse::Char('W') => {
                         let response2 = self
-                            .ask_dialog(DialogRequest::WorkflowControlBoard(
-                                WorkflowControlBoardState {
-                                    step_name: step_name.clone(),
-                                    can_launch_next: available.can_launch_next,
-                                    can_continue_current: available
-                                        .can_continue_in_current_container,
-                                    can_restart: available.can_restart_current_step,
-                                    can_go_back: available.can_cancel_to_previous_step,
-                                    can_finish: available.can_finish_workflow,
-                                    continue_unavailable_reason: available
-                                        .continue_unavailable_reason
-                                        .clone(),
-                                    cancel_to_previous_unavailable_reason: available
-                                        .cancel_to_previous_unavailable_reason
-                                        .clone(),
-                                    finish_workflow_unavailable_reason: available
-                                        .finish_workflow_unavailable_reason
-                                        .clone(),
-                                    restart_unavailable_reason: available
-                                        .restart_unavailable_reason
-                                        .clone(),
-                                    can_dismiss: available.can_dismiss,
-                                    launch_next_label: available.launch_next_label.clone(),
-                                    focused_step_name: step_name.clone(),
-                                    parallel_peer_count: available.parallel_peer_count,
-                                    parallel_peers_running: available.parallel_peers_running,
-                                },
-                            ))
+                            .ask_dialog(DialogRequest::WorkflowControlBoard(control_board_state(
+                                &step_name, available,
+                            )))
                             .map_err(|e| EngineError::Other(e.to_string()))?;
                         wcb_response_to_action(response2, available)
                     }
@@ -95,29 +77,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
         }
 
         let response = self
-            .ask_dialog(DialogRequest::WorkflowControlBoard(
-                WorkflowControlBoardState {
-                    focused_step_name: step_name.clone(),
-                    step_name,
-                    can_launch_next: available.can_launch_next,
-                    can_continue_current: available.can_continue_in_current_container,
-                    can_restart: available.can_restart_current_step,
-                    can_go_back: available.can_cancel_to_previous_step,
-                    can_finish: available.can_finish_workflow,
-                    continue_unavailable_reason: available.continue_unavailable_reason.clone(),
-                    cancel_to_previous_unavailable_reason: available
-                        .cancel_to_previous_unavailable_reason
-                        .clone(),
-                    finish_workflow_unavailable_reason: available
-                        .finish_workflow_unavailable_reason
-                        .clone(),
-                    restart_unavailable_reason: available.restart_unavailable_reason.clone(),
-                    can_dismiss: available.can_dismiss,
-                    launch_next_label: available.launch_next_label.clone(),
-                    parallel_peer_count: available.parallel_peer_count,
-                    parallel_peers_running: available.parallel_peers_running,
-                },
-            ))
+            .ask_dialog(DialogRequest::WorkflowControlBoard(control_board_state(
+                &step_name, available,
+            )))
             .map_err(|e| EngineError::Other(e.to_string()))?;
         Ok(wcb_response_to_action(response, available))
     }
@@ -315,34 +277,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
         ))
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        step: &WorkflowStep,
-        exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        let mut error_lines = Vec::new();
-        if let Some(sig) = exit.signal {
-            error_lines.push(format!("Container exited from signal {}", sig));
-        }
-        error_lines.push(format!("Exit code: {}", exit.exit_code));
-        let duration = exit
-            .ended_at
-            .signed_duration_since(exit.started_at)
-            .num_seconds()
-            .max(0);
-        error_lines.push(format!("Ran for {}s", duration));
-
-        let response = self
-            .ask_dialog(DialogRequest::WorkflowStepError(WorkflowStepErrorState {
-                step_name: step.name.clone(),
-                error_lines,
-            }))
-            .map_err(|e| EngineError::Other(e.to_string()))?;
-        Ok(match response {
-            DialogResponse::Char('r') | DialogResponse::Char('1') => StepFailureChoice::Retry,
-            DialogResponse::Char('a') => StepFailureChoice::Abort,
-            _ => StepFailureChoice::Pause,
-        })
+    /// A TUI always has a user in front of it.
+    fn supports_interactive_recovery(&self) -> bool {
+        true
     }
 
     fn on_setup_step_started(&mut self, description: &str) {
@@ -544,6 +481,35 @@ impl WorkflowFrontend for TuiCommandFrontend {
 }
 
 /// Map a WCB dialog response to a `NextAction`.
+/// Project an engine [`AvailableActions`] onto the TUI dialog state. One place
+/// so the escalated-from-step-confirm board and the direct board never drift.
+fn control_board_state(step_name: &str, available: &AvailableActions) -> WorkflowControlBoardState {
+    WorkflowControlBoardState {
+        step_name: step_name.to_string(),
+        focused_step_name: step_name.to_string(),
+        can_launch_next: available.can_launch_next,
+        can_continue_current: available.can_continue_in_current_container,
+        can_restart: available.can_restart_current_step,
+        can_go_back: available.can_cancel_to_previous_step,
+        can_finish: available.can_finish_workflow,
+        continue_unavailable_reason: available.continue_unavailable_reason.clone(),
+        cancel_to_previous_unavailable_reason: available
+            .cancel_to_previous_unavailable_reason
+            .clone(),
+        finish_workflow_unavailable_reason: available.finish_workflow_unavailable_reason.clone(),
+        restart_unavailable_reason: available.restart_unavailable_reason.clone(),
+        can_dismiss: available.can_dismiss,
+        launch_next_label: available.launch_next_label.clone(),
+        parallel_peer_count: available.parallel_peer_count,
+        parallel_peers_running: available.parallel_peers_running,
+        failure_lines: available
+            .step_failure
+            .as_ref()
+            .map(|f| f.detail_lines.clone())
+            .unwrap_or_default(),
+    }
+}
+
 fn wcb_response_to_action(response: DialogResponse, available: &AvailableActions) -> NextAction {
     match response {
         DialogResponse::Char('>') => NextAction::LaunchNext,
@@ -634,8 +600,6 @@ fn upsert_phase_step(
 mod tests {
     use std::time::Duration;
 
-    use crate::engine::agent_runtime::execution::AgentExitInfo;
-    use crate::engine::workflow::actions::StepFailureChoice;
     use crate::engine::workflow::frontend::WorkflowFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
@@ -709,79 +673,6 @@ mod tests {
             overlays: None,
             abort_on_failure: false,
         }
-    }
-
-    fn dummy_exit_info() -> AgentExitInfo {
-        AgentExitInfo {
-            exit_code: 1,
-            signal: None,
-            started_at: chrono::Utc::now(),
-            ended_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn user_choose_after_step_failure_r_retries() {
-        let (mut frontend, req_rx, resp_tx) = make_frontend();
-        let step = dummy_step();
-        let exit = dummy_exit_info();
-        let handle = std::thread::spawn(move || {
-            let _req = req_rx.recv().unwrap();
-            resp_tx.send(DialogResponse::Char('r')).unwrap();
-        });
-        let result = frontend
-            .user_choose_after_step_failure(&step, &exit)
-            .unwrap();
-        handle.join().unwrap();
-        assert_eq!(result, StepFailureChoice::Retry);
-    }
-
-    #[test]
-    fn user_choose_after_step_failure_1_retries() {
-        let (mut frontend, req_rx, resp_tx) = make_frontend();
-        let step = dummy_step();
-        let exit = dummy_exit_info();
-        let handle = std::thread::spawn(move || {
-            let _req = req_rx.recv().unwrap();
-            resp_tx.send(DialogResponse::Char('1')).unwrap();
-        });
-        let result = frontend
-            .user_choose_after_step_failure(&step, &exit)
-            .unwrap();
-        handle.join().unwrap();
-        assert_eq!(result, StepFailureChoice::Retry);
-    }
-
-    #[test]
-    fn user_choose_after_step_failure_a_aborts() {
-        let (mut frontend, req_rx, resp_tx) = make_frontend();
-        let step = dummy_step();
-        let exit = dummy_exit_info();
-        let handle = std::thread::spawn(move || {
-            let _req = req_rx.recv().unwrap();
-            resp_tx.send(DialogResponse::Char('a')).unwrap();
-        });
-        let result = frontend
-            .user_choose_after_step_failure(&step, &exit)
-            .unwrap();
-        handle.join().unwrap();
-        assert_eq!(result, StepFailureChoice::Abort);
-    }
-
-    #[test]
-    fn user_choose_after_step_failure_dismissed_pauses() {
-        let (mut frontend, req_rx, resp_tx) = make_frontend();
-        let step = dummy_step();
-        let exit = dummy_exit_info();
-        let handle = std::thread::spawn(move || {
-            let _req = req_rx.recv().unwrap();
-            resp_tx.send(DialogResponse::Dismissed).unwrap();
-        });
-        let result = frontend
-            .user_choose_after_step_failure(&step, &exit)
-            .unwrap();
-        handle.join().unwrap();
-        assert_eq!(result, StepFailureChoice::Pause);
     }
 
     #[test]
@@ -1326,5 +1217,44 @@ mod tests {
         );
         assert_eq!(view.steps[0].kind, WorkflowStepKind::Setup);
         assert_eq!(view.steps[0].status, "error");
+    }
+
+    // ── WI-0115 §1: the failure board's dialog state ────────────────────
+
+    #[test]
+    fn control_board_state_carries_the_failure_detail_lines() {
+        use crate::engine::workflow::actions::{AvailableActions, StepFailureContext};
+
+        let available = AvailableActions {
+            can_restart_current_step: true,
+            can_abort: true,
+            step_failure: Some(StepFailureContext {
+                step_name: "implement".into(),
+                exit_code: 1,
+                signal: None,
+                detail_lines: vec!["Exit code: 1".into(), "Ran for 12s".into()],
+                previous_step: Some("design".into()),
+                next_step: Some("review".into()),
+            }),
+            ..Default::default()
+        };
+
+        let state = super::control_board_state("implement", &available);
+        assert_eq!(state.step_name, "implement");
+        assert_eq!(state.failure_lines, vec!["Exit code: 1", "Ran for 12s"]);
+        assert!(!state.can_finish);
+        assert!(!state.can_dismiss);
+    }
+
+    #[test]
+    fn control_board_state_has_no_failure_lines_between_steps() {
+        use crate::engine::workflow::actions::AvailableActions;
+
+        let available = AvailableActions {
+            can_launch_next: true,
+            ..Default::default()
+        };
+        let state = super::control_board_state("implement", &available);
+        assert!(state.failure_lines.is_empty());
     }
 }

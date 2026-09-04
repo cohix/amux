@@ -152,6 +152,7 @@ fn setup_wcb_dialog(app: &mut App) -> std::sync::mpsc::Receiver<DialogResponse> 
             focused_step_name: "test".into(),
             parallel_peer_count: 0,
             parallel_peers_running: 0,
+            failure_lines: Vec::new(),
         },
     ));
     app.command_dialog_active = true;
@@ -235,6 +236,7 @@ fn wcb_enter_ignored_when_finish_unavailable() {
             focused_step_name: "test".into(),
             parallel_peer_count: 0,
             parallel_peers_running: 0,
+            failure_lines: Vec::new(),
         },
     ));
     app.command_dialog_active = true;

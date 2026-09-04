@@ -31,7 +31,9 @@ use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -50,7 +52,6 @@ use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::acp::{AcpFrontend, PermissionDecision, PermissionRequest, SessionUpdate};
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::InitFrontend;
@@ -61,8 +62,8 @@ use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
-    WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome, WorkflowStepStatus,
+    YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -721,13 +722,9 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         Ok(true)
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &WorkflowStep,
-        _exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
-    }
+    // `supports_interactive_recovery` keeps its `false` default: an API run has
+    // no user to ask, so a failed step takes the engine's countdown-and-retry
+    // path (WI-0115 §3).
 
     fn on_setup_step_started(&mut self, description: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -1077,14 +1074,28 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
             ),
         });
     }
-    fn ask_workflow_resume_or_fresh(
+    /// No interactive prompt, so keep the API default of preserving work:
+    /// resume at the step the previous run stopped on.
+    fn ask_workflow_resume(
         &mut self,
-        _workflow_name: &str,
-        _completed_steps: usize,
-        _total_steps: usize,
-    ) -> Result<bool, CommandError> {
-        // API mode has no interactive prompt; resume by default.
-        Ok(true)
+        prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        Ok(prompt.resume_from_stop_point())
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "workflow".to_string(),
+            message: format!(
+                "cannot resume the previous dynamic workflow for work item {work_item:04}: \
+                 {reason}"
+            ),
+        });
+        Ok(())
     }
 }
 

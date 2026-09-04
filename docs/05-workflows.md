@@ -1063,6 +1063,50 @@ In command mode, the "same container" prompt is skipped entirely and the explana
 
 Ctrl+W works at any time when a workflow is active in the current tab — there are no other preconditions. It works mid-step, between steps, during a yolo countdown, or while another dialog is open (the existing dialog is dismissed first).
 
+### When a step fails
+
+If an agent step's container exits unexpectedly, awman does **not** end the workflow. It opens the control board with the failure attached, so you can recover in place:
+
+```
+╭──── Workflow Control — step failed ────╮
+│ Failed step: implement                 │
+│   Exit code: 1                         │
+│   Ran for 214s                         │
+│                                        │
+│    ↑ Restart failed step               │
+│                                        │
+│ ← Cancel to prev  → Skip to 'review'   │
+│                                        │
+│    ↓ Next: same container              │
+│      the failed step's container has   │
+│      exited                            │
+│                                        │
+│ [^C] Cancel workflow   [Esc] Pause     │
+╰────────────────────────────────────────╯
+```
+
+| Key | Effect |
+|-----|--------|
+| **↑** | Restart the failed step in a fresh container |
+| **←** | Go back to the previous step and re-run it (the failed step runs again afterwards) |
+| **→** | Skip the failed step and start the next one in a new container |
+| **Esc** | Pause the workflow — the state file is kept, so a later run can resume from here |
+| **Ctrl+C** | Cancel the workflow |
+
+There is no "Enter to finish workflow" on a failure board — finishing a run on a failed step is never what you want, so **Ctrl+C** is the deliberate way out. The container's recent output is also saved to a log file; see [Container failure logs](#container-failure-logs).
+
+In command mode the same choices are printed as a menu on stderr (`[r]` restart, `[b]` back, `[n]` next, `[p]` pause, `[a]` abort).
+
+### Failed steps without a user (squad, API, `--non-interactive`)
+
+An unattended run has nobody to ask, so the engine handles a failed step itself:
+
+1. It starts a 60-second yolo countdown, reported the same way a stuck-step countdown is.
+2. When the countdown expires, it retries the failed step **once**.
+3. If the same step fails again, the whole workflow fails with that step's exit code.
+
+A step marked `abort_on_failure = true` still stops the workflow immediately, with no countdown and no retry.
+
 ---
 
 ## Workflow Overview and step status
@@ -1240,14 +1284,31 @@ The file records the status of every step, the container ID used for each step, 
 
 ### Resuming
 
-If a saved state file exists when you run `exec workflow`, awman offers to resume:
+If a saved state file exists when you run `exec workflow`, awman offers to resume from a named step:
 
 ```
-Found a saved workflow state for 'implement-feature' (work item 0027).
-  1) Resume from where you left off
-  2) Restart from the beginning
-  [1/2]:
+╭──── Resume previous workflow? ─────────────────────────────╮
+│ A previous run of 'implement-feature' left resumable state │
+│ on disk.                                                   │
+│                                                            │
+│ Workflow: implement-feature                                │
+│ Work item: 0027                                            │
+│ Progress: 2/5 step(s) completed.                           │
+│                                                            │
+│ Resume it from one of these steps, or start over?          │
+│                                                            │
+│  [1] Resume from 'implement' (the step that failed)        │
+│  [2] Resume from 'design' (the step before it)             │
+│  [3] Resume from 'review' (the step after it)              │
+│  [f] Discard the saved state and start over                │
+╰────────────────────────────────────────────────────────────╯
 ```
+
+This is the same prompt, with the same three start points, that [`--dynamic`](06-dynamic-workflows.md#resuming-a-failed-dynamic-run) shows — the two modes resume identically. Picking a step rewinds the saved state: everything from that step onwards runs again, and earlier steps that never succeeded are marked skipped so they don't block their dependents.
+
+When the previous run completed every step there is nothing to resume, so awman says so and starts fresh rather than offering a choice with one sane answer.
+
+Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. The squad daemon is the exception: each scheduled evaluation is its own run, so it always starts over.
 
 ### Workflow file changed
 
@@ -1262,14 +1323,18 @@ WARNING: The workflow file has changed since the last run.
 
 If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
 
-### Interrupted steps
+### Unfinished steps
 
-If a step was running when awman last exited:
+Two kinds of step are terminal in the saved state but not actually *done*, and awman resets both to pending when it loads that state, naming them as it goes:
 
 ```
-Step 'implement' was running when the previous session ended.
-Start it over (s) or skip to next step (n)? [s/n]:
+awman: Interrupted steps detected (prior crash?): implement. Resetting to Pending.
+awman: Previous run left these steps unfinished: review, ship. Resetting to Pending.
 ```
+
+The first line covers a step that was still running when awman exited — a crash or a kill. The second covers steps a previous run left `Failed` or `Cancelled`, which is what a failed step and an aborted workflow leave behind.
+
+This reset matters more than it looks: an aborted run marks *every* remaining step cancelled, so without it the saved state would read as "all steps terminal" — indistinguishable from a finished run — and resuming would report success without executing anything. Steps that genuinely succeeded or were skipped are never touched, so a resume still picks up exactly where the previous run got to.
 
 ---
 

@@ -362,7 +362,14 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             .iter()
             .filter(|x| **x)
             .count() as u16;
+            let failed = !state.failure_lines.is_empty();
             let base_height: u16 = if state.can_finish { 14 } else { 12 };
+            // A failure banner adds its detail lines plus a blank separator.
+            let failure_height = if failed {
+                state.failure_lines.len() as u16 + 2
+            } else {
+                0
+            };
             // Width fits the longest reason line (+ left margin) when present;
             // otherwise the diamond layout's natural minimum is comfortable.
             let max_reason_w = [
@@ -376,19 +383,32 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             .map(|s| unicode_width::UnicodeWidthStr::width(s) + 15)
             .max()
             .unwrap_or(0) as u16;
+            let max_failure_w = state
+                .failure_lines
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 6)
+                .max()
+                .unwrap_or(0) as u16;
             let step_w =
                 unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16 + 10;
             let width = max_reason_w
+                .max(max_failure_w)
                 .max(step_w)
                 .max(56)
                 .min(area.width.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(width, base_height + extra_reasons, area);
-            let title = if state.can_dismiss {
-                "Workflow Control (step running)"
+            let dialog_area = dialogs::centered_fixed(
+                width,
+                (base_height + extra_reasons + failure_height).min(area.height.saturating_sub(2)),
+                area,
+            );
+            let (title, frame_colour) = if failed {
+                ("Workflow Control — step failed", Color::Red)
+            } else if state.can_dismiss {
+                ("Workflow Control (step running)", Color::Yellow)
             } else {
-                "Workflow Control"
+                ("Workflow Control", Color::Yellow)
             };
-            let inner = dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
+            let inner = dialogs::render_dialog_frame(title, frame_colour, dialog_area, frame);
 
             let arrow_style = Style::default()
                 .fg(Color::Cyan)
@@ -422,19 +442,30 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 (arrow_style, label_style)
             };
 
-            let mut lines: Vec<Line> = vec![
-                Line::from(vec![
-                    Span::raw(" Step: "),
-                    Span::styled(&state.step_name, step_style),
-                ]),
-                Line::from(""),
-                // ↑ Restart (top of diamond)
-                Line::from(vec![
-                    Span::raw("         "),
-                    Span::styled("\u{2191}", up_arrow_style),
-                    Span::styled(" Restart current step", up_label_style),
-                ]),
-            ];
+            let mut lines: Vec<Line> = vec![Line::from(vec![
+                Span::raw(if failed { " Failed step: " } else { " Step: " }),
+                Span::styled(&state.step_name, step_style),
+            ])];
+            if failed {
+                let err_style = Style::default().fg(Color::Red);
+                for line in &state.failure_lines {
+                    lines.push(Line::from(Span::styled(format!("   {line}"), err_style)));
+                }
+            }
+            lines.push(Line::from(""));
+            // ↑ Restart (top of diamond)
+            lines.push(Line::from(vec![
+                Span::raw("         "),
+                Span::styled("\u{2191}", up_arrow_style),
+                Span::styled(
+                    if failed {
+                        " Restart failed step"
+                    } else {
+                        " Restart current step"
+                    },
+                    up_label_style,
+                ),
+            ]));
             if let Some(ref reason) = state.restart_unavailable_reason {
                 lines.push(Line::from(Span::styled(
                     format!("           {reason}"),
@@ -493,6 +524,11 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                     "  [^C] Abort   [p] Pause   [Esc] Dismiss",
                     dimmed_style,
                 )));
+            } else if failed {
+                lines.push(Line::from(Span::styled(
+                    "  [^C] Cancel workflow   [Esc] Pause",
+                    dimmed_style,
+                )));
             } else {
                 lines.push(Line::from(Span::styled(
                     "  [^C] Abort   [Esc] Pause",
@@ -500,42 +536,6 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 )));
             }
             frame.render_widget(Paragraph::new(lines), inner);
-        }
-        dialogs::Dialog::WorkflowStepError(state) => {
-            let max_err_w = state
-                .error_lines
-                .iter()
-                .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()))
-                .max()
-                .unwrap_or(0) as u16;
-            let step_w =
-                unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16 + 10; // "  Step: " prefix.
-            let width = max_err_w
-                .max(step_w)
-                .saturating_add(6)
-                .max(60)
-                .min(area.width.saturating_sub(4));
-            let height = (state.error_lines.len() as u16 + 8)
-                .min(area.height.saturating_sub(4))
-                .max(9);
-            let dialog_area = dialogs::centered_fixed(width, height, area);
-            let inner = dialogs::render_dialog_frame("Step failed", Color::Red, dialog_area, frame);
-            let mut lines = vec![
-                Line::from(format!("  Step: {}", state.step_name)),
-                Line::from(""),
-            ];
-            for line in &state.error_lines {
-                lines.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(Color::Red),
-                )));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  [r] Retry   [q/Esc] Pause   [a] Abort",
-                Style::default().fg(Color::DarkGray),
-            )));
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         dialogs::Dialog::WorkflowYoloCountdown(state) => {
             let emoji = if state.remaining_secs % 2 == 0 {
@@ -785,10 +785,16 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
                 lines.push(Line::from(format!("  [{ch}] {label}")));
             }
             // Always offer an Esc hint at the bottom — Custom is also used
-            // for prompts where the natural cancel key is Esc.
+            // for prompts where the natural cancel key is Esc. A single-key
+            // Custom is an acknowledgement rather than a choice, so Enter
+            // accepts it too (see `dialog_router::handle_dialog_submit`).
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  [Esc] cancel",
+                if keys.len() == 1 {
+                    "  [Enter] continue   [Esc] cancel"
+                } else {
+                    "  [Esc] cancel"
+                },
                 Style::default().fg(Color::DarkGray),
             )));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

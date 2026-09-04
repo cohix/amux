@@ -390,7 +390,10 @@ mod tests {
             clone_target_dir("https://github.com/org/repo.git/", None),
             "repo"
         );
-        assert_eq!(clone_target_dir("git@github.com:org/repo.git", None), "repo");
+        assert_eq!(
+            clone_target_dir("git@github.com:org/repo.git", None),
+            "repo"
+        );
         assert_eq!(
             clone_target_dir("https://github.com/org/repo", Some("subdir")),
             "subdir"

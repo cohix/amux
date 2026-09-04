@@ -10,10 +10,9 @@ use std::time::Duration;
 
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -39,8 +38,19 @@ impl WorkflowFrontend for CliFrontend {
         let resume_available = was_bound && available.can_dismiss;
 
         let mut lines_printed = 0usize;
-        eprintln!("awman: workflow paused — choose next action:");
-        lines_printed += 1;
+        if let Some(failure) = &available.step_failure {
+            eprintln!("awman: step '{}' failed.", failure.step_name);
+            lines_printed += 1;
+            for line in &failure.detail_lines {
+                eprintln!("  {line}");
+                lines_printed += 1;
+            }
+            eprintln!("awman: choose how to recover:");
+            lines_printed += 1;
+        } else {
+            eprintln!("awman: workflow paused — choose next action:");
+            lines_printed += 1;
+        }
         if resume_available {
             eprintln!("  [s] Resume final step (return to running container)");
             lines_printed += 1;
@@ -292,31 +302,10 @@ impl WorkflowFrontend for CliFrontend {
         Ok(matches!(buf.trim(), "y" | "Y"))
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        step: &WorkflowStep,
-        exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        if self.non_interactive {
-            return Ok(StepFailureChoice::Pause);
-        }
-        let signal_str = exit
-            .signal
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "—".to_string());
-        eprintln!(
-            "awman: step '{}' failed (exit {}, signal {signal_str}). [r]etry / [p]ause / [a]bort?",
-            step.name, exit.exit_code,
-        );
-        let mut buf = String::new();
-        if std::io::stdin().read_line(&mut buf).is_err() {
-            return Ok(StepFailureChoice::Pause);
-        }
-        Ok(match buf.trim() {
-            "r" | "R" => StepFailureChoice::Retry,
-            "a" | "A" => StepFailureChoice::Abort,
-            _ => StepFailureChoice::Pause,
-        })
+    /// A CLI on a TTY can ask; `--non-interactive` cannot, and falls to the
+    /// engine's unattended retry path instead.
+    fn supports_interactive_recovery(&self) -> bool {
+        !self.non_interactive
     }
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {

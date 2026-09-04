@@ -12,12 +12,11 @@ use awman::data::workflow_definition::{
 };
 use awman::data::workflow_state::PhaseStepStatus;
 use awman::engine::agent_runtime::background::{AgentExec, ExecOutput};
-use awman::engine::agent_runtime::execution::AgentExitInfo;
 use awman::engine::error::EngineError;
 use awman::engine::overlay::OverlayEngine;
 use awman::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, WorkflowOutcome,
-    WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, WorkflowOutcome, WorkflowStepStatus,
+    YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use awman::engine::workflow::{Frontend, WorkflowEngine};
@@ -176,13 +175,6 @@ impl Frontend for RecordingFrontend {
     }
     fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
         Ok(true)
-    }
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &WorkflowStep,
-        _exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
     }
     fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
     fn yolo_countdown_tick(
