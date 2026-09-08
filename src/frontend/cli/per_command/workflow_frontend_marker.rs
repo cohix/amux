@@ -37,65 +37,11 @@ impl WorkflowFrontend for CliFrontend {
         let was_bound = self.unbind_container_stdio();
         let resume_available = was_bound && available.can_dismiss;
 
-        let mut lines_printed = 0usize;
-        if let Some(failure) = &available.step_failure {
-            eprintln!("awman: step '{}' failed.", failure.step_name);
-            lines_printed += 1;
-            for line in &failure.detail_lines {
-                eprintln!("  {line}");
-                lines_printed += 1;
-            }
-            eprintln!("awman: choose how to recover:");
-            lines_printed += 1;
-        } else {
-            eprintln!("awman: workflow paused — choose next action:");
-            lines_printed += 1;
+        let menu = control_board_lines(available, resume_available);
+        for line in &menu {
+            eprintln!("{line}");
         }
-        if resume_available {
-            eprintln!("  [s] Resume final step (return to running container)");
-            lines_printed += 1;
-        }
-        if available.can_launch_next {
-            let label = available
-                .launch_next_label
-                .as_deref()
-                .unwrap_or("Launch next step (new container)");
-            eprintln!("  [n] {label}");
-            lines_printed += 1;
-        }
-        if available.can_continue_in_current_container {
-            eprintln!("  [c] Continue in current container");
-            lines_printed += 1;
-        } else if let Some(reason) = &available.continue_unavailable_reason {
-            eprintln!("  (continue unavailable: {reason})");
-            lines_printed += 1;
-        }
-        if available.can_restart_current_step {
-            eprintln!("  [r] Restart current step");
-            lines_printed += 1;
-        }
-        if available.can_cancel_to_previous_step {
-            eprintln!("  [b] Back to previous step");
-            lines_printed += 1;
-        } else if let Some(reason) = &available.cancel_to_previous_unavailable_reason {
-            eprintln!("  (back unavailable: {reason})");
-            lines_printed += 1;
-        }
-        if available.can_pause {
-            eprintln!("  [p] Pause workflow");
-            lines_printed += 1;
-        }
-        if available.can_abort {
-            eprintln!("  [a] Abort workflow");
-            lines_printed += 1;
-        }
-        if available.can_finish_workflow {
-            eprintln!("  [f] Finish workflow");
-            lines_printed += 1;
-        } else if let Some(reason) = &available.finish_workflow_unavailable_reason {
-            eprintln!("  (finish unavailable: {reason})");
-            lines_printed += 1;
-        }
+        let mut lines_printed = menu.len();
 
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
@@ -460,6 +406,65 @@ impl WorkflowFrontend for CliFrontend {
     }
 }
 
+/// The Workflow Control Board menu, one terminal line per entry.
+///
+/// Kept separate from the printing so the board's copy — in particular the
+/// failure banner (WI-0115 §1) — can be asserted on without a TTY. The caller
+/// erases exactly `len()` lines when it rewinds the menu, so every returned
+/// string must be one printed line.
+fn control_board_lines(available: &AvailableActions, resume_available: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(failure) = &available.step_failure {
+        lines.push(format!("awman: step '{}' failed.", failure.step_name));
+        for line in &failure.detail_lines {
+            lines.push(format!("  {line}"));
+        }
+        lines.push("awman: choose how to recover:".to_string());
+    } else {
+        lines.push("awman: workflow paused — choose next action:".to_string());
+    }
+    if resume_available {
+        lines.push("  [s] Resume final step (return to running container)".to_string());
+    }
+    if available.can_launch_next {
+        let label = available
+            .launch_next_label
+            .as_deref()
+            .unwrap_or("Launch next step (new container)");
+        lines.push(format!("  [n] {label}"));
+    }
+    if available.can_continue_in_current_container {
+        lines.push("  [c] Continue in current container".to_string());
+    } else if let Some(reason) = &available.continue_unavailable_reason {
+        lines.push(format!("  (continue unavailable: {reason})"));
+    }
+    if available.can_restart_current_step {
+        let label = if available.step_failure.is_some() {
+            "  [r] Restart failed step"
+        } else {
+            "  [r] Restart current step"
+        };
+        lines.push(label.to_string());
+    }
+    if available.can_cancel_to_previous_step {
+        lines.push("  [b] Back to previous step".to_string());
+    } else if let Some(reason) = &available.cancel_to_previous_unavailable_reason {
+        lines.push(format!("  (back unavailable: {reason})"));
+    }
+    if available.can_pause {
+        lines.push("  [p] Pause workflow".to_string());
+    }
+    if available.can_abort {
+        lines.push("  [a] Abort workflow".to_string());
+    }
+    if available.can_finish_workflow {
+        lines.push("  [f] Finish workflow".to_string());
+    } else if let Some(reason) = &available.finish_workflow_unavailable_reason {
+        lines.push(format!("  (finish unavailable: {reason})"));
+    }
+    lines
+}
+
 /// Erase `n` lines above the current cursor position (stderr).
 ///
 /// Used by the workflow control board to undo its menu output when the
@@ -481,9 +486,12 @@ fn erase_lines_above(n: usize) {
 mod tests {
     use std::time::Duration;
 
+    use super::control_board_lines;
     use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::data::workflow_definition::WorkflowStep;
-    use crate::engine::workflow::actions::WorkflowStepStatus;
+    use crate::engine::workflow::actions::{
+        AvailableActions, StepFailureContext, WorkflowStepStatus,
+    };
     use crate::engine::workflow::frontend::WorkflowFrontend;
     use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
 
@@ -805,5 +813,80 @@ mod tests {
             fe.last_sink_message_time.is_none(),
             "yolo_countdown_finished must reset last_sink_message_time to None"
         );
+    }
+
+    // ── WI-0115 §1: the command-mode failure board ────────────────────────
+
+    fn failure_actions() -> AvailableActions {
+        AvailableActions {
+            can_launch_next: true,
+            can_restart_current_step: true,
+            can_cancel_to_previous_step: true,
+            can_pause: true,
+            can_abort: true,
+            can_finish_workflow: false,
+            launch_next_label: Some("Skip to 'review' (new container)".into()),
+            continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            finish_workflow_unavailable_reason: Some(
+                "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
+            ),
+            step_failure: Some(StepFailureContext {
+                step_name: "implement".into(),
+                exit_code: 1,
+                signal: None,
+                detail_lines: vec!["Exit code: 1".into(), "Ran for 214s".into()],
+                previous_step: Some("plan".into()),
+                next_step: Some("review".into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn control_board_lines_lead_with_the_failure_banner() {
+        let lines = control_board_lines(&failure_actions(), false);
+
+        assert_eq!(lines[0], "awman: step 'implement' failed.");
+        assert_eq!(lines[1], "  Exit code: 1");
+        assert_eq!(lines[2], "  Ran for 214s");
+        assert_eq!(lines[3], "awman: choose how to recover:");
+    }
+
+    #[test]
+    fn control_board_lines_offer_every_recovery_action_but_never_finish() {
+        let lines = control_board_lines(&failure_actions(), false).join("\n");
+
+        assert!(lines.contains("[r] Restart failed step"), "{lines}");
+        assert!(lines.contains("[b] Back to previous step"), "{lines}");
+        assert!(
+            lines.contains("[n] Skip to 'review' (new container)"),
+            "{lines}"
+        );
+        assert!(lines.contains("[p] Pause workflow"), "{lines}");
+        assert!(lines.contains("[a] Abort workflow"), "{lines}");
+        assert!(!lines.contains("[f] Finish workflow"), "{lines}");
+        assert!(
+            lines.contains("(finish unavailable: a step failed"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("(continue unavailable: the failed step's container has exited"),
+            "{lines}"
+        );
+    }
+
+    #[test]
+    fn control_board_lines_between_steps_have_no_failure_banner() {
+        let available = AvailableActions {
+            can_launch_next: true,
+            can_pause: true,
+            can_abort: true,
+            ..Default::default()
+        };
+
+        let lines = control_board_lines(&available, false);
+
+        assert_eq!(lines[0], "awman: workflow paused — choose next action:");
+        assert!(!lines.join("\n").contains("failed"), "{lines:?}");
     }
 }

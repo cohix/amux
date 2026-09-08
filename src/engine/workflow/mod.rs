@@ -4307,6 +4307,29 @@ mod tests {
         );
     }
 
+    /// `abort_on_failure` is checked before the recovery path is chosen, so an
+    /// unattended run aborts on the first failure rather than spending its one
+    /// automatic retry (WI-0115 §3).
+    #[tokio::test]
+    async fn unattended_abort_on_failure_step_aborts_without_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let mut step = make_step("a", &[], None);
+        step.abort_on_failure = true;
+        let workflow = make_workflow(Some("wf-unattended-abort"), Some("claude"), vec![step]);
+        // A single exit code: a retry would launch a second container and panic
+        // the fake factory, so reaching `Aborted` proves no retry happened.
+        let factory = FakeAgentExecutionFactory::new([9]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Aborted);
+        assert!(engine.abort_on_failure_triggered());
+    }
+
     #[tokio::test]
     async fn unattended_cancelled_retry_countdown_fails_immediately() {
         let tmp = tempfile::tempdir().unwrap();
