@@ -156,8 +156,12 @@ Report F-35 (`src/command/dispatch/mod.rs:324-325`, `src/command/commands/auth.r
 
 #### F-34: `PhaseKind` collapses the setup/teardown twins; typed constructor args
 Report F-34 (`src/engine/workflow/mod.rs:2362-2866`, `src/engine/workflow/frontend.rs:122-135`).
-Already done by 0113 Step 1: the two never-read engine fields and their
-constructor parameters are deleted.
+**STATUS (0113 close-out, 2026-09-05): dead-fields part done.** 0113 Step 1
+deleted the two never-read `WorkflowEngine` fields (`git_engine`,
+`overlay_engine`) and their constructor parameters, with no `#[allow]` left
+behind. Everything else below (the `PhaseKind` enum, `run_phase` collapse,
+the five-method frontend trait, `WorkflowEngineDeps`/`WorkflowSpec`) is
+**still open** for 0114.
 1. Add `enum PhaseKind { Setup, Teardown }` to `src/data/workflow_state.rs`
    with `label()`; key phase step state by it (`phase_step_states(kind)` /
    `phase_step_states_mut(kind)` accessors over the two existing vectors are
@@ -187,8 +191,13 @@ constructor parameters are deleted.
 #### F-37: declare every environment variable in `Env`; no `std::env::var` above Layer 0
 Report F-37 (`src/engine/workflow/poll_ci.rs:29`, `src/engine/container/attach_socket.rs:77`,
 `src/frontend/api/session_setup.rs:463-471`, `docker.rs:1288-1292`, `options.rs:474, 480`,
-`sandbox/dsbx/session_config.rs:89`). Already done by 0113 Step 11:
-`GITHUB_TOKEN` declared and passed into the issue engine.
+`sandbox/dsbx/session_config.rs:89`).
+**STATUS (0113 close-out, 2026-09-05): `GITHUB_TOKEN` part done.** 0113 Step 11
+declared `GITHUB_TOKEN` in `src/data/config/env.rs` (`EnvSnapshot::github_token()`)
+and threads it into `IssueSourceRouter`/`GithubIssueSource` instead of a direct
+`std::env::var` read. `AWMAN_ATTACH_DIR`, `AWMAN_API_VERBOSE_SETUP`, the
+`poll_ci.rs` `CiPoller` wrap, the env-passthrough resolution move, and the
+architecture-lint `std::env::var` check are **still open** for 0114.
 1. Declare `AWMAN_ATTACH_DIR` and `AWMAN_API_VERBOSE_SETUP` in
    `src/data/config/env.rs` with typed accessors on `EnvSnapshot`
    (`attach_dir() -> Option<PathBuf>`, `api_verbose_setup() -> bool` with the
@@ -338,8 +347,11 @@ Report F-21 (`src/frontend/tui/mod.rs:135-162`, `src/frontend/tui/key_handler.rs
    returning `ready` or `status --watch`; both TUI sites call it.
 
 #### F-42: shared exit-code policy
-Report F-42. Already done by 0113 Step 4 (`CommandOutcome::exit_code` /
-`is_partial_failure`). Nothing remains; mark closed when 0113 lands.
+Report F-42.
+**STATUS (0113 close-out, 2026-09-05): DONE, closed.** 0113 Step 4 added
+`CommandOutcome::exit_code` / `is_partial_failure` in
+`src/command/dispatch/mod.rs` and both the CLI (`outcome_exit_code`) and the
+API's `QueueWorker` call the same method. Nothing remains for 0114.
 
 #### F-43: catalogue-owned "did you mean"
 Report F-43 (`src/frontend/tui/command_box.rs:20-52`, `src/command/commands/config.rs:319`).
@@ -714,8 +726,13 @@ each bullet is its own commit.
     `raw_args.rs` becomes a method on a `RawArgCursor`.
 
 #### F-52: shared test fixtures
-Report F-52. Already done by 0113 Step 2 (`Engines::for_tests`) and F-24
-(`TabSharedState::for_tests`).
+Report F-52.
+**STATUS (0113 close-out, 2026-09-05): `Engines::for_tests` part done.** 0113
+Step 2 added `#[cfg(test)] Engines::for_tests(root)` and folded the nine
+`make_engines` copies onto it. `TabSharedState::for_tests` is F-24's, not
+0113's — confirm separately. The `TestEnv::engines()` / shared `make_session`
+helper and the seven `#[ignore]` `todo!()` stubs at
+`exec_workflow.rs:5846-5894` are **still open** for 0114.
 1. `tests/helpers/mod.rs::TestEnv::engines()` and a single `make_session`
    helper in `src/data/session.rs` under `#[cfg(test)]` (or
    `tests/helpers`) replacing the 23 copies.
@@ -724,12 +741,21 @@ Report F-52. Already done by 0113 Step 2 (`Engines::for_tests`) and F-24
    never run is not a test.
 
 #### F-53: stale documentation pointers
-Report F-53. Already done by 0113 Step 13 (dead link). Fix
-`src/data/message.rs:25-27` ("Defined by Layer 1" → Layer 0) and any
-remaining doc drift found while executing the groups above.
+Report F-53.
+**STATUS (0113 close-out, 2026-09-05): dead-link part done.** 0113 Step 13
+fixed `aspec/architecture/four-layer-summary.md`'s pointer from the
+nonexistent `docs/10-architecture-overview.md` to the real `docs/architecture.md`.
+`src/data/message.rs:25-27` ("Defined by Layer 1" → should read Layer 0) and
+any other doc drift found while executing the groups above are **still open**
+for 0114.
 
 #### F-54
-Report F-54. Already done by 0113 Step 8. Mark closed when 0113 lands.
+Report F-54.
+**STATUS (0113 close-out, 2026-09-05): DONE, closed.** 0113 Step 8 replaced
+the API's raw `HashMap<String, Arc<RwLock<Session>>>` (in `AppState`,
+`QueueWorker`, `SquadAppState`) with `Arc<SessionManager>`, and folded the
+TUI's `InitialTab::Normal(Session)` into `InitialTab::Normal` built from
+`ctx.session`. Nothing remains for 0114.
 
 ### Close-out
 

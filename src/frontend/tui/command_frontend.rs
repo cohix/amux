@@ -86,6 +86,10 @@ pub struct TuiCommandFrontend {
     /// workflow callbacks push here; the TUI event loop drains it to maintain
     /// `Tab::container_slots`.
     pub(crate) container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
+    pub(crate) squad_attach_session:
+        Option<std::sync::Arc<crate::frontend::tui::squad_attach::SquadAttachSession>>,
+    pub(crate) squad_attach_reachable: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) squad_attach_metadata: HashMap<String, (String, Option<String>)>,
     pub(crate) parallel_group_active: bool,
     pub(crate) pending_step_slot_io: HashMap<String, crate::frontend::tui::tabs::ContainerSlotIo>,
     /// Per-step cancel flags for in-flight parallel yolo countdowns, keyed by
@@ -105,6 +109,10 @@ pub struct TuiCommandFrontend {
 // `per_command::squad`, alongside the other per-command TUI frontend impls.
 
 impl TuiCommandFrontend {
+    pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
+        self.parsed.flags.contains_key("container")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parsed: ParsedCommandBoxInput,
@@ -151,6 +159,9 @@ impl TuiCommandFrontend {
             status_dashboard,
             tui_context_shared,
             container_slot_events,
+            squad_attach_session: None,
+            squad_attach_reachable: None,
+            squad_attach_metadata: HashMap::new(),
             parallel_group_active: false,
             pending_step_slot_io: HashMap::new(),
             pending_parallel_yolo_cancel: HashMap::new(),

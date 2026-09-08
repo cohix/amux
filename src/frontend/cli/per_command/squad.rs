@@ -1,51 +1,10 @@
 //! CLI presentation for the squad command family.
 
-use std::process::ExitCode;
-
 use clap::ArgMatches;
 
 use crate::command::commands::squad::commands::SquadOutcome;
-use crate::command::commands::squad::daemon::SquadSupervisor;
-use crate::command::commands::squad::gateway::TaskGateway;
-use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::dispatch::Engines;
-use crate::command::error::CommandError;
-use crate::data::config::env::Env;
 
 use super::render::format_table;
-use crate::frontend::cli::{error_exit_code, format_error};
-
-/// Bare, non-interactive `awman squad`: make the daemon available and report
-/// exactly one gateway status response.
-pub(crate) async fn run_bare(matches: &ArgMatches, engines: &Engines) -> ExitCode {
-    let json = squad_flag(matches, "json");
-    // A non-container runtime cannot host squad: fail fast with the shared
-    // refusal rather than spawning a daemon child that will refuse (edge-case #1).
-    if let Err(error) = require_container_tier(engines) {
-        return render_failure(&error, json);
-    }
-    let supervisor = match SquadSupervisor::from_env(&Env::from_process()) {
-        Ok(supervisor) => supervisor,
-        Err(error) => return render_failure(&error, json),
-    };
-    let gateway = match supervisor.ensure_running().await {
-        Ok(gateway) => gateway,
-        Err(error) => return render_failure(&error, json),
-    };
-    // Disclosed on stderr so `--json` stdout stays machine-parseable.
-    if let Some(setup) = supervisor.take_generated_key_setup() {
-        eprintln!("{setup}");
-    }
-    match gateway.status().await {
-        Ok(status) => {
-            if let Some(output) = render_squad(&SquadOutcome::Status(status), json) {
-                println!("{output}");
-            }
-            ExitCode::SUCCESS
-        }
-        Err(error) => render_failure(&error, json),
-    }
-}
 
 /// Render a squad outcome through the CLI's common table/JSON conventions.
 pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String> {
@@ -177,16 +136,6 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
             None => "squad daemon is not running.".into(),
         }),
     }
-}
-
-/// Render a squad command error, preserving structured stdout for JSON callers.
-pub(crate) fn render_failure(error: &CommandError, json: bool) -> ExitCode {
-    if json {
-        println!("{}", serde_json::json!({ "error": format_error(error) }));
-    } else {
-        eprintln!("{}", format_error(error));
-    }
-    ExitCode::from(error_exit_code(error))
 }
 
 pub(crate) fn squad_flag(matches: &ArgMatches, flag: &str) -> bool {

@@ -5,17 +5,13 @@
 use std::process::{Command, Stdio};
 
 use crate::data::session::{AgentHandle, Session};
-use crate::engine::agent_runtime::execution::{
-    AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
-};
+use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
+use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::backend::ContainerBackend;
-use crate::engine::container::docker::build_run_argv;
-use crate::engine::container::instance::{handle_now, ContainerId};
-use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
-use crate::engine::credential_refresh::{register_container_leases, CredentialLease};
+use crate::engine::container::options::{ContainerName, ResolvedContainerOptions};
+use crate::engine::container::process::{AttachHookCtx, ContainerCli, ContainerInstance};
+use crate::engine::credential_refresh::register_container_leases;
 use crate::engine::error::EngineError;
-
-const AWMAN_LABEL: &str = "awman=true";
 
 /// Extract the container name from an Apple Containers JSON row.
 ///
@@ -172,12 +168,6 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
 #[derive(Debug, Default)]
 pub(super) struct AppleBackend;
 
-impl AppleBackend {
-    pub(super) fn new() -> Self {
-        Self
-    }
-}
-
 impl ContainerBackend for AppleBackend {
     fn build(
         &self,
@@ -193,13 +183,16 @@ impl ContainerBackend for AppleBackend {
         // the container is built and its child spawned — the single choke point
         // (INV-6). No-op for every launch that carries no such credential.
         let leases = register_container_leases(&options, &name.0);
-        Ok(Box::new(AppleContainerInstance {
-            id: ContainerId::new(name.0.clone()),
-            name,
+        // Apple's CLI has no `attach` verb, so the launching process must
+        // serve the container's PTY itself; `serve_attach_socket` is that hook.
+        Ok(Box::new(ContainerInstance::new(
+            ContainerCli::APPLE,
             image,
+            name,
             options,
             leases,
-        }))
+            Some(serve_attach_socket),
+        )))
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -302,38 +295,6 @@ impl ContainerBackend for AppleBackend {
         })
     }
 
-    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        let _ = Command::new("container")
-            .args(["stop", &handle.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("container")
-            .args(["rm", &handle.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        Ok(())
-    }
-
-    fn exec_args(
-        &self,
-        container_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
-        let mut args = vec!["exec".to_string(), "-it".to_string()];
-        args.extend(["-w".to_string(), working_dir.to_string()]);
-        for (k, v) in env_vars {
-            args.push("-e".to_string());
-            args.push(format!("{k}={v}"));
-        }
-        args.push(container_id.to_string());
-        args.extend(entrypoint.iter().map(|s| s.to_string()));
-        args
-    }
-
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         // Apple's `container` CLI has no `attach` subcommand, so reattach
         // goes through the awman-owned rendezvous instead: the process that
@@ -412,69 +373,6 @@ impl ContainerBackend for AppleBackend {
     }
 }
 
-struct AppleContainerInstance {
-    id: ContainerId,
-    name: ContainerName,
-    image: ImageRef,
-    options: ResolvedContainerOptions,
-    /// Credential-refresh leases, one per file-delivered credential. Moved into
-    /// the `AppleExecution` by each spawn fn so the lease's lifetime brackets
-    /// the child process exactly (this instance box is dropped before the spawn
-    /// fn returns).
-    leases: Vec<CredentialLease>,
-}
-
-impl AgentInstance for AppleContainerInstance {
-    fn handle_preview(&self) -> AgentHandlePreview {
-        AgentHandlePreview {
-            id: self.id.0.clone(),
-            name: self.name.0.clone(),
-            image: self.image.0.clone(),
-        }
-    }
-
-    fn run_with_frontend(
-        self: Box<Self>,
-        mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
-    ) -> Result<AgentExecution, EngineError> {
-        let argv = build_run_argv(&self.name, &self.image, &self.options);
-        let started_at = chrono::Utc::now();
-        let seeded = self.options.seeded_prompt.clone();
-        let handle = handle_now(&self.id, &self.name, &self.image);
-
-        frontend.report_status(
-            crate::engine::agent_runtime::frontend::AgentStatus::Running {
-                container_name: self.name.0.clone(),
-            },
-        );
-
-        // Read per-frontend timeouts before draining `take_io`.
-        let grace_timeout = frontend.grace_timeout();
-        let stuck_timeout = frontend.stuck_timeout();
-        let io = frontend.take_io();
-
-        let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
-
-        // PTY-bridged path
-        if io.initial_size.is_some() {
-            return spawn_pty_bridged_apple(self, io, argv, seeded, started_at, handle, bridge_cfg);
-        }
-
-        // ACP path: persistent piped stdio (no PTY), stdin kept open for the
-        // whole JSON-RPC session. Parity with the Docker backend is mandatory —
-        // shipping ACP only under Docker would be a platform-inconsistent
-        // regression (WI 0104 Edge Case Considerations).
-        if self.options.acp {
-            return spawn_piped_interactive_apple(
-                self, io, argv, seeded, started_at, handle, bridge_cfg,
-            );
-        }
-
-        // Piped path
-        spawn_piped_apple(self, io, argv, seeded, started_at, handle, bridge_cfg)
-    }
-}
-
 /// Resize the PTY behind an attach client's resize request, guaranteeing the
 /// agent receives a SIGWINCH even when the requested size equals the PTY's
 /// current size.
@@ -508,468 +406,69 @@ fn resize_pty_forcing_winch(master: &dyn portable_pty::MasterPty, cols: u16, row
     });
 }
 
-/// Build a `BridgeConfig` for this container. The cancel callback runs
-/// `container stop <name>` so the startup-grace detector can kill a
-/// container that never produced output.
-fn bridge_config_for(
-    name: &ContainerName,
-    grace_timeout: std::time::Duration,
-    stuck_timeout: std::time::Duration,
-) -> crate::engine::container::io_bridge::BridgeConfig {
-    let container_name = name.0.clone();
-    let cancel: crate::engine::container::io_bridge::CancelFn = std::sync::Arc::new(move || {
-        let _ = Command::new("container")
-            .args(["stop", &container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    });
-    crate::engine::container::io_bridge::BridgeConfig {
-        grace_timeout,
-        stuck_timeout,
-        container_start_delay: crate::engine::container::timing::APPLE_CONTAINER_START_DELAY,
-        cancel_on_grace_expired: Some(cancel),
-        output_tail: std::sync::Arc::new(
-            crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
-        ),
-        output_broadcast: None,
-    }
-}
+/// The Apple backend's `process::AttachHook`, run once the PTY bridge is up.
+///
+/// Apple's `container` CLI has no attach verb, so this process — the sole
+/// holder of the container's PTY — is the attach rendezvous: it serves the
+/// PTY over a per-container unix socket that `AppleBackend::attach` clients
+/// connect to. The shared spawn path installs the output tap on the bridge
+/// (`AttachHookCtx::output_broadcast`) and hands us the stdin injector and a
+/// weak PTY master; everything below this line is Apple's alone.
+///
+/// Returns `None` — after a warning — when the socket cannot be created. The
+/// container still runs; it simply cannot be attached to.
+fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
+    let AttachHookCtx {
+        container_name,
+        output_broadcast,
+        stdin_injector,
+        pty_master,
+    } = ctx;
 
-/// Spawn the Apple `container run -it` binary via `portable-pty` and bridge
-/// the PTY master to the frontend's `AgentIo` channels via the shared
-/// I/O bridge.
-fn spawn_pty_bridged_apple(
-    mut instance: Box<AppleContainerInstance>,
-    io: crate::engine::agent_runtime::frontend::AgentIo,
-    argv: Vec<String>,
-    _seeded: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::AgentHandle,
-    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-    // Move the credential leases out of the instance (dropped before this fn
-    // returns) and into the execution backend, so each lease brackets the child
-    // process it credentials.
-    let leases = std::mem::take(&mut instance.leases);
-
-    let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
-
-    let mut cmd = CommandBuilder::new("container");
-    for arg in &argv {
-        cmd.arg(arg);
-    }
-    // Agent credentials are passed as name-only `-e KEY` in argv; set their
-    // values on the `container` child's environment so the CLI resolves them
-    // without the secret ever touching the argument vector.
-    for (k, v) in &instance.options.agent_credentials {
-        cmd.env(k, v);
-    }
-
-    // INV-6: a credentialed container must hold its lease before the child is
-    // spawned. This closes the startup race where a token could expire between
-    // staging and the container's first request.
-    debug_assert!(
-        instance.options.refreshable_credentials.is_empty()
-            || !leases.is_empty()
-            || crate::engine::credential_refresh::global().is_none(),
-        "file-delivered credential spawned without a lease"
-    );
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| EngineError::Container(format!("spawn container via pty: {e}")))?;
-
-    // Interactive PTY runs pass the seeded prompt as a CLI positional arg
-    // (appended by `build_run_argv`), so it must NOT also be written to stdin.
-    // Writing it here would cause the PTY to echo the prompt text into the
-    // terminal output, painting it over the TUI before the agent starts.
-
-    // Apple's `container` CLI has no attach verb, so this process — the sole
-    // holder of the container's PTY — is the attach rendezvous: tap the
-    // bridge's output stream and serve the PTY over a per-container unix
-    // socket that `AppleBackend::attach` clients connect to.
-    let (output_broadcast_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
-    let output_broadcast_tx = std::sync::Arc::new(output_broadcast_tx);
-    let mut bridge_cfg = bridge_cfg;
-    bridge_cfg.output_broadcast = Some(std::sync::Arc::clone(&output_broadcast_tx));
-
-    let (master_arc, bridge) =
-        crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
-
-    // A weak master reference: the attach server must never keep the PTY
+    // The master reference is weak: the attach server must never keep the PTY
     // alive past the execution backend that owns it.
-    let master_for_resize = std::sync::Arc::downgrade(&master_arc);
     let resize: std::sync::Arc<dyn Fn(u16, u16) + Send + Sync> =
         std::sync::Arc::new(move |cols, rows| {
-            if let Some(master) = master_for_resize.upgrade() {
+            if let Some(master) = pty_master.upgrade() {
                 if let Ok(master) = master.lock() {
                     resize_pty_forcing_winch(master.as_ref(), cols, rows);
                 }
             }
         });
-    let attach_socket =
-        match crate::engine::container::attach_socket::attach_socket_path(&instance.name.0) {
-            Some(path) => crate::engine::container::attach_socket::spawn_attach_socket_server(
-                &path,
-                crate::engine::container::attach_socket::AttachHooks {
-                    output: output_broadcast_tx,
-                    stdin: bridge.stdin_injector.clone(),
-                    resize,
-                },
-            )
-            .map_err(|error| {
-                tracing::warn!(
-                    container = %instance.name.0,
-                    error = %error,
-                    "attach socket unavailable; the container runs but cannot be attached to"
-                );
-            })
-            .ok(),
-            None => {
-                tracing::warn!(
-                    container = %instance.name.0,
-                    "no home directory to place the attach socket in; the container \
-                     runs but cannot be attached to"
-                );
-                None
-            }
-        };
 
-    let backend = AppleExecution {
-        child: None,
-        pty_child: Some(child),
-        pty_master: Some(master_arc),
-        stdin_injector: Some(bridge.stdin_injector),
-        container_name: instance.name.0.clone(),
-        started_at,
-        attach_socket,
-        leases,
-    };
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        Some(bridge.output_tail),
-    ))
-}
-
-/// Spawn `container run` with piped stdio and bridge through `AgentIo`.
-fn spawn_piped_apple(
-    mut instance: Box<AppleContainerInstance>,
-    io: crate::engine::agent_runtime::frontend::AgentIo,
-    argv: Vec<String>,
-    seeded: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::AgentHandle,
-    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<AgentExecution, EngineError> {
-    let mut cmd = Command::new("container");
-    cmd.args(&argv);
-    // Agent credentials are passed as name-only `-e KEY` in argv; set their
-    // values on the `container` child's environment so the CLI resolves them
-    // without the secret ever touching the argument vector.
-    for (k, v) in &instance.options.agent_credentials {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    // Move leases into the backend; assert one exists before spawn (INV-6).
-    let leases = std::mem::take(&mut instance.leases);
-    debug_assert!(
-        instance.options.refreshable_credentials.is_empty()
-            || !leases.is_empty()
-            || crate::engine::credential_refresh::global().is_none(),
-        "file-delivered credential spawned without a lease"
-    );
-
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            EngineError::ContainerRuntimeUnavailable {
-                binary: "container".into(),
-            }
-        } else {
-            EngineError::Container(format!("spawn container: {e}"))
+    let path = match crate::engine::container::attach_socket::attach_socket_path(container_name) {
+        Some(path) => path,
+        None => {
+            tracing::warn!(
+                container = %container_name,
+                "no home directory to place the attach socket in; the container \
+                 runs but cannot be attached to"
+            );
+            return None;
         }
-    })?;
-
-    // Write seeded prompt into stdin channel before the writer task starts.
-    if let Some(prompt) = seeded {
-        let _ = io.stdin_tx.send(prompt.into_bytes());
-        let _ = io.stdin_tx.send(b"\n".to_vec());
-    }
-
-    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
-
-    // Non-interactive (piped) path: drop the engine's stdin_injector so the
-    // writer task sees EOF after draining the seeded prompt and closes the
-    // child's stdin pipe. See docker.rs::spawn_piped_docker for rationale.
-    drop(bridge.stdin_injector);
-
-    let backend = AppleExecution {
-        child: Some(child),
-        pty_child: None,
-        pty_master: None,
-        stdin_injector: None,
-        container_name: instance.name.0.clone(),
-        started_at,
-        attach_socket: None,
-        leases,
     };
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        Some(bridge.output_tail),
-    ))
-}
 
-/// Spawn `container run -i` (no PTY) with piped stdio for an ACP session and
-/// bridge through `AgentIo`.
-///
-/// The Apple-backend sibling of `docker.rs::spawn_piped_interactive_docker`,
-/// and the persistent-piped counterpart of [`spawn_piped_apple`]. The one
-/// difference from `spawn_piped_apple` — and the whole point — is that it does
-/// **not** `drop(bridge.stdin_injector)`: the stdin channel is retained on the
-/// `AppleExecution` for the session's entire lifetime, exactly as
-/// [`spawn_pty_bridged_apple`] keeps its PTY master alive. That keeps the
-/// container's stdin pipe open so the ACP driver can write JSON-RPC request
-/// lines (via `try_inject_stdin`) across a full bidirectional exchange.
-///
-/// No seeded prompt is written to stdin: an ACP session delivers its prompt
-/// over the JSON-RPC channel (`session/prompt`), so writing raw text to stdin
-/// would corrupt the newline-delimited framing. `_seeded` is accepted only to
-/// keep the signature parallel with `spawn_piped_apple`.
-///
-/// Security: identical wiring to `spawn_piped_apple` — the JSON-RPC bytes ride
-/// the stdio pipes `-i` already wires up. No ports, no `--network`, no new
-/// mounts (see `aspec/architecture/security.md`).
-fn spawn_piped_interactive_apple(
-    mut instance: Box<AppleContainerInstance>,
-    io: crate::engine::agent_runtime::frontend::AgentIo,
-    argv: Vec<String>,
-    _seeded: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::AgentHandle,
-    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<AgentExecution, EngineError> {
-    let mut cmd = Command::new("container");
-    cmd.args(&argv);
-    // Agent credentials are passed as name-only `-e KEY` in argv; set their
-    // values on the `container` child's environment so the CLI resolves them
-    // without the secret ever touching the argument vector.
-    for (k, v) in &instance.options.agent_credentials {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    // Move leases into the backend; assert one exists before spawn (INV-6).
-    let leases = std::mem::take(&mut instance.leases);
-    debug_assert!(
-        instance.options.refreshable_credentials.is_empty()
-            || !leases.is_empty()
-            || crate::engine::credential_refresh::global().is_none(),
-        "file-delivered credential spawned without a lease"
-    );
-
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            EngineError::ContainerRuntimeUnavailable {
-                binary: "container".into(),
-            }
-        } else {
-            EngineError::Container(format!("spawn container: {e}"))
-        }
-    })?;
-
-    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
-
-    // Persistent-piped (ACP) path: KEEP the stdin_injector alive (do NOT drop
-    // it, unlike `spawn_piped_apple`). Retaining the sender both enables
-    // `try_inject_stdin` and prevents the writer task from ever seeing EOF, so
-    // the container's stdin pipe stays open for the whole JSON-RPC session.
-    let backend = AppleExecution {
-        child: Some(child),
-        pty_child: None,
-        pty_master: None,
-        stdin_injector: Some(bridge.stdin_injector),
-        container_name: instance.name.0.clone(),
-        started_at,
-        attach_socket: None,
-        leases,
-    };
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        Some(bridge.output_tail),
-    ))
-}
-
-struct AppleExecution {
-    /// Set when running with piped stdio.
-    child: Option<std::process::Child>,
-    /// Set when running PTY-bridged via portable-pty.
-    pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    /// Held alive so the resize task and PTY writer keep working until exit.
-    pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
-    /// Sender side of the stdin channel — used by `try_inject_stdin` to push
-    /// a workflow continue-in-current prompt into the running PTY.
-    stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    container_name: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    /// The attach rendezvous socket for PTY-backed runs (`None` on the piped
-    /// paths). Dropped with this backend, which closes every attach session
-    /// and removes the socket file.
-    attach_socket: Option<crate::engine::container::attach_socket::AttachSocketGuard>,
-    /// Credential-refresh leases held for the container's whole life. Dropped
-    /// (deregistering each lease) when this backend is consumed by
-    /// `wait_blocking` on child exit, or when the execution is dropped unwaited.
-    /// The monitor stops writing this container's staged file the moment these
-    /// drop. Not read directly — held purely for its `Drop`.
-    #[allow(dead_code)]
-    leases: Vec<CredentialLease>,
-}
-
-impl ExecutionBackend for AppleExecution {
-    fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-        // PTY-bridged path: wait on the portable-pty child.
-        if let Some(mut child) = self.pty_child.take() {
-            let status = child
-                .wait()
-                .map_err(|e| EngineError::Container(format!("wait container (pty): {e}")))?;
-            self.pty_master = None;
-            let exit_code = status.exit_code().try_into().unwrap_or(-1);
-            return Ok(AgentExitInfo {
-                exit_code,
-                signal: None,
-                started_at: self.started_at,
-                ended_at: chrono::Utc::now(),
-            });
-        }
-
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| EngineError::Container("execution already waited".into()))?;
-        let status = child
-            .wait()
-            .map_err(|e| EngineError::Container(format!("wait container: {e}")))?;
-        let exit_code = status.code().unwrap_or(-1);
-        #[cfg(unix)]
-        let signal = {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal()
-        };
-        #[cfg(not(unix))]
-        let signal = None;
-        Ok(AgentExitInfo {
-            exit_code,
-            signal,
-            started_at: self.started_at,
-            ended_at: chrono::Utc::now(),
-        })
-    }
-
-    fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
-        if let Some(tx) = &self.stdin_injector {
-            tx.send(bytes.to_vec())
-                .map_err(|e| EngineError::Container(format!("inject stdin: {e}")))?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn cancel(&self) -> Result<(), EngineError> {
-        let _ = Command::new("container")
-            .args(["stop", &self.container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("container")
-            .args(["rm", &self.container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        Ok(())
-    }
-
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
-        let name = self.container_name.clone();
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                let _ = Command::new("container")
-                    .args(["stop", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = Command::new("container")
-                    .args(["rm", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                Ok(())
-            },
-        ))
-    }
-}
-
-/// Parse a memory-usage string like `"123.4MiB"`, `"1.2GB"`, `"512KB"` into
-/// megabytes. Unrecognized units fall back to assuming MB (consistent with
-/// the legacy parser at `oldsrc/runtime/docker.rs`).
-fn parse_memory_mb(s: &str) -> f64 {
-    let trimmed = s.trim();
-    let split_at = trimmed
-        .find(|c: char| c.is_alphabetic())
-        .unwrap_or(trimmed.len());
-    let (num, unit) = trimmed.split_at(split_at);
-    let value: f64 = num.parse().unwrap_or(0.0);
-    let unit_norm: String = unit.trim().to_ascii_lowercase();
-    let factor_to_mb: f64 = match unit_norm.as_str() {
-        "b" => 1.0 / (1024.0 * 1024.0),
-        "k" | "kb" | "kib" => 1.0 / 1024.0,
-        "m" | "mb" | "mib" | "" => 1.0,
-        "g" | "gb" | "gib" => 1024.0,
-        "t" | "tb" | "tib" => 1024.0 * 1024.0,
-        _ => 1.0,
-    };
-    value * factor_to_mb
+    crate::engine::container::attach_socket::spawn_attach_socket_server(
+        &path,
+        crate::engine::container::attach_socket::AttachHooks {
+            output: output_broadcast,
+            stdin: stdin_injector,
+            resize,
+        },
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            container = %container_name,
+            error = %error,
+            "attach socket unavailable; the container runs but cannot be attached to"
+        );
+    })
+    .ok()
 }
 
 #[cfg(test)]
 mod apple_tests {
     use super::*;
-
-    #[test]
-    fn parse_memory_mb_handles_common_units() {
-        assert!((parse_memory_mb("128MiB") - 128.0).abs() < 0.001);
-        assert!((parse_memory_mb("128MB") - 128.0).abs() < 0.001);
-        assert!((parse_memory_mb("1.5GB") - 1536.0).abs() < 0.001);
-        assert!((parse_memory_mb("512KB") - 0.5).abs() < 0.001);
-        assert!((parse_memory_mb("1024B") - (1024.0 / (1024.0 * 1024.0))).abs() < 0.001);
-        assert!((parse_memory_mb("64") - 64.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn parse_memory_mb_unknown_unit_assumes_mb() {
-        assert!((parse_memory_mb("128wat") - 128.0).abs() < 0.001);
-    }
 
     #[test]
     fn parse_apple_list_picks_up_running_awman_containers() {
@@ -1124,7 +623,7 @@ mod apple_tests {
         // `container image inspect` exits non-zero for an unknown tag, and
         // the helper must collapse that to `None` rather than panic — also
         // covers the case where the `container` CLI itself isn't installed.
-        let backend = AppleBackend::new();
+        let backend = AppleBackend;
         let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
         assert!(backend.image_home_dir(bogus).is_none());
     }

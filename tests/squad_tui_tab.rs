@@ -26,8 +26,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
-
 use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::Engines;
@@ -93,18 +91,29 @@ fn make_engines(with_container_runtime: bool) -> Engines {
     }
 }
 
+/// One multi-threaded runtime shared by every test in this file, rather than
+/// each leaking its own: leaking a fresh `Runtime` (and its worker-thread
+/// pool) per call exhausts the OS thread budget in a resource-constrained CI
+/// container well before the file's tests finish.
+fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+        .handle()
+        .clone()
+}
+
 fn make_app(with_container_runtime: bool) -> App {
-    let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
     let catalogue = CommandCatalogue::get();
     let engines = make_engines(with_container_runtime);
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let tab = Tab::new(make_session());
     App::new(
         catalogue,
         engines,
         session_manager,
         tab,
-        rt.handle().clone(),
+        test_runtime_handle(),
     )
 }
 
@@ -112,18 +121,26 @@ fn make_app(with_container_runtime: bool) -> App {
 /// `App::build_squad_tab` builds one after a successful `ensure_running` (minus
 /// the gateway/poller, which the individual tests that need them install).
 fn make_squad_only_app() -> App {
-    let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
     let catalogue = CommandCatalogue::get();
     let engines = make_engines(true);
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let tab = Tab::new_squad(make_session());
     App::new(
         catalogue,
         engines,
         session_manager,
         tab,
-        rt.handle().clone(),
+        test_runtime_handle(),
     )
+}
+
+/// A directory that still exists when the caller uses it.
+///
+/// `make_session` drops its `TempDir` as it returns, which is fine for a
+/// `Session` that has already read what it needs — but `App::add_tab` hands
+/// the path to `SessionManager::open_or_create`, which opens it for real.
+fn live_dir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
 }
 
 fn fake_task(name: &str) -> Task {
@@ -250,7 +267,9 @@ fn creating_the_squad_tab_auto_spawns_nothing() {
 #[test]
 fn tab_cycle_includes_the_squad_tab_and_selection_survives_a_defocus_round_trip() {
     let mut app = make_app(true); // tab 0, ordinary
-    app.add_tab(make_session()); // tab 1, ordinary
+    let ordinary = live_dir();
+    app.add_tab(ordinary.path().to_path_buf(), SessionOpenOptions::default())
+        .unwrap(); // tab 1, ordinary
     app.tabs.push(Tab::new_squad(make_session())); // tab 2 == squad
     let squad_idx = app.tabs.len() - 1;
     app.active_tab = squad_idx;
@@ -290,7 +309,9 @@ fn tab_cycle_includes_the_squad_tab_and_selection_survives_a_defocus_round_trip(
 #[test]
 fn tick_all_tabs_flips_focused_based_on_the_active_tab() {
     let mut app = make_squad_only_app();
-    app.add_tab(make_session()); // tab 1, ordinary; squad tab (0) still active
+    let ordinary = live_dir();
+    app.add_tab(ordinary.path().to_path_buf(), SessionOpenOptions::default())
+        .unwrap(); // tab 1, ordinary; squad tab (0) still active
 
     app.tick_all_tabs();
     assert!(

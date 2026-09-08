@@ -34,11 +34,11 @@ fn has_green_sidebar_corner(buf: &ratatui::buffer::Buffer) -> Option<u16> {
 }
 
 fn set_summary(app: &App, additions: u32, deletions: u32) {
-    use crate::frontend::tui::git_sidebar::GitDiffSummary;
+    use crate::engine::git::GitDiffSummary;
     *app.active_tab().git_diff_summary.lock().unwrap() = Some(GitDiffSummary {
         files: Vec::new(),
-        total_additions: additions,
-        total_deletions: deletions,
+        added: additions,
+        removed: deletions,
         branch: None,
     });
 }

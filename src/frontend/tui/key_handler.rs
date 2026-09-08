@@ -980,33 +980,14 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
         return;
     }
 
-    let session = {
-        let resolver = crate::data::session::StaticGitRootResolver::new(&dir);
-        match crate::data::session::Session::open(
-            dir.clone(),
-            &resolver,
-            crate::data::session::SessionOpenOptions::default(),
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                // Fallback for non-git directories: use dir as git root.
-                match crate::data::session::Session::open_at_git_root(
-                    dir.clone(),
-                    dir.clone(),
-                    crate::data::session::SessionOpenOptions::default(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        app.status_bar.text = format!("Failed to open session: {e}");
-                        return;
-                    }
-                }
-            }
+    let idx = match app.add_tab(dir, crate::data::session::SessionOpenOptions::default()) {
+        Ok(idx) => idx,
+        Err(error) => {
+            app.status_bar.text = format!("Failed to open session: {error}");
+            return;
         }
     };
-
-    let is_git = session.git_root().join(".git").exists();
-    let idx = app.add_tab(session);
+    let is_git = app.tabs[idx].session.git_root().join(".git").exists();
     app.active_tab = idx;
 
     if is_git {

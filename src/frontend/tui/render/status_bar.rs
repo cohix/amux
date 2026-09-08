@@ -174,12 +174,12 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
         if let Some(summary) = tab.git_diff_summary.lock().ok().and_then(|g| g.clone()) {
             let git_spans = vec![
                 Span::styled(
-                    format!("+{}", summary.total_additions),
+                    format!("+{}", summary.added),
                     Style::default().fg(Color::Green),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!("-{} ", summary.total_deletions),
+                    format!("-{} ", summary.removed),
                     Style::default().fg(Color::Red),
                 ),
             ];

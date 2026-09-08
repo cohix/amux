@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
 
@@ -717,6 +717,25 @@ impl ConfigCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The three
+    /// `config` leaves share one entry point, selected by the caller's
+    /// canonical path.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "show" => ConfigSubcommand::Show(ConfigShowFlags {}),
+            "get" => ConfigSubcommand::Get(ConfigGetFlags {
+                field: ctx.args.require("field")?,
+            }),
+            "set" => ConfigSubcommand::Set(ConfigSetFlags {
+                field: ctx.args.require("field")?,
+                value: ctx.args.require("value")?,
+                global: ctx.flags.bool("global"),
+            }),
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &ConfigSubcommand {
@@ -1836,37 +1855,7 @@ mod edit_loop_tests {
     }
 
     fn make_engines() -> crate::command::dispatch::Engines {
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-                "/tmp",
-            )),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store = {
-            let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                tmp.path(),
-            ))
-        };
-        crate::command::dispatch::Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
-        }
+        crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"))
     }
 
     fn open_session(git_root: &std::path::Path) -> crate::data::session::Session {

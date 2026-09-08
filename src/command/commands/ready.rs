@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::{resolve_agent, Command};
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::ready_summary::AgentCredentialHealth;
@@ -147,6 +147,24 @@ impl ReadyCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). `--json`
+    /// declares `implies: ["non-interactive"]`, so the implication is already
+    /// applied in `flags` and is not re-derived here.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            ReadyCommandFlags {
+                refresh: ctx.flags.bool("refresh"),
+                build: ctx.flags.bool("build"),
+                no_cache: ctx.flags.bool("no-cache"),
+                non_interactive: ctx.flags.bool("non-interactive"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+                json: ctx.flags.bool("json"),
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        ))
     }
 
     pub fn flags(&self) -> &ReadyCommandFlags {

@@ -129,6 +129,7 @@ Components of this layer:
   - No specific persistence logic may reside in the API frontend package, all should be delegated to objects and functions in lower-level packages
   - The server/API frontend's only job is to translate the lower-level package's functionality into an HTTP-powered API.
   - Server endpoint handler should be nearly identical to their CLI and TUI counterparts, using `Dispatch` to parse inputs and then execute the resolved `Command` and providing `frontend_...` trait implementations. 
+  - Interactive/PTY commands such as `squad attach` are the sanctioned P2 exception and remain excluded from the API (`api_allowed: false`).
 
 ### Layer 4: binary
 The binary layer is responsible for the main method, whose sole responsibility is to set up the available frontends and make them available to the user. 

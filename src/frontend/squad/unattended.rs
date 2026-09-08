@@ -22,11 +22,8 @@
 //! is either a constant or the task's own captured setting.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,7 +40,7 @@ use crate::command::commands::worktree_lifecycle::{
     PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
-use crate::data::fs::RunId;
+use crate::data::fs::{RunId, SharedSquadRunLog, SquadRunLog, SquadRunLogError, SquadRunLogs};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
@@ -104,17 +101,18 @@ pub struct UnattendedFrontend {
     context: String,
     task: String,
     run_id: RunId,
-    /// Created by the scheduler before evaluation is dispatched. Each
-    /// `AgentStatus::Running` opens its own `<container-name>.log` here before
-    /// the runtime starts the container subprocess.
-    run_log_dir: PathBuf,
-    pending_log_files: VecDeque<SharedLogFile>,
+    /// The run directory the scheduler created before evaluation was
+    /// dispatched, wrapped in the Layer 0 type that owns its file layout. Each
+    /// `AgentStatus::Running` opens its own `<container-name>.log` through it
+    /// before the runtime starts the container subprocess.
+    logs: SquadRunLogs,
+    pending_log_files: VecDeque<SharedSquadRunLog>,
     /// The task's captured mount scope, returned verbatim when asked.
     mount_scope: MountScopeDecision,
     /// The setup/teardown step whose output is being written right now (WI
     /// 0112 Part 5). `None` outside a phase step, which is the normal state
     /// while agent steps run.
-    phase_log: Option<PhaseLog>,
+    phase_log: Option<SquadRunLog>,
     /// How many setup / teardown steps have started, for the `<n>` in the
     /// step log's filename. The engine fires the hooks strictly in definition
     /// order and never concurrently, so a counter is reliable.
@@ -131,62 +129,21 @@ pub struct UnattendedFrontend {
     last_container_log: Option<PathBuf>,
 }
 
-/// One setup/teardown step's open log file (WI 0112 Part 5).
-struct PhaseLog {
-    path: PathBuf,
-    file: File,
-}
-
-/// The `<step>` part of a phase-step log filename: the step description
-/// lower-cased, runs of anything outside `[a-z0-9]` collapsed to one `-`,
-/// trimmed, capped at 40 characters. Empty when nothing survives.
-pub(crate) fn step_log_slug(description: &str) -> String {
-    let mut slug = String::new();
-    let mut pending_dash = false;
-    for ch in description.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            if pending_dash && !slug.is_empty() {
-                slug.push('-');
-            }
-            pending_dash = false;
-            slug.push(ch);
-        } else {
-            pending_dash = true;
-        }
-        if slug.len() >= 40 {
-            break;
-        }
-    }
-    slug.truncate(40);
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    slug
-}
-
-/// `setup-3-clone-repo.log`, or `setup-3.log` when the slug is empty.
-pub(crate) fn step_log_file_name(phase: &str, index: usize, description: &str) -> String {
-    let slug = step_log_slug(description);
-    if slug.is_empty() {
-        format!("{phase}-{index}.log")
-    } else {
-        format!("{phase}-{index}-{slug}.log")
-    }
-}
-
 impl UnattendedFrontend {
+    /// Test-only construction. Production always uses `for_run`, which
+    /// receives a scheduler-created directory and can report setup errors.
+    #[cfg(test)]
     fn new(context: String) -> Self {
-        // Test-only construction. Production always uses `for_run`, which
-        // receives a scheduler-created directory and can report setup errors.
         Self::with_mount_scope(context, MountScopeDecision::MountGitRoot)
     }
 
+    #[cfg(test)]
     fn with_mount_scope(context: String, mount_scope: MountScopeDecision) -> Self {
         Self {
             task: context.clone(),
             context,
             run_id: RunId::new(),
-            run_log_dir: std::env::temp_dir().join("awman-unattended-test-logs"),
+            logs: SquadRunLogs::new(std::env::temp_dir().join("awman-unattended-test-logs")),
             pending_log_files: VecDeque::new(),
             mount_scope,
             phase_log: None,
@@ -205,7 +162,8 @@ impl UnattendedFrontend {
         label: &str,
         mount_scope: MountScopeDecision,
     ) -> Result<Self, CommandError> {
-        if !run_log_dir.is_dir() {
+        let logs = SquadRunLogs::new(run_log_dir);
+        if !logs.is_prepared() {
             return Err(CommandError::Other(format!(
                 "squad run log directory was not prepared before container launch: {}",
                 run_log_dir.display()
@@ -215,7 +173,7 @@ impl UnattendedFrontend {
             context: format!("{task}/{label}"),
             task: task.to_string(),
             run_id: run_id.clone(),
-            run_log_dir: run_log_dir.to_path_buf(),
+            logs,
             pending_log_files: VecDeque::new(),
             mount_scope,
             phase_log: None,
@@ -234,31 +192,21 @@ impl UnattendedFrontend {
     /// logged and the step runs unlogged rather than not at all.
     fn begin_phase_step(&mut self, phase: &str, index: usize, description: &str) {
         self.finish_phase_log();
-        let path = self
-            .run_log_dir
-            .join(step_log_file_name(phase, index, description));
-        match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut file) => {
-                let _ = writeln!(
-                    file,
-                    "# {phase} step {index}: {description}\n# started {}",
-                    chrono::Utc::now().to_rfc3339()
-                );
-                let _ = file.flush();
+        match self.logs.open_step_log(phase, index, description) {
+            Ok(log) => {
                 tracing::info!(
                     task = %self.task,
                     run_id = %self.run_id,
                     step = description,
-                    log_path = %path.display(),
+                    log_path = %log.path().display(),
                     "squad {phase} step started"
                 );
-                self.phase_log = Some(PhaseLog { path, file });
+                self.phase_log = Some(log);
             }
             Err(error) => tracing::error!(
                 task = %self.task,
                 run_id = %self.run_id,
                 step = description,
-                log_path = %path.display(),
                 error = %error,
                 "squad failed to open {phase} step log"
             ),
@@ -269,8 +217,7 @@ impl UnattendedFrontend {
     /// same durability rule `spawn_file_drain` applies to agent output.
     fn phase_step_line(&mut self, line: &str) {
         if let Some(log) = self.phase_log.as_mut() {
-            let _ = writeln!(log.file, "{line}");
-            let _ = log.file.flush();
+            log.write_line(line);
         }
     }
 
@@ -330,33 +277,14 @@ impl UnattendedFrontend {
 
     /// Flush and close the open phase log, returning its path.
     fn finish_phase_log(&mut self) -> Option<PathBuf> {
-        let log = self.phase_log.take()?;
-        let PhaseLog { path, mut file } = log;
-        let _ = file.flush();
-        Some(path)
+        Some(self.phase_log.take()?.finish())
     }
 
     fn prepare_container_log(&mut self, container_name: &str) {
-        // squad names are generated by our validated slug helper. Reject a
-        // surprising runtime name rather than allowing path traversal through
-        // a filename from a container backend.
-        if Path::new(container_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            != Some(container_name)
-        {
-            tracing::error!(
-                task = %self.task,
-                run_id = %self.run_id,
-                container = %container_name,
-                "squad refused unsafe container-log filename"
-            );
-            return;
-        }
-        let path = self.run_log_dir.join(format!("{container_name}.log"));
-        match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(file) => {
-                self.pending_log_files.push_back(Arc::new(Mutex::new(file)));
+        match self.logs.open_container_log(container_name) {
+            Ok(log) => {
+                let path = log.path().to_path_buf();
+                self.pending_log_files.push_back(log);
                 tracing::info!(
                     task = %self.task,
                     run_id = %self.run_id,
@@ -371,19 +299,24 @@ impl UnattendedFrontend {
                 }
                 self.last_container_log = Some(path);
             }
+            // A name that is not a single path component reached us from a
+            // container backend, never from squad's own validated slug helper.
+            Err(SquadRunLogError::UnsafeName { name }) => tracing::error!(
+                task = %self.task,
+                run_id = %self.run_id,
+                container = %name,
+                "squad refused unsafe container-log filename"
+            ),
             Err(error) => tracing::error!(
                 task = %self.task,
                 run_id = %self.run_id,
                 container = %container_name,
-                log_path = %path.display(),
                 error = %error,
                 "squad failed to open per-container log"
             ),
         }
     }
 }
-
-type SharedLogFile = Arc<Mutex<File>>;
 
 impl Drop for UnattendedFrontend {
     /// A frontend torn down mid-step (the workflow aborted) still flushes
@@ -457,7 +390,7 @@ impl AgentFrontend for UnattendedFrontend {
 }
 
 fn spawn_file_drain(
-    log_file: Option<SharedLogFile>,
+    log_file: Option<SharedSquadRunLog>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     tokio::spawn(async move {
@@ -465,14 +398,8 @@ fn spawn_file_drain(
             // The PTY bridge delivers one merged stream through stdout. Keep
             // the same shared file for stderr too, which also preserves a
             // faithful interleaving should a runtime ever take the piped path.
-            if let Some(file) = &log_file {
-                if let Ok(mut file) = file.lock() {
-                    let _ = file.write_all(&bytes);
-                    // Flush every bridged chunk. A daemon crash can still
-                    // lose bytes in the OS page cache, but this avoids an
-                    // application-level buffered tail.
-                    let _ = file.flush();
-                }
+            if let Some(log) = &log_file {
+                log.write_bytes(&bytes);
             }
         }
     });
@@ -748,6 +675,8 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     // ── WI 0112 Part 5: setup/teardown step logs and failure lines ──────
@@ -775,23 +704,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn step_log_slugs_are_safe_lower_case_and_capped() {
-        assert_eq!(step_log_slug("clone_repo"), "clone-repo");
-        assert_eq!(
-            step_log_slug("Run shell: git   status && ls"),
-            "run-shell-git-status-ls"
-        );
-        assert_eq!(step_log_slug("///"), "");
-        assert_eq!(step_log_slug("-a-"), "a");
-        let long = step_log_slug(&"x".repeat(100));
-        assert_eq!(long.len(), 40);
-        assert_eq!(
-            step_log_file_name("setup", 2, "clone_repo"),
-            "setup-2-clone-repo.log"
-        );
-        assert_eq!(step_log_file_name("teardown", 1, "///"), "teardown-1.log");
-    }
+    // The slug and filename rules moved to `SquadRunLogs` (Layer 0) in WI
+    // 0113 F-02 and are tested there; what stays here is that the frontend
+    // writes the right *content* through them.
 
     #[test]
     fn a_setup_step_writes_its_output_to_a_numbered_file_and_logs_the_path() {

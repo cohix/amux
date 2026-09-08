@@ -25,8 +25,6 @@ use awman::engine::credential_refresh::{
     install_global, CredentialRefreshMonitor, MonitorConfig, RefreshOutcome,
 };
 use awman::engine::error::EngineError;
-use awman::engine::git::GitEngine;
-use awman::engine::overlay::OverlayEngine;
 use awman::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, WorkflowOutcome, WorkflowStepStatus,
     YoloTickOutcome,
@@ -326,15 +324,12 @@ fn run_retry_workflow() -> (usize, usize) {
         launches: launches.clone(),
         refreshes: refreshes.clone(),
     };
-    let overlay = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(root.path()));
     let mut engine = WorkflowEngine::new(
         &session,
         retry_workflow(),
         None,
         Box::new(UnattendedTestFrontend),
         Box::new(factory),
-        Arc::new(GitEngine::new()),
-        Arc::new(overlay),
     )
     .unwrap();
     let outcome = tokio::runtime::Runtime::new()
@@ -713,7 +708,10 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .collect();
-    assert!(fingerprints.len() >= 2, "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?}");
+    assert!(
+        fingerprints.len() >= 2,
+        "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?}"
+    );
     assert_eq!(
         std::fs::read(&exited_delivery.staged_path).unwrap(),
         exited_before,

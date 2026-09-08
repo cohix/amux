@@ -29,8 +29,6 @@ use crate::engine::agent_runtime::execution::{
 use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
-use crate::engine::git::GitEngine;
-use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureContext, StepOutcome, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
@@ -159,9 +157,6 @@ struct ActiveParallelStep {
     /// Standalone kill handle, extracted before the execution is moved into a
     /// wait future. Used by the multi-step path to kill just this container.
     cancel_handle: Option<CancelHandle>,
-    /// This container's stuck broadcast sender (published to the frontend so it
-    /// can subscribe per-slot).
-    stuck_sender: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
     /// The container's name, retained so a failure log can be named after it
     /// once the execution has been consumed by its wait future.
     container_name: String,
@@ -191,8 +186,6 @@ pub struct WorkflowEngine {
     effective_config: EffectiveConfig,
     frontend: Box<dyn WorkflowFrontend>,
     agent_factory: Box<dyn AgentExecutionFactory>,
-    git_engine: Arc<GitEngine>,
-    overlay_engine: Arc<OverlayEngine>,
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
@@ -326,8 +319,6 @@ impl WorkflowEngine {
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_context_permission =
@@ -358,8 +349,6 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,
@@ -431,8 +420,6 @@ impl WorkflowEngine {
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         Self::resume_with_state_root(
             session,
@@ -440,8 +427,6 @@ impl WorkflowEngine {
             work_item_context,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             None,
         )
         .await
@@ -454,15 +439,12 @@ impl WorkflowEngine {
     /// whose session root must stay untouched between runs — a squad task
     /// bound to its durable workspace (WI 0106 §6a) — points this at a
     /// run-scoped directory instead. `None` keeps the session-rooted default.
-    #[allow(clippy::too_many_arguments)]
     pub async fn resume_with_state_root(
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
         state_root: Option<std::path::PathBuf>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
@@ -562,8 +544,6 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,
@@ -993,7 +973,6 @@ impl WorkflowEngine {
             step_name: step.name.clone(),
             execution: None,
             cancel_handle,
-            stuck_sender,
             container_name,
             output_tail,
             awman_killed: false,
@@ -1643,14 +1622,12 @@ impl WorkflowEngine {
         );
         self.persist()?;
 
-        let stuck_sender = execution.stuck_sender();
         let container_name = execution.handle().name.clone();
         let output_tail = execution.output_tail();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
             cancel_handle: None,
-            stuck_sender,
             container_name,
             output_tail,
             awman_killed: false,
@@ -3528,7 +3505,6 @@ mod tests {
     use crate::data::workflow_definition::{Workflow, WorkflowStep};
     use crate::data::workflow_state_store::WorkflowStateStore;
     use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
-    use crate::engine::overlay::OverlayEngine;
 
     // ── Fake implementations ─────────────────────────────────────────────────
 
@@ -3572,14 +3548,6 @@ mod tests {
         fn with_confirm_resume(mut self, response: bool) -> Self {
             self.confirm_resume_response = response;
             self
-        }
-
-        fn step_statuses(&self) -> Vec<(String, WorkflowStepStatus)> {
-            self.step_statuses.lock().unwrap().clone()
-        }
-
-        fn completed_outcome(&self) -> Option<WorkflowOutcome> {
-            self.completed.lock().unwrap().clone()
         }
     }
 
@@ -3660,13 +3628,6 @@ mod tests {
 
         fn always_success() -> Self {
             Self::new(std::iter::repeat_n(0, 100))
-        }
-
-        fn with_inject_support(exit_codes: impl IntoIterator<Item = i32>) -> Self {
-            Self {
-                inject_result: Some(()),
-                ..Self::new(exit_codes)
-            }
         }
 
         /// Produce executions whose output tail is pre-filled with `lines` and
@@ -3815,17 +3776,12 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: FakeWorkflowFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -3874,17 +3830,12 @@ mod tests {
         );
         let factory = FakeAgentExecutionFactory::always_success();
         let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -4057,14 +4008,12 @@ mod tests {
         let mut engine = make_engine(&session, workflow, factory, []);
 
         // Simulate a live slot that awman killed, carrying buffered output.
-        let (tx, _rx) = tokio::sync::broadcast::channel(4);
         let tail = OutputTail::with_default_capacity();
         tail.push_bytes(b"some output before the kill\n");
         engine.active_steps.push(ActiveParallelStep {
             step_name: "build".to_string(),
             execution: None,
             cancel_handle: None,
-            stuck_sender: Arc::new(tx),
             container_name: "awman-build-killed".to_string(),
             output_tail: Some(Arc::new(tail)),
             awman_killed: true,
@@ -4392,21 +4341,11 @@ mod tests {
         }
 
         let factory2 = FakeAgentExecutionFactory::always_success();
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]);
-        let mut engine = WorkflowEngine::resume(
-            &session,
-            wf,
-            None,
-            Box::new(frontend),
-            Box::new(factory2),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
-        )
-        .await
-        .unwrap();
+        let mut engine =
+            WorkflowEngine::resume(&session, wf, None, Box::new(frontend), Box::new(factory2))
+                .await
+                .unwrap();
         let result = engine.run_to_completion().await.unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
     }
@@ -4494,17 +4433,12 @@ mod tests {
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
 
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::resume_with_state_root(
             &session,
             wf,
             None,
             Box::new(FakeWorkflowFrontend::new([NextAction::Pause])),
             Box::new(FakeAgentExecutionFactory::always_success()),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
             Some(run_dir.path().to_path_buf()),
         )
         .await
@@ -4545,9 +4479,6 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]).with_confirm_resume(false);
         let result = WorkflowEngine::resume(
             &session,
@@ -4555,8 +4486,6 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(FakeAgentExecutionFactory::always_success()),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await;
 
@@ -4597,17 +4526,12 @@ mod tests {
             }
         }
 
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -4892,9 +4816,6 @@ mod tests {
         actions: impl IntoIterator<Item = NextAction>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
     ) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>) {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = CapturingFrontend::new(actions, engine_tx);
         let container_exits = frontend.container_exits.clone();
         let engine = WorkflowEngine::new(
@@ -4903,8 +4824,6 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(crate::engine::git::GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         (engine, container_exits)
@@ -5170,17 +5089,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -5325,17 +5239,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -6068,17 +5977,12 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: MessageCapturingFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -7127,17 +7031,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7224,17 +7123,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7327,17 +7221,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7431,17 +7320,12 @@ mod tests {
             let recording = Arc::new(FakeAgentExecutionFactory::always_success());
             let (step_factory, _step_calls) = StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7526,17 +7410,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7754,17 +7633,12 @@ mod tests {
         factory: BlockingFactory,
         frontend: ParallelTestFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -8088,21 +7962,17 @@ mod tests {
         let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(&session, workflow, factory, []);
 
-        let dummy = |name: &str| {
-            let (tx, _rx) = tokio::sync::broadcast::channel(4);
-            ActiveParallelStep {
-                step_name: name.to_string(),
-                execution: None,
-                cancel_handle: None,
-                stuck_sender: Arc::new(tx),
-                container_name: format!("container-{name}"),
-                output_tail: None,
-                awman_killed: false,
-                stuck: false,
-                yolo_deadline: None,
-                agent: AgentName::new("claude").unwrap(),
-                model: None,
-            }
+        let dummy = |name: &str| ActiveParallelStep {
+            step_name: name.to_string(),
+            execution: None,
+            cancel_handle: None,
+            container_name: format!("container-{name}"),
+            output_tail: None,
+            awman_killed: false,
+            stuck: false,
+            yolo_deadline: None,
+            agent: AgentName::new("claude").unwrap(),
+            model: None,
         };
 
         // Two live slots, "a" focused → one running peer.

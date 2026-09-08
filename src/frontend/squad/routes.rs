@@ -15,10 +15,9 @@ use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 
 use crate::command::commands::squad::commands::SquadOutcome;
-use crate::command::commands::squad::gateway::TaskGateway;
+use crate::command::commands::squad::daemon_runtime::SquadWorkflowLookup;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::{CommandOutcome, Dispatch};
-use crate::data::EngineWorkflowStateStore;
 use crate::frontend::api::command_frontend::ApiDispatchFrontend;
 use crate::frontend::api::event_bus::EventBus;
 use crate::frontend::api::serve::{check_bearer_auth, error_json};
@@ -52,7 +51,7 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Some(rejection) = check_bearer_auth(&state.auth_mode, req.headers()) {
+    if let Some(rejection) = check_bearer_auth(&state.handles.auth_mode(), req.headers()) {
         return rejection;
     }
     next.run(req).await
@@ -86,10 +85,14 @@ async fn handle_command(
     // an SSE route nor a logs route.
     let frontend =
         ApiDispatchFrontend::new(&body.subcommand, &body.args, EventBus::new(1).sender());
-    let outcome = Dispatch::new(frontend, state.session.clone(), state.engines.clone())
-        .with_squad_gateway(state.gateway())
-        .run_command(&path_parts)
-        .await;
+    let outcome = Dispatch::new(
+        frontend,
+        state.handles.session(),
+        state.handles.engines().clone(),
+    )
+    .with_squad_gateway(state.handles.gateway())
+    .run_command(&path_parts)
+    .await;
     match outcome {
         // The remote gateway deserializes the command result into the same
         // concrete type used by local callers.  Keep that synchronous payload
@@ -139,15 +142,8 @@ fn squad_outcome_response(outcome: SquadOutcome) -> Response {
 }
 
 async fn handle_status(State(state): State<Arc<SquadAppState>>) -> Response {
-    match state.gateway.status().await {
-        Ok(mut status) => {
-            status.bound_addr = state
-                .bound_addr
-                .lock()
-                .expect("squad bound-address mutex poisoned")
-                .clone();
-            Json(status).into_response()
-        }
+    match state.handles.status(state.bound_addr()).await {
+        Ok(status) => Json(status).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to read daemon status");
             (
@@ -163,46 +159,12 @@ async fn handle_workflow(
     State(state): State<Arc<SquadAppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let task = match state.store.get(&name) {
-        Ok(Some(task)) => task,
-        Ok(None) => return (StatusCode::NOT_FOUND, error_json("task not found")).into_response(),
-        Err(error) => {
-            tracing::error!(error = %error, "squad: failed to read task for workflow");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read task"),
-            )
-                .into_response();
+    match state.handles.workflow_state(&name).await {
+        Ok(SquadWorkflowLookup::Found(workflow)) => Json(*workflow).into_response(),
+        Ok(SquadWorkflowLookup::TaskNotFound) => {
+            (StatusCode::NOT_FOUND, error_json("task not found")).into_response()
         }
-    };
-    let run = match state.store.running_run_for(&task.id) {
-        Ok(Some(run)) => run,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json("no workflow for this task"),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "squad: failed to read running workflow");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read workflow"),
-            )
-                .into_response();
-        }
-    };
-    let Some(path) = run.workflow_state_path else {
-        return (
-            StatusCode::NOT_FOUND,
-            error_json("no workflow for this task"),
-        )
-            .into_response();
-    };
-    match EngineWorkflowStateStore::read_state_path(&path) {
-        Ok(Some(workflow)) => Json(workflow).into_response(),
-        Ok(None) => (
+        Ok(SquadWorkflowLookup::NoWorkflow) => (
             StatusCode::NOT_FOUND,
             error_json("no workflow for this task"),
         )

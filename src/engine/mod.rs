@@ -18,6 +18,7 @@ pub mod credential_refresh;
 pub mod error;
 pub mod git;
 pub mod init;
+pub mod issue;
 pub mod overlay;
 pub mod ready;
 pub mod sandbox;

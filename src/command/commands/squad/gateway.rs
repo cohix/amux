@@ -22,6 +22,7 @@ use crate::data::fs::task_store::{
 };
 use crate::data::fs::SquadPaths;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
+use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::naming::validate_task_slug;
 use crate::engine::squad::SchedulerStatus;
 
@@ -202,6 +203,13 @@ pub trait TaskGateway: Send + Sync {
     async fn trigger(&self, name: &str) -> Result<(), CommandError>;
     async fn delete(&self, name: &str) -> Result<(), CommandError>;
     async fn status(&self) -> Result<DaemonStatus, CommandError>;
+    /// Read the state of the task's currently running workflow, if any.
+    ///
+    /// The default keeps lightweight test gateways source-compatible; real
+    /// gateways implement the transport-specific lookup below.
+    async fn workflow_state(&self, _task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        Ok(None)
+    }
 }
 
 /// Boxable adaptor for Dispatch's shared daemon gateway handle.
@@ -235,6 +243,9 @@ impl TaskGateway for SharedTaskGateway {
     }
     async fn status(&self) -> Result<DaemonStatus, CommandError> {
         self.0.status().await
+    }
+    async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        self.0.workflow_state(task).await
     }
 }
 
@@ -442,7 +453,7 @@ impl LocalTaskGateway {
                 Err(error) => {
                     return Err(CommandError::Data(crate::data::error::DataError::io(
                         &path, error,
-                    )))
+                    )));
                 }
             }
         }
@@ -685,6 +696,21 @@ impl TaskGateway for LocalTaskGateway {
             in_flight: status.in_flight,
         })
     }
+
+    async fn workflow_state(&self, name: &str) -> Result<Option<WorkflowState>, CommandError> {
+        let Some(task) = self.store.get(name)? else {
+            return Ok(None);
+        };
+        let Some(run) = self.store.running_run_for(&task.id)? else {
+            return Ok(None);
+        };
+        let Some(path) = run.workflow_state_path else {
+            return Ok(None);
+        };
+        Ok(crate::data::EngineWorkflowStateStore::read_state_path(
+            &path,
+        )?)
+    }
 }
 
 /// HTTP-only gateway. It intentionally makes no validation decisions.
@@ -839,6 +865,23 @@ impl TaskGateway for RemoteTaskGateway {
         serde_json::from_value(response.body).map_err(|error| {
             CommandError::RemoteTransport(format!("invalid squad daemon status: {error}"))
         })
+    }
+
+    async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        // This route belongs to the remote gateway so route knowledge cannot
+        // leak into a frontend or a shared polling implementation.
+        let response = match self.core.get(&["tasks", task, "workflow"]).await {
+            Ok(response) => response,
+            Err(CommandError::RemoteHttpStatus { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_value(response.body)
+            .map(Some)
+            .map_err(|error| {
+                CommandError::RemoteTransport(format!(
+                    "invalid squad workflow state for {task:?}: {error}"
+                ))
+            })
     }
 }
 

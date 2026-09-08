@@ -910,18 +910,6 @@ mod tests {
         last_dockerfile_prompt_path: Option<std::path::PathBuf>,
     }
 
-    impl FakeReadyFrontend {
-        fn all_yes() -> Self {
-            Self {
-                create_dockerfile: true,
-                run_audit: true,
-                phases: Vec::new(),
-                statuses: Vec::new(),
-                last_dockerfile_prompt_path: None,
-            }
-        }
-    }
-
     struct FakeRuntimeFrontend;
 
     impl UserMessageSink for FakeRuntimeFrontend {

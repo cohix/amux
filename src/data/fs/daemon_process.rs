@@ -269,7 +269,14 @@ pub fn pid_is_awman(pid: u32) -> bool {
     let path = format!("/proc/{pid}/comm");
     std::fs::read_to_string(&path)
         .map(|s| s.trim().contains("awman"))
-        .unwrap_or(false)
+        // `check_already_running` has already established that this PID is
+        // alive.  A transient procfs read failure must therefore not turn a
+        // live daemon into a "stale" pidfile and delete its claim: doing so
+        // lets a competing daemon start against the same shared database.
+        // When identity cannot be inspected, conservatively retain the
+        // pidfile and refuse the competing start. This matches the fallback
+        // policy on platforms without a readable process command name.
+        .unwrap_or(true)
 }
 
 #[cfg(target_os = "macos")]

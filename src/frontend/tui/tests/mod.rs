@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::data::session_manager::SessionManager;
@@ -8,6 +5,7 @@ use crate::frontend::tui::app::{App, Focus};
 use crate::frontend::tui::dialogs::{Dialog, DialogResponse, MountScopeState};
 use crate::frontend::tui::tabs::Tab;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use std::sync::Arc;
 
 mod config_show_tests;
 mod dialog_tests;
@@ -18,53 +16,43 @@ mod render_tests;
 // ─── Shared helpers ───────────────────────────────────────────────────────
 
 fn make_engines() -> crate::command::dispatch::Engines {
-    let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-    let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-        crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from("/tmp")),
-    ));
-    let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-    let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-        overlay.clone(),
-        runtime.clone(),
-    ));
-    let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-        crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-        crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-    ));
-    let workflow_state_store = {
-        let tmp = tempfile::tempdir().unwrap();
-        Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-            tmp.path(),
-        ))
-    };
-    crate::command::dispatch::Engines {
-        runtime: runtime.clone(),
-        container_runtime: Some(runtime),
-        sandbox_runtime: None,
-        git_engine,
-        overlay_engine: overlay,
-        auth_engine,
-        agent_engine,
-        workflow_state_store,
-    }
+    crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"))
 }
 
 fn make_session() -> Session {
-    let tmp = tempfile::tempdir().unwrap();
-    let resolver = StaticGitRootResolver::new(tmp.path());
+    // Sessions retain their workdir path, so it must outlive each test's App.
+    // Keep one root for this test process rather than leaking a TempDir for
+    // every fixture.  The latter creates thousands of orphaned directories
+    // during `make test` and eventually exhausts the temporary-root directory.
+    static TEST_SESSION_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = TEST_SESSION_ROOT
+        .get_or_init(|| tempfile::tempdir().expect("create TUI test session root"));
+    let resolver = StaticGitRootResolver::new(root.path());
     Session::open(
-        tmp.path().to_path_buf(),
+        root.path().to_path_buf(),
         &resolver,
         SessionOpenOptions::default(),
     )
     .unwrap()
 }
 
+/// One multi-threaded runtime shared by every test in this binary that needs
+/// a `Handle`, rather than each test leaking its own: leaking a fresh
+/// `Runtime` (and its worker-thread pool) per call, across the hundreds of
+/// tests in this module tree, exhausts the OS thread/process budget in a
+/// resource-constrained CI container well before the suite finishes.
+pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+        .handle()
+        .clone()
+}
+
 fn make_app() -> App {
-    let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
     let catalogue = CommandCatalogue::get();
     let engines = make_engines();
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let session = make_session();
     let tab = Tab::new(session);
     App::new(
@@ -72,7 +60,7 @@ fn make_app() -> App {
         engines,
         session_manager,
         tab,
-        rt.handle().clone(),
+        test_runtime_handle(),
     )
 }
 

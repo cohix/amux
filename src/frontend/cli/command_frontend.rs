@@ -11,6 +11,8 @@
 //! interactive Q&A when stdin is not a TTY.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 
 use clap::ArgMatches;
 
@@ -34,7 +36,7 @@ use super::user_message::CliUserMessageQueue;
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
 pub struct CliFrontend {
-    matches: ArgMatches,
+    pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
@@ -68,6 +70,8 @@ pub struct CliFrontend {
     /// interactive prompt and rebind by spawning a fresh reader thread that
     /// shares the same channel. Cleared when the active step ends.
     pub(crate) container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    pub(crate) squad_attach_cancel: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
 }
 
 #[async_trait::async_trait]
@@ -78,11 +82,30 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         true
     }
 
+    /// The daemon host: the unattended frontends its evaluator drives agents
+    /// and workflows with. Answers, not decisions — the policy behind them is
+    /// Layer 2's.
+    fn squad_run_frontends(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
+    {
+        Some(crate::frontend::squad::unattended::UnattendedFrontends::shared())
+    }
+
     async fn serve_squad_daemon(
         &mut self,
-        config: crate::command::commands::squad::commands::SquadServeConfig,
+        handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
     ) -> Result<(), CommandError> {
-        crate::frontend::squad::serve(config).await
+        crate::frontend::squad::serve(handles).await
+    }
+
+    /// stdout belongs to `--json` consumers, so the key banner goes to stderr
+    /// — the same place it has always been printed.
+    fn show_key_setup(
+        &mut self,
+        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
+    ) {
+        eprintln!("{}", setup.body);
     }
 
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
@@ -354,21 +377,7 @@ impl Drop for RawModeGuard {
 impl CliFrontend {
     pub fn new(matches: ArgMatches) -> Self {
         let command_path = command_path_from_matches(&matches);
-        let explicit_flag = {
-            let path_strs: Vec<&str> = command_path.iter().map(|s| s.as_str()).collect();
-            let mut m = &matches;
-            for seg in &path_strs {
-                match m.subcommand_matches(seg) {
-                    Some(sub) => m = sub,
-                    None => break,
-                }
-            }
-            m.try_get_one::<bool>("non-interactive")
-                .ok()
-                .flatten()
-                .copied()
-                .unwrap_or(false)
-        };
+        let explicit_flag = Self::explicit_non_interactive(&matches, &command_path);
         let non_interactive = crate::frontend::effective_non_interactive(explicit_flag);
         Self {
             matches,
@@ -381,7 +390,37 @@ impl CliFrontend {
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
             container_stdin_tx: None,
+            squad_attach_cancel: None,
+            squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// The raw, TTY-independent half of the cached `non_interactive` mode:
+    /// `true` if either `--non-interactive` was passed explicitly, or
+    /// `--json` was — `--json` implies `--non-interactive` (one of the
+    /// catalogue's documented `implies` edges, see `ResolvedFlags`/F-10).
+    /// The built command's own flags always see this implication via
+    /// catalogue resolution; this cache must agree, or a `--json` caller on
+    /// a TTY gets a frontend that still thinks it is interactive while the
+    /// command it built believes it is non-interactive JSON. Callers pass
+    /// this into [`crate::frontend::effective_non_interactive`] to fold in
+    /// the no-TTY fallback.
+    fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
+        let mut m = matches;
+        for seg in command_path {
+            match m.subcommand_matches(seg) {
+                Some(sub) => m = sub,
+                None => break,
+            }
+        }
+        let flag = |name: &str| {
+            m.try_get_one::<bool>(name)
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+        };
+        flag("non-interactive") || flag("json")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
@@ -850,6 +889,42 @@ mod tests {
             .unwrap();
         let path = command_path_from_matches(&m);
         assert_eq!(path, vec!["remote", "session", "start"]);
+    }
+
+    // ─── explicit_non_interactive (--json implies --non-interactive) ──────────
+
+    /// Regression: `--json` alone (no explicit `--non-interactive`) must
+    /// still resolve `explicit_non_interactive` to `true`, matching
+    /// `ResolvedFlags`' `json -> non-interactive` catalogue implication —
+    /// otherwise a `--json` caller on a TTY gets a frontend that still
+    /// thinks it is interactive while the command it built (which reads its
+    /// flags through `ResolvedFlags`) believes it is non-interactive JSON.
+    #[test]
+    fn json_alone_implies_explicit_non_interactive() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "ready", "--json"])
+            .unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(CliFrontend::explicit_non_interactive(&m, &path));
+    }
+
+    #[test]
+    fn explicit_non_interactive_flag_alone_is_still_honoured() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "ready", "--non-interactive"])
+            .unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(CliFrontend::explicit_non_interactive(&m, &path));
+    }
+
+    #[test]
+    fn neither_json_nor_non_interactive_is_not_explicit() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd.try_get_matches_from(["awman", "ready"]).unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(!CliFrontend::explicit_non_interactive(&m, &path));
     }
 
     // ─── flag_bool ────────────────────────────────────────────────────────────

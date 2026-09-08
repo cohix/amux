@@ -45,14 +45,14 @@ pub(super) fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option
     // Bold `+A -D` totals on the first inner row.
     let title = Line::from(vec![
         Span::styled(
-            format!("+{}", summary.total_additions),
+            format!("+{}", summary.added),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
-            format!("-{}", summary.total_deletions),
+            format!("-{}", summary.removed),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -76,12 +76,12 @@ pub(super) fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option
 /// Build a single sidebar file line: a fixed `+A -D ` stat prefix followed by
 /// the (possibly truncated) path, all in the change type's accent color.
 pub(super) fn git_file_line(entry: &GitFileEntry, inner_width: usize) -> Line<'static> {
-    let color = match entry.change_type {
+    let color = match entry.change {
         GitFileChangeType::Added => Color::Green,
         GitFileChangeType::Deleted => Color::Red,
         GitFileChangeType::Modified => Color::Blue,
     };
-    let stat = format!("+{} -{} ", entry.additions, entry.deletions);
+    let stat = format!("+{} -{} ", entry.added, entry.removed);
     let suffix = if entry.binary { " (binary)" } else { "" };
     let reserved = stat.chars().count() + suffix.chars().count();
     let avail = inner_width.saturating_sub(reserved);

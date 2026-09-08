@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::command::commands::squad::daemon::SquadSupervisor;
 use crate::command::commands::squad::gateway::TaskGateway;
+use crate::command::commands::squad::supervisor::SquadGatewayResolver;
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
 use crate::data::fs::task_store::{RunStatus, Task};
@@ -115,7 +115,7 @@ impl SquadIndicatorPoller {
 /// `Env` is re-read every time so a key minted mid-session (published into
 /// the process environment by the supervisor) is picked up without a restart.
 async fn probe_once() -> SquadIndicator {
-    let supervisor = match SquadSupervisor::from_env(&Env::from_process()) {
+    let supervisor = match SquadGatewayResolver::from_env(&Env::from_process()) {
         Ok(supervisor) => supervisor,
         Err(_) => return SquadIndicator::Unreachable,
     };

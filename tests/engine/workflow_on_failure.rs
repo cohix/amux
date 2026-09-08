@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use awman::data::session::Session;
 use awman::data::session::{SessionOpenOptions, StaticGitRootResolver};
 use awman::data::workflow_definition::{
     RemediationConfig, SetupStep, TeardownStep, Workflow, WorkflowStep,
@@ -13,14 +14,12 @@ use awman::data::workflow_definition::{
 use awman::data::workflow_state::PhaseStepStatus;
 use awman::engine::agent_runtime::background::{AgentExec, ExecOutput};
 use awman::engine::error::EngineError;
-use awman::engine::overlay::OverlayEngine;
 use awman::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, WorkflowOutcome, WorkflowStepStatus,
     YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use awman::engine::workflow::{Frontend, WorkflowEngine};
-use awman::{data::session::Session, engine::git::GitEngine};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -193,17 +192,12 @@ fn make_engine(
     factory: FinishedFactory,
     frontend: RecordingFrontend,
 ) -> WorkflowEngine {
-    let overlay = OverlayEngine::with_auth_resolver(
-        awman::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-    );
     WorkflowEngine::new(
         session,
         minimal_workflow(),
         None,
         Box::new(frontend),
         Box::new(factory),
-        Arc::new(GitEngine::new()),
-        Arc::new(overlay),
     )
     .unwrap()
 }
@@ -702,17 +696,12 @@ command = "cargo test"
         let session = make_session(&tmp);
         let (frontend, _msgs) = RecordingFrontend::new();
         let factory = FinishedFactory::always_success();
-        let overlay = OverlayEngine::with_auth_resolver(
-            awman::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             wf.clone(),
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 

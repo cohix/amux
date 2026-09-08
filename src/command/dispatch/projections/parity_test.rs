@@ -270,9 +270,12 @@ fn clap_and_raw_args_agree_for_every_command() {
                 a.name, path, c, r, argv
             );
 
-            // A path-typed positional must also be reachable via flag_path with
-            // the same value clap parsed (Dispatch's flag_path-then-argument
-            // fallback, used by `exec workflow`).
+            // A path-typed positional must also be reachable via flag_path
+            // with the same value clap parsed. Dispatch itself now reads
+            // positionals only through `ResolvedArgs` (WI 0113 F-10), but the
+            // two readings must not disagree: the CLI's clap matches expose a
+            // positional under both accessors, and the raw-args projection has
+            // to match that.
             if matches!(a.kind, ArgumentKind::Path | ArgumentKind::OptionalPath) {
                 if let Some(s) = leaf_m.get_one::<String>(a.name) {
                     assert_eq!(
@@ -525,4 +528,355 @@ fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     assert_eq!(with_plan.flag_bool("plan"), Some(true));
     assert_eq!(with_plan.flag_bool("non-interactive"), Some(true));
     assert_eq!(with_plan.flag_bool("yolo"), None);
+}
+
+// ─── WI 0113 F-10: the catalogue owns defaults and implications ─────────────
+//
+// The two regression guards for the root cause F-10 names: six literal
+// defaults restated in `Dispatch::build_command` beside the catalogue's own
+// `FlagDefault`, and three hand-written `if`s restating `implies`, which had
+// no non-test consumer at all. Both sweeps are catalogue-driven, so a flag
+// added tomorrow is covered without touching this file.
+
+use std::sync::Arc;
+
+use crate::command::commands::squad::commands::SquadSubcommand;
+use crate::command::dispatch::catalogue::FlagDefault;
+use crate::command::dispatch::tests::FakeCommandFrontend;
+use crate::command::dispatch::{BuiltCommand, Dispatch, Engines, ResolvedFlags};
+use crate::command::error::CommandError;
+
+/// Every leaf command the catalogue can build, with its canonical path.
+fn buildable_leaves() -> Vec<(Vec<&'static str>, &'static CommandSpec)> {
+    let mut leaves = Vec::new();
+    collect_leaves(CommandCatalogue::get().root(), Vec::new(), &mut leaves);
+    leaves
+}
+
+/// A frontend that supplies nothing at all, so every value must come from the
+/// catalogue.
+fn empty_frontend() -> FakeCommandFrontend {
+    FakeCommandFrontend::new()
+}
+
+/// A frontend carrying a placeholder for every positional argument and every
+/// required flag, so `build_command` gets far enough to construct the command
+/// whatever leaf is under test.
+fn frontend_with_required_input(spec: &'static CommandSpec) -> FakeCommandFrontend {
+    let mut frontend = FakeCommandFrontend::new();
+    for argument in spec.arguments {
+        frontend
+            .args
+            .insert(argument.name.to_string(), "placeholder".to_string());
+    }
+    for flag in spec.flags {
+        if flag.optional {
+            continue;
+        }
+        match flag.kind {
+            FlagKind::Bool => {
+                frontend.bools.insert(flag.long.to_string(), true);
+            }
+            FlagKind::String | FlagKind::OptionalString => {
+                frontend
+                    .strings
+                    .insert(flag.long.to_string(), "placeholder".to_string());
+            }
+            FlagKind::Enum(values) => {
+                frontend
+                    .enums
+                    .insert(flag.long.to_string(), values[0].to_string());
+            }
+            FlagKind::VecString => {
+                frontend
+                    .strings_vec
+                    .insert(flag.long.to_string(), vec!["placeholder".to_string()]);
+            }
+            FlagKind::Path | FlagKind::OptionalPath => {
+                frontend
+                    .paths
+                    .insert(flag.long.to_string(), PathBuf::from("placeholder"));
+            }
+            FlagKind::U16 => {
+                frontend.u16s.insert(flag.long.to_string(), 1);
+            }
+            FlagKind::UsizeAtLeastOne => {
+                frontend.usizes.insert(flag.long.to_string(), 1);
+            }
+        }
+    }
+    frontend
+}
+
+fn dispatch_for(frontend: FakeCommandFrontend) -> Dispatch<FakeCommandFrontend> {
+    let tmp = tempfile::tempdir().expect("temp root");
+    let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
+    let session = crate::data::session::Session::open(
+        tmp.path().to_path_buf(),
+        &resolver,
+        crate::data::session::SessionOpenOptions::default(),
+    )
+    .expect("open test session");
+    Dispatch::new(
+        frontend,
+        Arc::new(tokio::sync::RwLock::new(session)),
+        Engines::for_tests(tmp.path()),
+    )
+}
+
+fn resolve_with(frontend: FakeCommandFrontend, path: &[&str]) -> ResolvedFlags {
+    dispatch_for(frontend)
+        .resolve_flags(path)
+        .unwrap_or_else(|e| panic!("resolve {path:?}: {e}"))
+}
+
+/// Sweep 1 — for every flag in the catalogue that declares a `FlagDefault`,
+/// resolving with nothing supplied yields exactly that default. This is what
+/// the six literals at the old `build_command:406, :557, :691, :716, :944,
+/// :1008` were silently allowed to disagree with.
+#[test]
+fn every_flag_default_is_what_resolution_answers() {
+    for (path, spec) in buildable_leaves() {
+        let flags = resolve_with(empty_frontend(), &path);
+        for flag in spec.flags {
+            let where_ = format!("{} --{}", path.join(" "), flag.long);
+            match flag.default {
+                FlagDefault::None => match flag.kind {
+                    FlagKind::Bool => {
+                        assert!(!flags.bool(flag.long), "{where_} must default false")
+                    }
+                    FlagKind::VecString => {
+                        assert!(
+                            flags.strs(flag.long).is_empty(),
+                            "{where_} must default empty"
+                        )
+                    }
+                    _ => {}
+                },
+                FlagDefault::Bool(expected) => {
+                    assert_eq!(flags.bool(flag.long), expected, "{where_}")
+                }
+                FlagDefault::Str(expected) => {
+                    assert_eq!(flags.str(flag.long), Some(expected), "{where_}")
+                }
+                FlagDefault::U16(expected) => {
+                    assert_eq!(flags.u16(flag.long), Some(expected), "{where_}")
+                }
+                FlagDefault::EmptyVec => {
+                    assert!(flags.strs(flag.long).is_empty(), "{where_}")
+                }
+            }
+        }
+    }
+}
+
+/// Sweep 2 — every `implies` edge in the catalogue is honoured. Before F-10
+/// this relation had no non-test consumer: dispatch re-derived
+/// `json → non-interactive` and `yolo|auto → worktree` by hand, in three
+/// places, for three of the commands that declare them.
+#[test]
+fn every_implies_edge_is_honoured() {
+    let mut edges_seen = 0;
+    for (path, spec) in buildable_leaves() {
+        for flag in spec.flags {
+            if flag.implies.is_empty() {
+                continue;
+            }
+            assert!(
+                matches!(flag.kind, FlagKind::Bool),
+                "{} --{}: only boolean flags may imply another flag",
+                path.join(" "),
+                flag.long
+            );
+            let mut frontend = frontend_with_required_input(spec);
+            frontend.bools.insert(flag.long.to_string(), true);
+            // A flag this one conflicts with must not also be supplied, or
+            // resolution refuses before the implication runs.
+            for conflict in flag.conflicts_with {
+                frontend.bools.remove(*conflict);
+                frontend.strings.remove(*conflict);
+            }
+            let flags = resolve_with(frontend, &path);
+            for target in flag.implies {
+                // The shared flag arrays give `--yolo` to commands with no
+                // `--worktree` to set; there the edge is inert by design.
+                if spec.find_flag(target).is_none() {
+                    continue;
+                }
+                edges_seen += 1;
+                assert!(
+                    flags.bool(target),
+                    "{} --{} must imply --{}",
+                    path.join(" "),
+                    flag.long,
+                    target
+                );
+            }
+        }
+    }
+    assert!(
+        edges_seen >= 3,
+        "the catalogue's json/yolo/auto implications must be exercised, saw {edges_seen}"
+    );
+}
+
+/// Sweep 3 — the non-trivial defaults do not merely resolve correctly, they
+/// reach the constructed command. This is the half that the deleted literals
+/// used to satisfy by restating them.
+///
+/// The list is checked for completeness against the catalogue below, so a new
+/// non-trivial default cannot be added without an assertion here.
+#[test]
+fn every_non_trivial_default_reaches_the_built_command() {
+    let mut covered: Vec<(Vec<&str>, &str)> = Vec::new();
+    let build = |path: &[&'static str]| -> BuiltCommand {
+        let spec = CommandCatalogue::get().lookup(path).expect("spec");
+        dispatch_for(frontend_with_required_input(spec))
+            .build_command(path)
+            .unwrap_or_else(|e| panic!("build {path:?}: {e}"))
+    };
+
+    match build(&["init"]) {
+        BuiltCommand::Init(cmd) => assert_eq!(cmd.flags().agent, "claude"),
+        _ => panic!("expected Init"),
+    }
+    covered.push((vec!["init"], "agent"));
+
+    match build(&["api", "start"]) {
+        BuiltCommand::ApiServer(cmd) => match cmd.subcommand() {
+            crate::command::commands::api_server::ApiServerSubcommand::Start(flags) => {
+                assert_eq!(flags.port, 9876)
+            }
+            _ => panic!("expected api start"),
+        },
+        _ => panic!("expected ApiServer"),
+    }
+    covered.push((vec!["api", "start"], "port"));
+
+    match build(&["squad", "start"]) {
+        BuiltCommand::Squad(cmd) => match cmd.subcommand() {
+            SquadSubcommand::Start(flags) => assert_eq!(flags.port, 0),
+            _ => panic!("expected squad start"),
+        },
+        _ => panic!("expected Squad"),
+    }
+    covered.push((vec!["squad", "start"], "port"));
+
+    match build(&["squad", "add"]) {
+        BuiltCommand::Squad(cmd) => match cmd.subcommand() {
+            SquadSubcommand::Add(request) => {
+                let prefilled = request.prefilled.as_ref().expect("scripted create");
+                assert_eq!(
+                    prefilled.interval_secs,
+                    6 * 3600,
+                    "--interval defaults to 6h"
+                );
+                assert_eq!(
+                    prefilled.mount_scope,
+                    crate::data::fs::task_store::MountScope::GitRoot,
+                    "--mount-scope defaults to gitroot"
+                );
+            }
+            _ => panic!("expected squad add"),
+        },
+        _ => panic!("expected Squad"),
+    }
+    covered.push((vec!["squad", "add"], "interval"));
+    covered.push((vec!["squad", "add"], "mount-scope"));
+
+    match build(&["new", "workflow"]) {
+        BuiltCommand::New(cmd) => match cmd.subcommand() {
+            crate::command::commands::new::NewSubcommand::Workflow(flags) => {
+                assert_eq!(flags.format, "toml")
+            }
+            _ => panic!("expected new workflow"),
+        },
+        _ => panic!("expected New"),
+    }
+    covered.push((vec!["new", "workflow"], "format"));
+
+    match build(&["remote", "session", "start"]) {
+        BuiltCommand::Remote(cmd) => match cmd.subcommand() {
+            crate::command::commands::remote::RemoteSubcommand::SessionStart(flags) => {
+                assert_eq!(flags.session_type, "local")
+            }
+            _ => panic!("expected remote session start"),
+        },
+        _ => panic!("expected Remote"),
+    }
+    covered.push((vec!["remote", "session", "start"], "type"));
+
+    // Completeness: every non-trivial default in the catalogue is asserted
+    // above. `Bool(false)` and `EmptyVec` are the trivial ones — they equal
+    // the absent-value reading, so sweep 1 alone covers them.
+    let mut expected: Vec<(Vec<&str>, &str)> = Vec::new();
+    for (path, spec) in buildable_leaves() {
+        for flag in spec.flags {
+            if matches!(flag.default, FlagDefault::Str(_) | FlagDefault::U16(_))
+                || matches!(flag.default, FlagDefault::Bool(true))
+            {
+                expected.push((path.clone(), flag.long));
+            }
+        }
+    }
+    expected.sort();
+    covered.sort();
+    assert_eq!(
+        covered, expected,
+        "a non-trivial FlagDefault was added or removed without updating this test"
+    );
+}
+
+/// Sweep 4 — every command leaf in the catalogue actually builds through
+/// `Dispatch`, and every grouping-only spec refuses.
+///
+/// This is the registration guard for `CommandSpec::build`: a leaf that
+/// arrives without a Layer 2 command — the shape of F-01 — lands in
+/// `NOT_RUNNABLE` or fails here. This is the regression guard that would have
+/// caught F-01 when `squad attach` existed in the catalogue but not Dispatch.
+#[test]
+fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
+    /// Grouping parents. Every leaf command is buildable by Dispatch.
+    const NOT_RUNNABLE: &[&[&str]] = &[
+        &[],
+        &["specs"],
+        &["config"],
+        &["exec"],
+        &["api"],
+        &["remote"],
+        &["remote", "exec"],
+        &["remote", "session"],
+        &["new"],
+    ];
+
+    fn walk(
+        spec: &'static CommandSpec,
+        path: Vec<&'static str>,
+        out: &mut Vec<(Vec<&'static str>, &'static CommandSpec)>,
+    ) {
+        out.push((path.clone(), spec));
+        for sub in spec.subcommands {
+            let mut child = path.clone();
+            child.push(sub.name);
+            walk(sub, child, out);
+        }
+    }
+    let mut specs = Vec::new();
+    walk(CommandCatalogue::get().root(), Vec::new(), &mut specs);
+
+    for (path, spec) in specs {
+        let result = dispatch_for(frontend_with_required_input(spec)).build_command(&path);
+        if NOT_RUNNABLE.contains(&path.as_slice()) {
+            assert!(
+                matches!(result, Err(CommandError::UnknownCommand { .. })),
+                "{path:?} is not runnable and must refuse with UnknownCommand"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "{path:?} must be buildable by Dispatch: {}",
+                result.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+        }
+    }
 }

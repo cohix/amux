@@ -923,7 +923,7 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -d '{"subcommand":"chat"}'
 ```
 
-Dispatches a subcommand to the session identified by the `x-awman-session` header. Valid values for `subcommand`: `chat`, `ready`, `exec`, `remote`.
+Dispatches a subcommand to the session identified by the `x-awman-session` header. The API accepts commands enabled for API use, including squad task and daemon-management commands. `squad attach` is intentionally excluded: attaching owns an interactive PTY and must be run from the CLI or TUI.
 
 For `exec`, the `args` array starts with the exec action (`prompt` or `workflow`/`wf`), followed by any further arguments:
 
@@ -1006,6 +1006,11 @@ Returns the current status and metadata for a command:
 | `done` | Completed with exit code 0 |
 | `error` | Completed with a non-zero exit code |
 | `cancelled` | Cancelled before execution (e.g. session kill) |
+
+For `new skill --pull-all`, awman attempts every reachable library even when
+one pull fails. If any library fails, the command is reported with
+`status: "error"` and `exit_code: 1`; successful library pulls are still
+processed and reported in the command log.
 
 **Queue-related response fields** (present when `status = 'queued'`):
 

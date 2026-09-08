@@ -1,92 +1,77 @@
-//! CLI attach entry point for a running squad task.
+//! CLI presentation for the Layer 2 `squad attach` command.
 
-use std::process::ExitCode;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 
-use clap::ArgMatches;
+use tokio_util::sync::CancellationToken;
 
-use crate::command::commands::squad::daemon::SquadSupervisor;
-use crate::command::commands::squad::runtime_guard::SQUAD_SANDBOX_REFUSAL;
-use crate::command::error::CommandError;
-use crate::data::config::env::Env;
-use crate::data::workflow_state::WorkflowState;
-use crate::frontend::attach::{
-    format_candidates, label_with_step_names, list_task_containers, resolve_attach_target,
-    AttachResolution,
+use crate::command::commands::squad::attach::{
+    format_candidates, SquadAttachFrontend, SquadContainer,
 };
-use crate::frontend::cli::{error_exit_code, format_error, CliFrontend, RuntimeContext};
+use crate::command::error::CommandError;
+use crate::engine::agent_runtime::AgentInstance;
+use crate::frontend::cli::CliFrontend;
 
-/// Attach a single CLI terminal to the selected running squad container.
-pub(crate) async fn run_attach(matches: &ArgMatches, ctx: &RuntimeContext) -> ExitCode {
-    let Some(squad) = matches.subcommand_matches("squad") else {
-        return render_error(&CommandError::unknown_command(&["squad", "attach"]));
-    };
-    let Some(attach) = squad.subcommand_matches("attach") else {
-        return render_error(&CommandError::unknown_command(&["squad", "attach"]));
-    };
-    let Some(name) = attach.get_one::<String>("name") else {
-        return render_error(&CommandError::missing_required_argument(
-            &["squad", "attach"],
-            "name",
-        ));
-    };
-
-    if ctx.engines.container_runtime.is_none() {
-        return render_error(&CommandError::Other(
-            SQUAD_SANDBOX_REFUSAL.replace("{runtime}", ctx.engines.runtime.runtime_name()),
-        ));
+impl SquadAttachFrontend for CliFrontend {
+    fn begin_attach(&mut self, _task: &str) -> Result<CancellationToken, CommandError> {
+        let cancel = CancellationToken::new();
+        self.squad_attach_cancel = Some(cancel.clone());
+        self.squad_attach_exit_code.store(0, Ordering::Relaxed);
+        Ok(cancel)
     }
 
-    let mut candidates = match list_task_containers(ctx.engines.runtime.as_ref(), name) {
-        Ok(candidates) => candidates,
-        Err(error) => return render_error(&error),
-    };
-    // Prefix discovery above is authoritative. The daemon merely supplies
-    // workflow-step labels when it happens to be reachable.
-    if let Some(state) = workflow_state_for_labels(name).await {
-        label_with_step_names(&mut candidates, &state);
-    }
-    let requested = attach.get_one::<String>("container").map(String::as_str);
-    let target = match resolve_attach_target(candidates, name, requested) {
-        Ok(AttachResolution::One(container)) => container,
-        Ok(AttachResolution::Ambiguous(candidates)) => {
-            eprintln!(
-                "{}\nspecify one with --container <id>",
-                format_candidates(&candidates)
-            );
-            return ExitCode::from(2);
+    fn ask_pick_candidate(
+        &mut self,
+        candidates: &[SquadContainer],
+    ) -> Result<Option<usize>, CommandError> {
+        if self.non_interactive {
+            return Ok(None);
         }
-        Err(error) => return render_error(&error),
-    };
-
-    let instance = match ctx.engines.runtime.attach(&target.handle) {
-        Ok(instance) => instance,
-        Err(error) => return render_error(&error.into()),
-    };
-    let mut execution =
-        match instance.run_with_frontend(Box::new(CliFrontend::new(matches.clone()))) {
-            Ok(execution) => execution,
-            Err(error) => return render_error(&error.into()),
-        };
-    match execution.wait().await {
-        Ok(info) => ExitCode::from(u8::try_from(info.exit_code).unwrap_or(1)),
-        Err(error) => render_error(&error.into()),
+        let items = format_candidates(candidates);
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        let picked = super::helpers::pick_numbered("attach to which container?", &refs, 1);
+        Ok((1..=candidates.len())
+            .contains(&picked)
+            .then_some(picked - 1))
     }
-}
 
-fn render_error(error: &CommandError) -> ExitCode {
-    eprintln!("{}", format_error(error));
-    ExitCode::from(error_exit_code(error))
-}
+    fn on_slot_attached(
+        &mut self,
+        step: &str,
+        instance: Box<dyn AgentInstance>,
+    ) -> Result<(), CommandError> {
+        let matches = self.matches.clone();
+        let mut execution = instance
+            .run_with_frontend(Box::new(CliFrontend::new(matches.clone())))
+            .map_err(CommandError::from)?;
+        let cancel = self.squad_attach_cancel.clone().unwrap_or_default();
+        let exit_code: Arc<AtomicI32> = self.squad_attach_exit_code.clone();
+        let explicit_target = self
+            .matches
+            .subcommand_matches("squad")
+            .and_then(|squad| squad.subcommand_matches("attach"))
+            .and_then(|attach| attach.get_one::<String>("container"))
+            .is_some();
+        let single_attach = step == "evaluation" || explicit_target;
+        tokio::spawn(async move {
+            let code = execution
+                .wait()
+                .await
+                .map(|info| info.exit_code)
+                .unwrap_or(1);
+            if single_attach || code != 0 {
+                exit_code.store(code, Ordering::Relaxed);
+            }
+            if single_attach {
+                cancel.cancel();
+            }
+        });
+        Ok(())
+    }
 
-/// Fetch step labels only. Every error is deliberately swallowed: attaching
-/// must continue to work while the daemon is stopped or has no workflow.
-async fn workflow_state_for_labels(task: &str) -> Option<WorkflowState> {
-    let supervisor = SquadSupervisor::from_env(&Env::from_process()).ok()?;
-    let gateway = supervisor.gateway_from_meta().ok()??;
-    let response = gateway
-        .core()
-        .get(&["tasks", task, "workflow"])
-        .await
-        .ok()?;
-    serde_json::from_value(response.body).ok()
+    fn on_slot_exited(&mut self, _step: &str) {}
+
+    fn exit_code(&self) -> i32 {
+        self.squad_attach_exit_code.load(Ordering::Relaxed)
+    }
 }

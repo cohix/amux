@@ -16,13 +16,10 @@ use std::sync::Arc;
 use clap::ArgMatches;
 use tokio::sync::RwLock;
 
-use crate::command::commands::squad::daemon::{SquadKeyState, SquadSupervisor};
-use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuiltCommand, Dispatch, Engines};
 use crate::command::error::CommandError;
 use crate::command::CommandOutcome;
-use crate::data::config::env::Env;
 use crate::data::session::Session;
 
 mod command_frontend;
@@ -65,17 +62,6 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         return ExitCode::from(2);
     }
     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-    // ── squad ────────────────────────────────────────────────────────────────
-    // The interactive bare form is routed to the TUI by main.rs. Piped and
-    // explicitly non-interactive invocations report the daemon summary here.
-    if path_strs == ["squad"] {
-        return per_command::squad::run_bare(&matches, &ctx.engines).await;
-    }
-    // Attach is intentionally not a Layer-2 command: it opens a local runtime
-    // session against an existing agent, just like the exec-workflow carve-out.
-    if path_strs == ["squad", "attach"] {
-        return per_command::squad_attach::run_attach(&matches, &ctx).await;
-    }
     if path_strs == ["exec", "workflow"] {
         let build_frontend = CliFrontend::new(matches.clone());
         let json = build_frontend.is_json_mode();
@@ -93,78 +79,24 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         };
     }
 
-    // Under a non-container runtime, every squad entry point must fail fast with
-    // the shared sandbox refusal — the same text attach and Ctrl-A already use
-    // — instead of provisioning a key and hanging ~10s on a daemon child that
-    // will refuse to start (edge-case #1). attach ran its own check above.
-    if matches!(
-        path_strs.as_slice(),
-        [
-            "squad",
-            "add" | "edit" | "list" | "show" | "remove" | "pause" | "resume" | "trigger" | "status"
-        ]
-    ) {
-        if let Err(error) =
-            crate::command::commands::squad::runtime_guard::require_container_tier(&ctx.engines)
-        {
-            return per_command::squad::render_failure(
-                &error,
-                per_command::squad::squad_flag(&matches, "json"),
-            );
-        }
-    }
-
+    // The runtime-tier guard and the squad gateway are catalogue-driven and
+    // resolved by `Dispatch::run_command` (WI 0113 F-04). The CLI names no
+    // squad subcommand of its own.
     let frontend = CliFrontend::new(matches);
     let json = frontend.is_json_mode();
-    let mut dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
-    if matches!(
-        path_strs.as_slice(),
-        [
-            "squad",
-            "add" | "edit" | "list" | "show" | "remove" | "pause" | "resume" | "trigger"
-        ]
-    ) {
-        let supervisor = match SquadSupervisor::from_env(&Env::from_process()) {
-            Ok(supervisor) => supervisor,
-            Err(error) => return per_command::squad::render_failure(&error, json),
-        };
-        let gateway = match supervisor.ensure_running().await {
-            Ok(gateway) => gateway,
-            Err(error) => return per_command::squad::render_failure(&error, json),
-        };
-        // A first run mints the bearer key. Disclose it on stderr — stdout
-        // belongs to `--json` consumers, and this is the only moment the
-        // plaintext exists outside the daemon's hash file. A key we do *not*
-        // hold is reported here too, rather than left to surface as a bare
-        // `HTTP 401` from a request that was never going to be accepted.
-        match supervisor.key_state() {
-            Ok(SquadKeyState::Minted { setup, .. }) => eprintln!("{setup}"),
-            Ok(SquadKeyState::Ready) => {}
-            Ok(SquadKeyState::Missing) => {
-                return per_command::squad::render_failure(&missing_squad_key_error(), json)
-            }
-            Err(error) => return per_command::squad::render_failure(&error, json),
-        }
-        dispatch = dispatch.with_squad_gateway(Arc::new(gateway) as Arc<dyn TaskGateway>);
-    } else if path_strs == ["squad", "status"] {
-        let supervisor = match SquadSupervisor::from_env(&Env::from_process()) {
-            Ok(supervisor) => supervisor,
-            Err(error) => return per_command::squad::render_failure(&error, json),
-        };
-        let gateway = match supervisor.gateway_from_meta() {
-            Ok(gateway) => gateway,
-            Err(error) => return per_command::squad::render_failure(&error, json),
-        };
-        if let Some(gateway) = gateway {
-            dispatch = dispatch.with_squad_gateway(Arc::new(gateway) as Arc<dyn TaskGateway>);
-        }
-    }
+    let dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
     match dispatch.run_command(&path_strs).await {
         Ok(outcome) => render_outcome(&outcome, json),
-        Err(err) if path_strs.first() == Some(&"squad") => {
-            per_command::squad::render_failure(&err, json)
-        }
-        Err(err) => render_error(&err),
+        Err(err) => render_error_for_mode(&err, json),
+    }
+}
+
+fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
+    if json {
+        println!("{}", serde_json::json!({ "error": format_error(error) }));
+        ExitCode::from(error_exit_code(error))
+    } else {
+        render_error(error)
     }
 }
 
@@ -372,6 +304,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::Io { path, source } => {
                 format!("io error at {}: {source}", path.display())
             }
+            crate::engine::error::EngineError::SquadRuntimeUnsupported { .. }
+            | crate::engine::error::EngineError::SquadDaemonStartup(_)
+            | crate::engine::error::EngineError::SquadDaemonConflict(_)
+            | crate::engine::error::EngineError::SquadDaemonUnreachable(_) => format!("{e}"),
             crate::engine::error::EngineError::Git(msg) => {
                 format!("git operation failed: {msg}")
             }
@@ -414,6 +350,9 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
         }
+        // The squad missing-key answer authors its own full text, including
+        // the variable to set and the command to mint a new key.
+        CommandError::SquadKeyMissing => err.to_string(),
         // Session-creation validation errors (surfaced by multi-session
         // frontends); their Display text is already user-appropriate.
         CommandError::SessionInvalidType { .. }
@@ -444,13 +383,7 @@ fn render_outcome(outcome: &CommandOutcome, json: bool) -> ExitCode {
 /// when one upstream is gone. Their aggregate status has to reach scripts and
 /// CI as a non-zero exit code even though the command itself returned `Ok`.
 fn outcome_exit_code(outcome: &CommandOutcome) -> u8 {
-    let failed = match outcome {
-        CommandOutcome::New(crate::command::commands::new::NewOutcome::Skill(skill)) => {
-            skill.libraries.iter().any(|lib| lib.error.is_some())
-        }
-        _ => false,
-    };
-    u8::from(failed)
+    u8::try_from(outcome.exit_code()).unwrap_or(1)
 }
 
 /// Render a [`CommandError`] to stderr and return the corresponding
@@ -525,26 +458,9 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
+        CommandError::SquadKeyMissing => 1,
         CommandError::Other(_) => 1,
     }
-}
-
-/// The CLI's answer to a squad daemon this shell holds no key for.
-///
-/// Reported *before* the request rather than after it, because the request's
-/// own answer is a bare `HTTP 401: API key required`, which names neither the
-/// variable to set nor the fact that the key can no longer be read back — it
-/// was shown once and is stored only as a hash.
-fn missing_squad_key_error() -> CommandError {
-    CommandError::Other(format!(
-        "squad requires a bearer key and none is set in this shell.\n\n\
-         The key is shown only once, when it is minted, and only its hash is \
-         stored — so it cannot be read back. Set {} if you saved it, or mint a \
-         new one with:\n    awman squad start --refresh-key\n\
-         which invalidates the previous key, so any shell still exporting it \
-         must be updated too.",
-        crate::data::config::env::AWMAN_SQUAD_KEY
-    ))
 }
 
 #[cfg(test)]
@@ -737,25 +653,20 @@ mod tests {
     }
 
     // ─── TTY detection ────────────────────────────────────────────────────────
-    // These tests exercise the output.rs TTY-detection functions to confirm
-    // they don't panic and return consistent bool values. In CI, both stdin
-    // and stderr are non-TTY, so both return false. The behavior is documented
-    // rather than asserted to avoid fragility when running locally.
+    // These tests exercise the output.rs TTY-detection function to confirm
+    // it doesn't panic and returns a consistent bool value. In CI, stdin is
+    // non-TTY, so it returns false. The behavior is documented rather than
+    // asserted to avoid fragility when running locally.
 
     #[test]
     fn tty_detection_does_not_panic() {
-        let _stderr = crate::frontend::cli::output::stderr_is_tty();
         let _stdin = crate::frontend::cli::output::stdin_is_tty();
-        // No assertion — just verifying the calls don't panic.
+        // No assertion — just verifying the call doesn't panic.
     }
 
     #[test]
-    fn stderr_and_stdin_tty_return_consistent_bools() {
+    fn stdin_tty_returns_consistent_bools() {
         // Calling twice must return the same value (no side effects, no flicker).
-        let a = crate::frontend::cli::output::stderr_is_tty();
-        let b = crate::frontend::cli::output::stderr_is_tty();
-        assert_eq!(a, b, "stderr_is_tty must be idempotent");
-
         let c = crate::frontend::cli::output::stdin_is_tty();
         let d = crate::frontend::cli::output::stdin_is_tty();
         assert_eq!(c, d, "stdin_is_tty must be idempotent");

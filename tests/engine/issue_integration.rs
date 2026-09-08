@@ -2,9 +2,9 @@
 //!
 //! Hermetic — no network, no Docker, no git daemon. Uses in-process logic only.
 
-use awman::data::issue::github::GithubIssueSource;
-use awman::data::issue::{Issue, IssueSource};
 use awman::data::worktree_paths::worktree_branch_name_for_workflow;
+use awman::engine::issue::github::GithubIssueSource;
+use awman::engine::issue::{Issue, IssueSource};
 use std::path::PathBuf;
 
 fn make_issue(source_id: &str, title: &str) -> Issue {

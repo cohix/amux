@@ -608,8 +608,9 @@ guardrails to every run rather than leaving them optional:
 - **A sandbox runtime (`docker-sbx-experimental`) is refused entirely.**
   squad's task-directory mounts, its evaluation-agent handshake, and
   workflow setup/teardown steps all depend on a real container runtime.
-  Every squad entry point — the daemon, `squad add`, the TUI — fails with a
-  clear error naming the configured runtime rather than degrading silently.
+  Every squad command — including daemon lifecycle commands such as `start`,
+  `stop`, and `logs`, task commands, and the TUI — fails with a clear error
+  naming the configured runtime rather than degrading silently.
   Set `runtime` to `docker` or `apple-containers` to use squad.
 
 ---

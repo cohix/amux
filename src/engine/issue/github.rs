@@ -3,7 +3,9 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::data::config::env::Env;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::engine::git::GitEngine;
 
 use super::{Issue, IssueSource, IssueSourceError};
 
@@ -50,16 +52,30 @@ impl IssueSource for GithubIssueSource {
     }
 
     fn fetch_issue(&self, input: &str, git_root: &Path) -> Result<Issue, IssueSourceError> {
-        let input = input.trim();
-        let (owner, repo, number) = parse_input(input, git_root, self.provider_name())?;
+        let env = Env::from_process();
+        fetch_issue_with_dependencies(
+            input,
+            git_root,
+            self.provider_name(),
+            &GitEngine::new(),
+            env.github_token(),
+        )
+    }
 
-        // Try gh CLI first
-        if let Some(issue) = try_gh_cli(&owner, &repo, number, self.provider_name()) {
-            return Ok(issue);
-        }
-
-        // Fall back to REST API
-        fetch_rest_api(&owner, &repo, number, self.provider_name())
+    fn fetch_issue_with_engine(
+        &self,
+        input: &str,
+        git_root: &Path,
+        git_engine: &GitEngine,
+        github_token: Option<&str>,
+    ) -> Result<Issue, IssueSourceError> {
+        fetch_issue_with_dependencies(
+            input,
+            git_root,
+            self.provider_name(),
+            git_engine,
+            github_token,
+        )
     }
 
     fn fetch_issue_with_progress(
@@ -68,28 +84,84 @@ impl IssueSource for GithubIssueSource {
         git_root: &Path,
         sink: &mut dyn UserMessageSink,
     ) -> Result<Issue, IssueSourceError> {
-        let input = input.trim();
-        let (owner, repo, number) = parse_input(input, git_root, self.provider_name())?;
-
-        sink.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "running: gh issue view {number} --repo {owner}/{repo} --json number,title,body,url"
-            ),
-        });
-
-        if let Some(issue) = try_gh_cli(&owner, &repo, number, self.provider_name()) {
-            return Ok(issue);
-        }
-
-        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
-        sink.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("gh CLI unavailable, falling back to REST API: GET {api_url}"),
-        });
-
-        fetch_rest_api(&owner, &repo, number, self.provider_name())
+        let env = Env::from_process();
+        fetch_issue_with_progress_dependencies(
+            input,
+            git_root,
+            self.provider_name(),
+            sink,
+            &GitEngine::new(),
+            env.github_token(),
+        )
     }
+
+    fn fetch_issue_with_engine_progress(
+        &self,
+        input: &str,
+        git_root: &Path,
+        sink: &mut dyn UserMessageSink,
+        git_engine: &GitEngine,
+        github_token: Option<&str>,
+    ) -> Result<Issue, IssueSourceError> {
+        fetch_issue_with_progress_dependencies(
+            input,
+            git_root,
+            self.provider_name(),
+            sink,
+            git_engine,
+            github_token,
+        )
+    }
+}
+
+fn fetch_issue_with_dependencies(
+    input: &str,
+    git_root: &Path,
+    provider: &str,
+    git_engine: &GitEngine,
+    github_token: Option<&str>,
+) -> Result<Issue, IssueSourceError> {
+    let input = input.trim();
+    let (owner, repo, number) = parse_input(input, git_root, provider, git_engine)?;
+
+    // Try gh CLI first
+    if let Some(issue) = try_gh_cli(&owner, &repo, number, provider) {
+        return Ok(issue);
+    }
+
+    // Fall back to REST API
+    fetch_rest_api_with_token(&owner, &repo, number, provider, github_token)
+}
+
+fn fetch_issue_with_progress_dependencies(
+    input: &str,
+    git_root: &Path,
+    provider: &str,
+    sink: &mut dyn UserMessageSink,
+    git_engine: &GitEngine,
+    github_token: Option<&str>,
+) -> Result<Issue, IssueSourceError> {
+    let input = input.trim();
+    let (owner, repo, number) = parse_input(input, git_root, provider, git_engine)?;
+
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!(
+            "running: gh issue view {number} --repo {owner}/{repo} --json number,title,body,url"
+        ),
+    });
+
+    if let Some(issue) = try_gh_cli(&owner, &repo, number, provider) {
+        return Ok(issue);
+    }
+
+    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("gh CLI unavailable, falling back to REST API: GET {api_url}"),
+    });
+
+    fetch_rest_api_with_token(&owner, &repo, number, provider, github_token)
 }
 
 /// Parse user input into (owner, repo, number).
@@ -97,6 +169,7 @@ fn parse_input(
     input: &str,
     git_root: &Path,
     provider: &str,
+    git_engine: &GitEngine,
 ) -> Result<(String, String, u32), IssueSourceError> {
     // Bare integer — resolve from git remote
     if input.chars().all(|c| c.is_ascii_digit()) {
@@ -107,7 +180,7 @@ fn parse_input(
                 input: input.to_string(),
                 hint: "could not parse as issue number".to_string(),
             })?;
-        let (owner, repo) = detect_github_remote(git_root, provider)?;
+        let (owner, repo) = detect_github_remote(git_root, provider, git_engine)?;
         return Ok((owner, repo, number));
     }
 
@@ -187,24 +260,13 @@ fn parse_github_url(url: &str, provider: &str) -> Result<(String, String, u32), 
 fn detect_github_remote(
     git_root: &Path,
     provider: &str,
+    git_engine: &GitEngine,
 ) -> Result<(String, String), IssueSourceError> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(git_root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => {
-            return Err(IssueSourceError::NoRemoteDetected {
-                provider: provider.to_string(),
-            });
+    let url = git_engine.remote_url(git_root, "origin").map_err(|_| {
+        IssueSourceError::NoRemoteDetected {
+            provider: provider.to_string(),
         }
-    };
-
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    })?;
     parse_owner_repo_from_remote(&url).ok_or_else(|| IssueSourceError::NoRemoteDetected {
         provider: provider.to_string(),
     })
@@ -296,24 +358,43 @@ pub(crate) fn try_gh_cli_with_cmd(
     })
 }
 
-/// Fetch via GitHub REST API.
-fn fetch_rest_api(
+fn fetch_rest_api_with_token(
     owner: &str,
     repo: &str,
     number: u32,
     provider: &str,
+    github_token: Option<&str>,
 ) -> Result<Issue, IssueSourceError> {
-    fetch_rest_api_with_base("https://api.github.com", owner, repo, number, provider)
+    fetch_rest_api_with_base_and_token(
+        "https://api.github.com",
+        owner,
+        repo,
+        number,
+        provider,
+        github_token,
+    )
 }
 
 /// Inner implementation for `fetch_rest_api`, parameterised on the API base URL.
 /// Exposed as `pub(crate)` so tests can inject a wiremock server URL.
+#[cfg(test)]
 pub(crate) fn fetch_rest_api_with_base(
     base_url: &str,
     owner: &str,
     repo: &str,
     number: u32,
     provider: &str,
+) -> Result<Issue, IssueSourceError> {
+    fetch_rest_api_with_base_and_token(base_url, owner, repo, number, provider, None)
+}
+
+fn fetch_rest_api_with_base_and_token(
+    base_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u32,
+    provider: &str,
+    github_token: Option<&str>,
 ) -> Result<Issue, IssueSourceError> {
     let url = format!("{base_url}/repos/{owner}/{repo}/issues/{number}");
     let client = reqwest::blocking::Client::builder()
@@ -328,10 +409,8 @@ pub(crate) fn fetch_rest_api_with_base(
 
     let mut request = client.get(&url);
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
+    if let Some(token) = github_token.filter(|token| !token.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
 
     let response = request.send().map_err(|e| IssueSourceError::Network {
@@ -551,7 +630,8 @@ mod tests {
     #[test]
     fn parse_input_short_form() {
         let tmp = tempfile::tempdir().unwrap();
-        let (o, r, n) = parse_input("owner/repo#99", tmp.path(), "GitHub").unwrap();
+        let (o, r, n) =
+            parse_input("owner/repo#99", tmp.path(), "GitHub", &GitEngine::new()).unwrap();
         assert_eq!(o, "owner");
         assert_eq!(r, "repo");
         assert_eq!(n, 99);
@@ -564,6 +644,7 @@ mod tests {
             "https://github.com/my-org/my-repo/issues/123",
             tmp.path(),
             "GitHub",
+            &GitEngine::new(),
         )
         .unwrap();
         assert_eq!(o, "my-org");
@@ -574,7 +655,12 @@ mod tests {
     #[test]
     fn parse_input_non_github_url_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = parse_input("https://gitlab.com/o/r/issues/1", tmp.path(), "GitHub");
+        let result = parse_input(
+            "https://gitlab.com/o/r/issues/1",
+            tmp.path(),
+            "GitHub",
+            &GitEngine::new(),
+        );
         assert!(result.is_err());
     }
 
@@ -649,9 +735,9 @@ mod tests {
 
     #[test]
     fn detect_github_remote_fails_for_no_remote() {
-        // A temp dir that is not a git repo — git remote get-url will fail.
+        // A temp dir that is not a git repo — the remote lookup will fail.
         let tmp = tempfile::tempdir().unwrap();
-        let result = detect_github_remote(tmp.path(), "GitHub");
+        let result = detect_github_remote(tmp.path(), "GitHub", &GitEngine::new());
         match result {
             Err(IssueSourceError::NoRemoteDetected { provider }) => {
                 assert_eq!(provider, "GitHub");

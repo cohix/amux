@@ -108,7 +108,8 @@ impl AgentEngine {
     /// exist, no `report_step_status` calls fire.
     ///
     /// `image_exists` is injected so callers in tests can avoid shelling out
-    /// to Docker. Production callers pass `image_exists_locally`.
+    /// to Docker. Production callers pass a closure over the session's
+    /// `ContainerRuntime::image_exists`.
     pub async fn ensure_available(
         &self,
         session: &Session,
@@ -901,19 +902,6 @@ fn plant_agents_md(host_dir: &std::path::Path, prompt_text: &str) {
              agent will not be automatically notified about the context directory"
         );
     }
-}
-
-/// Best-effort check whether a Docker image tag exists locally.
-/// Returns `false` quietly when `docker` is missing.
-pub(crate) fn image_exists_locally(tag: &str) -> bool {
-    use std::process::Command;
-    Command::new("docker")
-        .args(["image", "inspect", tag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

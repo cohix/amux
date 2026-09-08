@@ -819,18 +819,17 @@ fn set_squad_tasks(app: &mut App, names: &[&str]) {
 /// fast-path deterministically, with no filesystem or process side effects —
 /// mirroring `tests/squad_sandbox_refusal.rs`'s `FakeSandboxRuntime` approach.
 fn make_app_no_container_runtime() -> App {
-    let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
     let catalogue = CommandCatalogue::get();
     let mut engines = make_engines();
     engines.container_runtime = None;
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let tab = Tab::new(make_session());
     App::new(
         catalogue,
         engines,
         session_manager,
         tab,
-        rt.handle().clone(),
+        super::test_runtime_handle(),
     )
 }
 
@@ -838,7 +837,11 @@ fn make_app_no_container_runtime() -> App {
 /// for Ctrl-A/Ctrl-D navigation away from the squad tab to be observable.
 fn squad_list_app() -> App {
     let mut app = make_app();
-    app.add_tab(make_session());
+    app.add_tab(
+        make_session().working_dir().to_path_buf(),
+        SessionOpenOptions::default(),
+    )
+    .unwrap();
     push_squad_tab(&mut app);
     app
 }
@@ -888,7 +891,11 @@ fn ctrl_s_in_new_tab_dialog_focuses_existing_squad_tab_and_closes_dialog() {
 #[test]
 fn ctrl_a_without_dialog_switches_to_previous_tab_and_does_not_open_squad() {
     let mut app = make_app(); // tab 0
-    app.add_tab(make_session()); // tab 1
+    app.add_tab(
+        make_session().working_dir().to_path_buf(),
+        SessionOpenOptions::default(),
+    )
+    .unwrap(); // tab 1
     let squad_idx = push_squad_tab(&mut app); // tab 2 == squad, active_tab == squad_idx
     app.active_tab = 1; // sit on the middle (normal) tab
     press_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
@@ -906,7 +913,11 @@ fn ctrl_a_without_dialog_switches_to_previous_tab_and_does_not_open_squad() {
 #[test]
 fn ctrl_s_with_new_tab_dialog_open_opens_squad_and_does_not_switch_tabs() {
     let mut app = make_app(); // tab 0
-    app.add_tab(make_session()); // tab 1
+    app.add_tab(
+        make_session().working_dir().to_path_buf(),
+        SessionOpenOptions::default(),
+    )
+    .unwrap(); // tab 1
     let squad_idx = push_squad_tab(&mut app); // tab 2 == squad
     app.active_tab = 1; // sit on the middle tab: "previous" (0) != squad (2)
     press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -1436,7 +1447,7 @@ fn ctrl_backslash_ends_a_squad_attach_session_and_returns_to_the_grid() {
 
     let tab = app.active_tab();
     assert!(
-        tab.squad.as_ref().unwrap().attached_task.is_none(),
+        tab.squad.as_ref().unwrap().attached_task().is_none(),
         "the attach session is over"
     );
     assert!(
@@ -1635,9 +1646,9 @@ fn the_progress_modal_survives_until_the_daemon_answers() {
 fn a_failed_daemon_start_is_reported_in_a_modal() {
     let mut app = make_app();
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Err(
+    tx.send(Err(crate::frontend::tui::app::SquadStartError::Other(
         "failed to start the squad daemon: did not become ready within 10 seconds".to_string(),
-    ))
+    )))
     .unwrap();
     app.squad_startup_rx = Some(rx);
     app.active_dialog = Some(Dialog::Loading {
@@ -1677,12 +1688,10 @@ fn unreachable_gateway() -> crate::command::commands::squad::gateway::RemoteTask
 /// a tab. A tab would poll, be refused with 401, and render nothing but that.
 #[test]
 fn a_daemon_with_no_usable_key_raises_the_recovery_instead_of_opening_a_tab() {
-    use crate::command::commands::squad::daemon::SquadKeyState;
-
     let mut app = make_app();
     let tabs_before = app.tabs.len();
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Ok((unreachable_gateway(), SquadKeyState::Missing)))
+    tx.send(Err(crate::frontend::tui::app::SquadStartError::KeyMissing))
         .unwrap();
     app.squad_startup_rx = Some(rx);
     app.active_dialog = Some(Dialog::Loading {
@@ -1751,13 +1760,18 @@ fn a_completed_key_refresh_opens_the_tab_and_displays_the_new_key() {
 
     let mut app = make_app();
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Ok((
-        unreachable_gateway(),
-        SquadKeyState::Minted {
+    tx.send(Ok(crate::frontend::tui::app::SquadStartup {
+        gateway: std::sync::Arc::new(unreachable_gateway()),
+        key_state: SquadKeyState::Minted {
             setup: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
             key: "deadbeef".to_string(),
         },
-    )))
+        key_setup: Some(crate::frontend::tui::app::SquadKeySetup {
+            body: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
+            key: "deadbeef".to_string(),
+            zshrc_snippet: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
+        }),
+    }))
     .unwrap();
     app.squad_startup_rx = Some(rx);
     app.active_dialog = Some(Dialog::Loading {
@@ -1891,7 +1905,11 @@ fn leaving_the_squad_tab_restores_the_command_box_and_returning_refocuses_the_gr
 #[test]
 fn a_normal_to_normal_tab_switch_leaves_focus_alone() {
     let mut app = make_app();
-    app.add_tab(make_session());
+    app.add_tab(
+        make_session().working_dir().to_path_buf(),
+        SessionOpenOptions::default(),
+    )
+    .unwrap();
     app.tick_all_tabs();
     app.focus = Focus::ExecutionWindow;
     press_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
@@ -1907,7 +1925,12 @@ fn a_normal_to_normal_tab_switch_leaves_focus_alone() {
 fn closing_a_tab_that_lands_on_the_squad_tab_focuses_the_grid() {
     let mut app = make_app();
     push_squad_tab(&mut app); // index 1
-    let normal = app.add_tab(make_session()); // index 2
+    let normal = app
+        .add_tab(
+            make_session().working_dir().to_path_buf(),
+            SessionOpenOptions::default(),
+        )
+        .unwrap(); // index 2
     app.active_tab = normal;
     app.focus = Focus::CommandBox;
     app.tick_all_tabs();

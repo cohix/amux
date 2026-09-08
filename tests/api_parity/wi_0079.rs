@@ -64,7 +64,7 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
@@ -1376,7 +1376,7 @@ async fn real_network_local_session_creation_succeeds() {
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });

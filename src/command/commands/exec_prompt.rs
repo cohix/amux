@@ -10,7 +10,7 @@ use crate::command::commands::{
     collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
     warn_legacy_config, Command,
 };
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
@@ -29,7 +29,7 @@ pub struct ExecPromptCommandFlags {
     pub model: Option<String>,
     pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
-    pub issue_source: crate::data::issue::IssueSourceFlags,
+    pub issue_source: crate::engine::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +116,39 @@ impl ExecPromptCommand {
         }
     }
 
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). A
+    /// whitespace-only positional prompt is normalised to `None`; the
+    /// prompt-or-issue requirement is checked at run time, where `--issue`
+    /// can still supply the text.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let prompt = match ctx.args.get("prompt") {
+            Some(prompt) if prompt.trim().is_empty() => None,
+            other => other.map(str::to_string),
+        };
+        Ok(Self::new(
+            ExecPromptCommandFlags {
+                prompt,
+                non_interactive: ctx.flags.bool("non-interactive"),
+                plan: ctx.flags.bool("plan"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+                yolo: ctx.flags.bool("yolo"),
+                auto: ctx.flags.bool("auto"),
+                agent: ctx.flags.string("agent"),
+                model: ctx.flags.string("model"),
+                launch_mode: crate::command::dispatch::parse_launch_mode(
+                    ctx.flags.string("launch-mode"),
+                    &ctx.path(),
+                )?,
+                overlay: ctx.flags.strs("overlay").to_vec(),
+                issue_source: crate::engine::issue::IssueSourceFlags {
+                    issue: ctx.flags.string("issue"),
+                },
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        ))
+    }
+
     pub fn flags(&self) -> &ExecPromptCommandFlags {
         &self.flags
     }
@@ -141,7 +174,10 @@ impl Command for ExecPromptCommand {
 
         // Resolve issue if --issue was provided.
         let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            let router = crate::data::issue::router::IssueSourceRouter::default();
+            let router = crate::engine::issue::router::IssueSourceRouter::new(
+                std::sync::Arc::clone(&self.engines.git_engine),
+                session.env(),
+            );
             match router.fetch_issue_with_progress(issue_ref, session.git_root(), &mut *frontend) {
                 Ok((issue, source)) => {
                     let md = source.format_as_markdown(&issue);
@@ -483,7 +519,7 @@ mod tests {
     #[test]
     fn build_prompt_issue_with_empty_body_uses_title_only_markdown() {
         // format_as_markdown with empty body produces "# Title Only".
-        use crate::data::issue::{Issue, IssueSource, IssueSourceError};
+        use crate::engine::issue::{Issue, IssueSource, IssueSourceError};
         use std::path::Path;
 
         struct FakeSource;

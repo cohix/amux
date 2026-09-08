@@ -153,8 +153,8 @@ impl AgentExecution {
         }
     }
 
-    /// Construct a pre-finished execution (used by the inert backend below
-    /// and by tests).
+    /// Construct a pre-finished execution. Test-only.
+    #[cfg(test)]
     pub(crate) fn finished(handle: AgentHandle, info: AgentExitInfo) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(4);
         Self {

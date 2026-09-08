@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
@@ -204,6 +204,18 @@ impl CleanCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10).
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            CleanFlags {
+                yes: ctx.flags.bool("yes"),
+                dry_run: ctx.flags.bool("dry-run"),
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        ))
     }
 
     pub fn flags(&self) -> &CleanFlags {
@@ -700,12 +712,6 @@ mod tests {
                 confirm_yes: false,
                 ..Self::yes()
             }
-        }
-        fn warns_count(&self) -> usize {
-            self.messages
-                .iter()
-                .filter(|m| m.level == MessageLevel::Warning)
-                .count()
         }
         fn has_message_containing(&self, s: &str) -> bool {
             self.messages.iter().any(|m| m.text.contains(s))

@@ -10,7 +10,7 @@ use crate::command::commands::skill_library::{
     pull_all_libraries, pull_library, resolve_pull_target, PullOutcome,
 };
 use crate::command::commands::{resolve_agent, Command};
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs, SKILL_INTERVIEW_CONTAINER_DIR};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -22,7 +22,7 @@ use crate::engine::container::options::ContainerOption;
 pub struct NewSpecFlags {
     pub interview: bool,
     pub non_interactive: bool,
-    pub issue_source: crate::data::issue::IssueSourceFlags,
+    pub issue_source: crate::engine::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +223,52 @@ impl NewCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The three
+    /// `new` leaves share one entry point, selected by the caller's canonical
+    /// path; `--format` takes its `"toml"` from the catalogue.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "spec" => NewSubcommand::Spec(NewSpecFlags {
+                interview: ctx.flags.bool("interview"),
+                non_interactive: ctx.flags.bool("non-interactive"),
+                issue_source: crate::engine::issue::IssueSourceFlags {
+                    issue: ctx.flags.string("issue"),
+                },
+            }),
+            "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
+                interview: ctx.flags.bool("interview"),
+                non_interactive: ctx.flags.bool("non-interactive"),
+                global: ctx.flags.bool("global"),
+                format: ctx.flags.require_str("format")?,
+            }),
+            "skill" => {
+                let pull = ctx.flags.string("pull");
+                let pull_all = ctx.flags.bool("pull-all");
+                let subdir = ctx.flags.string("subdir");
+                // `--subdir` names a path *inside* a pulled repository, so it
+                // is meaningless without one. The catalogue cannot say
+                // "requires one of two flags", so the check lives here.
+                if subdir.is_some() && pull.is_none() && !pull_all {
+                    return Err(CommandError::InvalidFlagValue {
+                        command: ctx.path().iter().map(|part| (*part).to_string()).collect(),
+                        flag: "subdir".to_string(),
+                        reason: "--subdir requires --pull <repo>".to_string(),
+                    });
+                }
+                NewSubcommand::Skill(NewSkillFlags {
+                    interview: ctx.flags.bool("interview"),
+                    non_interactive: ctx.flags.bool("non-interactive"),
+                    global: ctx.flags.bool("global"),
+                    pull,
+                    pull_all,
+                    subdir,
+                })
+            }
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {
@@ -822,42 +868,9 @@ fn pull_library_outcome(outcome: PullOutcome) -> PullLibraryOutcome {
     }
 }
 
-fn next_work_item_number(dir: &std::path::Path) -> u32 {
-    let mut max = 0u32;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if s.len() >= 5 && s.as_bytes()[4] == b'-' {
-                if let Ok(n) = s[..4].parse::<u32>() {
-                    if n > max {
-                        max = n;
-                    }
-                }
-            }
-        }
-    }
-    max + 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn next_work_item_number_empty_dir_is_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 1);
-    }
-
-    #[test]
-    fn next_work_item_number_finds_max_number() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("0001-first.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0010-tenth.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0005-fifth.md"), "").unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 11);
-    }
 
     struct FakeNewFrontend {
         workflow_name: String,
@@ -1001,35 +1014,7 @@ mod tests {
     }
 
     fn make_engines(root: &std::path::Path) -> Engines {
-        use crate::data::fs::api_paths::ApiPaths;
-        use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::engine::container::ContainerRuntime;
-        use crate::engine::overlay::OverlayEngine;
-        use std::sync::Arc;
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            AuthPathResolver::at_home(root),
-        ));
-        let runtime = Arc::new(ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            AuthPathResolver::at_home(root),
-            ApiPaths::at_root(root),
-        ));
-        Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine: Arc::new(crate::engine::git::GitEngine::new()),
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                root,
-            )),
-        }
+        Engines::for_tests(root)
     }
 
     fn make_session(root: &std::path::Path) -> Session {

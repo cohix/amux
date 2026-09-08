@@ -1,30 +1,38 @@
 //! State owned by the squad HTTP daemon.
+//!
+//! Everything of substance is Layer 2's [`SquadDaemonHandles`]. What this adds
+//! is transport-local: when the listener bound, and where.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
-use tokio::sync::RwLock;
-
-use crate::command::commands::squad::gateway::{LocalTaskGateway, TaskGateway};
-use crate::command::dispatch::Engines;
-use crate::data::fs::TaskStore;
-use crate::data::session::Session;
-use crate::frontend::api::routes::AuthMode;
+use crate::command::commands::squad::daemon_runtime::SquadDaemonHandles;
+use crate::data::session_manager::SessionManager;
 
 /// All daemon-local dependencies presented to the squad router.
 pub struct SquadAppState {
-    pub store: Arc<TaskStore>,
-    pub gateway: Arc<LocalTaskGateway>,
-    pub auth_mode: AuthMode,
-    pub engines: Engines,
-    pub session: Arc<RwLock<Session>>,
+    pub handles: SquadDaemonHandles,
+    pub sessions: std::sync::Arc<SessionManager>,
     pub started_at: Instant,
     /// Filled only after the listener has successfully bound.
     pub bound_addr: Mutex<Option<String>>,
 }
 
 impl SquadAppState {
-    pub fn gateway(&self) -> Arc<dyn TaskGateway> {
-        self.gateway.clone()
+    pub fn new(handles: SquadDaemonHandles) -> Self {
+        Self {
+            sessions: handles.session_manager(),
+            handles,
+            started_at: Instant::now(),
+            bound_addr: Mutex::new(None),
+        }
+    }
+
+    /// The endpoint the listener bound, once it has.
+    pub fn bound_addr(&self) -> Option<String> {
+        self.bound_addr
+            .lock()
+            .expect("squad bound-address mutex poisoned")
+            .clone()
     }
 }

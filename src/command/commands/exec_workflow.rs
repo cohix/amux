@@ -17,7 +17,7 @@ use crate::command::commands::{
     collect_all_overlay_specs, parse_overlay_list, resolve_context_overlays, warn_legacy_config,
     TypedOverlay,
 };
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
@@ -58,7 +58,7 @@ pub struct ExecWorkflowCommandFlags {
     pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
     pub max_concurrent: Option<usize>,
-    pub issue_source: crate::data::issue::IssueSourceFlags,
+    pub issue_source: crate::engine::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
     /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
     pub dynamic: bool,
@@ -346,6 +346,48 @@ impl ExecWorkflowCommand {
             task_workspace: None,
             workflow_state_root: None,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10).
+    ///
+    /// `--yolo` and `--auto` declare `implies: ["worktree"]`, so `worktree`
+    /// arrives already set and no implication is re-derived here. The two
+    /// checks that remain are genuine command-layer policy: the WI-0092
+    /// dynamic/leader relationships, and the positional path that only a
+    /// non-dynamic run requires (the catalogue marks it optional so
+    /// `--dynamic` may omit it).
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let flags = ExecWorkflowCommandFlags {
+            workflow: ctx.args.get("workflow").map(PathBuf::from),
+            work_item: ctx.flags.string("work-item"),
+            non_interactive: ctx.flags.bool("non-interactive"),
+            plan: ctx.flags.bool("plan"),
+            allow_docker: ctx.flags.bool("allow-docker"),
+            worktree: ctx.flags.bool("worktree"),
+            yolo: ctx.flags.bool("yolo"),
+            auto: ctx.flags.bool("auto"),
+            agent: ctx.flags.string("agent"),
+            model: ctx.flags.string("model"),
+            launch_mode: crate::command::dispatch::parse_launch_mode(
+                ctx.flags.string("launch-mode"),
+                &ctx.path(),
+            )?,
+            overlay: ctx.flags.strs("overlay").to_vec(),
+            max_concurrent: ctx.flags.usize("max-concurrent"),
+            issue_source: crate::engine::issue::IssueSourceFlags {
+                issue: ctx.flags.string("issue"),
+            },
+            dynamic: ctx.flags.bool("dynamic"),
+            leader: ctx.flags.string("leader"),
+        };
+        validate_dynamic_flags(&flags)?;
+        if !flags.dynamic && flags.workflow.is_none() {
+            return Err(CommandError::missing_required_argument(
+                &ctx.path(),
+                "workflow",
+            ));
+        }
+        Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone()))
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -1134,7 +1176,10 @@ impl Command for ExecWorkflowCommand {
 
         let work_item_context = if let Some(ref issue_ref) = self.flags.issue_source.issue {
             // --issue: fetch issue and construct work item context from it.
-            let router = crate::data::issue::router::IssueSourceRouter::default();
+            let router = crate::engine::issue::router::IssueSourceRouter::new(
+                std::sync::Arc::clone(&self.engines.git_engine),
+                self.session.env(),
+            );
             match router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, &mut *frontend) {
                 Ok((issue, source)) => {
                     let work_items_dir = self
@@ -1720,8 +1765,6 @@ async fn execute_prepared(
             engine_work_item_context,
             Box::new(proxy),
             Box::new(factory),
-            Arc::clone(&engines.git_engine),
-            Arc::clone(&engines.overlay_engine),
             workflow_state_root.map(Path::to_path_buf),
         )
         .await
@@ -3939,6 +3982,7 @@ pub(crate) struct IssueTempFile {
 }
 
 impl IssueTempFile {
+    #[cfg(test)]
     fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -3971,8 +4015,8 @@ pub(crate) struct IssueOverlayBuild {
 ///
 /// Signature takes `&dyn IssueSource` and `&Issue` — no concrete provider types.
 pub(crate) fn issue_source_overlay(
-    source: &dyn crate::data::issue::IssueSource,
-    issue: &crate::data::issue::Issue,
+    source: &dyn crate::engine::issue::IssueSource,
+    issue: &crate::engine::issue::Issue,
     git_root: &std::path::Path,
     work_items_dir: &std::path::Path,
 ) -> std::io::Result<IssueOverlayBuild> {
@@ -4240,37 +4284,7 @@ prompt = "do something"
     }
 
     fn make_engines() -> Engines {
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-                "/tmp",
-            )),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            Arc::clone(&overlay),
-            Arc::clone(&runtime),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store = {
-            let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                tmp.path(),
-            ))
-        };
-        Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
-        }
+        Engines::for_tests(Path::new("/tmp"))
     }
 
     // ─── Tests ────────────────────────────────────────────────────────────────
@@ -4340,7 +4354,7 @@ prompt = "do something"
             launch_mode: None,
             overlay: vec![],
             max_concurrent: None,
-            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
         };
@@ -4430,7 +4444,7 @@ prompt = "do something"
             launch_mode: None,
             overlay: vec![],
             max_concurrent: None,
-            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
         };
@@ -4457,7 +4471,7 @@ prompt = "do something"
             launch_mode: None,
             overlay: vec![],
             max_concurrent: None,
-            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
         };
@@ -4855,8 +4869,8 @@ prompt = "do something"
 
     // ── issue_source_overlay + IssueTempFile ─────────────────────────────────
 
-    use crate::data::issue::github::GithubIssueSource;
-    use crate::data::issue::Issue;
+    use crate::engine::issue::github::GithubIssueSource;
+    use crate::engine::issue::Issue;
 
     fn make_issue(source_id: &str, title: &str, body: &str) -> Issue {
         Issue {
@@ -4982,7 +4996,7 @@ prompt = "do something"
             launch_mode: None,
             overlay: vec![],
             max_concurrent: None,
-            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
             dynamic,
             leader: leader.map(|s| s.to_string()),
         }

@@ -32,6 +32,9 @@ pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
 /// shell-export snippet; see `awman squad start`.
 pub const AWMAN_SQUAD_KEY: &str = "AWMAN_SQUAD_KEY";
 
+/// `GITHUB_TOKEN` — optional token used by the GitHub issue provider.
+pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
+
 /// `AWMAN_MAX_CONCURRENT_AGENTS` — overrides the max-concurrent-agents cap
 /// for workflow execution.
 pub const AWMAN_MAX_CONCURRENT_AGENTS: &str = "AWMAN_MAX_CONCURRENT_AGENTS";
@@ -126,6 +129,11 @@ impl EnvSnapshot {
         self.get(AWMAN_SQUAD_KEY).filter(|v| !v.is_empty())
     }
 
+    /// `GITHUB_TOKEN` if set and non-empty.
+    pub fn github_token(&self) -> Option<&str> {
+        self.get(GITHUB_TOKEN).filter(|v| !v.is_empty())
+    }
+
     /// `AWMAN_MAX_CONCURRENT_AGENTS` parsed as a `usize`, if set and valid.
     pub fn max_concurrent_agents(&self) -> Option<usize> {
         self.get(AWMAN_MAX_CONCURRENT_AGENTS)?.parse().ok()
@@ -180,6 +188,7 @@ impl Env {
             AWMAN_REMOTE_SESSION,
             AWMAN_API_KEY,
             AWMAN_SQUAD_KEY,
+            GITHUB_TOKEN,
             AWMAN_MAX_CONCURRENT_AGENTS,
             AWMAN_LAUNCH_MODE,
             XDG_CONFIG_HOME,
@@ -222,6 +231,17 @@ mod tests {
     fn xdg_data_home_returns_none_when_empty_string() {
         let snap = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "")]);
         assert!(snap.xdg_data_home().is_none());
+    }
+
+    #[test]
+    fn github_token_returns_only_non_empty_values() {
+        assert_eq!(
+            EnvSnapshot::with_overrides([(GITHUB_TOKEN, "token")]).github_token(),
+            Some("token")
+        );
+        assert!(EnvSnapshot::with_overrides([(GITHUB_TOKEN, "")])
+            .github_token()
+            .is_none());
     }
 
     #[test]

@@ -34,6 +34,19 @@ pub struct Capabilities {
     pub session_label_supported: bool,
 }
 
+impl Capabilities {
+    /// Whether squad can run tasks on this runtime.
+    ///
+    /// squad binds a task's persistent workspace and per-run context
+    /// directories into the leader container and runs workflow setup/teardown
+    /// steps against the host tree, so a runtime that cannot mount arbitrary
+    /// host paths cannot host a task at all. Reading it off the capability
+    /// rather than the concrete tier is what lets Layer 1 assert the same
+    /// admission rule Layer 2 enforces before bootstrap (WI 0113 F-02).
+    pub fn squad_supported(&self) -> bool {
+        self.arbitrary_host_mounts
+    }
+}
 /// How a runtime provides Docker-in-Docker to its agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DindSupport {

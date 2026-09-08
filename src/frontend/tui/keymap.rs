@@ -117,13 +117,13 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
             KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
             KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
             KeyCode::Char('m') if ctx != FocusContext::Dialog => {
-                return Action::CycleContainerWindow
+                return Action::CycleContainerWindow;
             }
             // Ctrl-O (SI, 0x0f) is intercepted in every context — including
             // ContainerMaximized, before the ForwardToPty path below — so the
             // workflow overview is always one keystroke away.
             KeyCode::Char('o') if ctx != FocusContext::Dialog => {
-                return Action::ToggleWorkflowOverview
+                return Action::ToggleWorkflowOverview;
             }
             KeyCode::Char('w') => return Action::WorkflowControl,
             // Ctrl-G (BEL, 0x07) is rarely used by terminal programs, so we

@@ -29,7 +29,8 @@ use crate::command::dispatch::Engines;
 use crate::command::session_create::SessionCreatePlan;
 use crate::data::message::UserMessageSink;
 use crate::data::ready_summary::ReadySummary;
-use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
+use crate::data::session::{Session, SessionOpenOptions, SessionType};
+use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::engine::error::EngineError;
 use crate::engine::ready::frontend::ReadyFrontend;
@@ -90,14 +91,21 @@ pub struct SessionSetup {
     session_id: String,
     plan: SessionCreatePlan,
     engines: Engines,
+    sessions: Arc<SessionManager>,
 }
 
 impl SessionSetup {
-    pub fn new(session_id: String, plan: SessionCreatePlan, engines: Engines) -> Self {
+    pub fn new(
+        session_id: String,
+        plan: SessionCreatePlan,
+        engines: Engines,
+        sessions: Arc<SessionManager>,
+    ) -> Self {
         Self {
             session_id,
             plan,
             engines,
+            sessions,
         }
     }
 
@@ -266,13 +274,12 @@ impl SessionSetup {
             "Opening session"
         );
 
-        let resolver = StaticGitRootResolver::new(&self.plan.resolved_workdir);
-        let session = match Session::open_or_workdir_fallback(
+        let session = match self.sessions.open_or_create_with_key(
+            Some(self.session_id.clone()),
             self.plan.resolved_workdir.clone(),
-            &resolver,
             SessionOpenOptions::default(),
         ) {
-            Ok(s) => Arc::new(RwLock::new(s)),
+            Ok(session) => session,
             Err(e) => {
                 tracing::error!(
                     session_id = %session_id,
@@ -509,7 +516,12 @@ mod tests {
             branch: None,
         };
 
-        let setup = SessionSetup::new("sess-clone-fail".to_string(), plan, test_engines());
+        let setup = SessionSetup::new(
+            "sess-clone-fail".to_string(),
+            plan,
+            test_engines(),
+            Arc::new(SessionManager::in_memory()),
+        );
         let mut observer = RecordingObserver::default();
         setup.run(&mut observer).await;
 

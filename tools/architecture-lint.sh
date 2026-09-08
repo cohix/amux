@@ -128,6 +128,28 @@ check_layer 2 'crate::frontend([^A-Za-z0-9_]|$)' "$SRC/command" "frontend"
 
 # Layer 3: frontend/ can import everything — no check needed.
 
+# Lint-suppression guard (WI 0113 F-12): a crate- or module-level
+# `#![allow(dead_code)]` or `#![allow(unused_imports)]` is where cruft
+# accumulates unseen (see aspec/review-notes/0113-architecture-audit.md,
+# F-12). `src/lib.rs` and `src/data/mod.rs` carried exactly this and hid 29
+# warnings, including an entire never-called sandbox backend surface. Fail
+# if either inner-attribute form reappears anywhere under src/. Item-level
+# `#[allow(dead_code)]` (single `#`, on one fn/field/struct with its own
+# justification) is unaffected.
+allow_matches=$(grep -rnE '^\s*#!\[allow\((dead_code|unused_imports)\)\]' "$SRC" 2>/dev/null || true)
+if [ -n "$allow_matches" ]; then
+    echo ""
+    echo "architecture-lint: crate/module-level #![allow(dead_code|unused_imports)] found:"
+    echo "$allow_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [lint-suppression]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
 # Report results.
 if [ -s "$VIOLATION_FILE" ]; then
     count=$(wc -l < "$VIOLATION_FILE" | tr -d ' ')

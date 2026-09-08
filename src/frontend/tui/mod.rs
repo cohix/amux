@@ -13,8 +13,6 @@ pub fn is_tui_active() -> bool {
     TUI_ACTIVE.load(Ordering::Relaxed)
 }
 
-use tokio::sync::RwLock;
-
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::data::session_manager::SessionManager;
@@ -46,10 +44,6 @@ pub mod text_edit;
 pub mod user_message;
 pub mod workflow_view;
 
-pub use per_command::remote::{
-    RemoteApiWorkflowSource, RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
-};
-
 #[cfg(test)]
 mod tests;
 
@@ -57,17 +51,10 @@ use app::{App, SquadTabStart};
 use dialogs::Dialog;
 use tabs::Tab;
 
-/// What the TUI opens with. `Normal` carries the session `main.rs` already
-/// resolved from the working directory; `Squad` opens the singleton squad tab and
-/// no directory-bound tab at all.
-///
-/// The shape is pinned by the WI 0102 contract (§1). `Normal(Session)` is
-/// intentionally unboxed — the enum is constructed once and consumed
-/// immediately in [`run`], so the size difference between variants never
-/// materialises as a real cost.
-#[allow(clippy::large_enum_variant)]
+/// What the TUI opens with. The normal tab is built from `ctx.session`; squad
+/// opens the singleton squad tab and no directory-bound tab at all.
 pub enum InitialTab {
-    Normal(crate::data::session::Session),
+    Normal,
     Squad,
 }
 
@@ -78,7 +65,7 @@ pub enum InitialTab {
 /// global config names a runtime awman doesn't recognize. In that case the
 /// TUI presents only a fatal modal (Enter quits) — no startup command runs.
 ///
-/// `initial_tab` selects the opening tab: `Normal(session)` is today's
+/// `initial_tab` selects the opening tab: `Normal` uses `ctx.session`,
 /// behaviour, including the `ready` / `status --watch` startup auto-spawn;
 /// `Squad` opens the singleton squad tab (§2.2) with no auto-spawn.
 pub async fn run(
@@ -88,14 +75,18 @@ pub async fn run(
     initial_tab: InitialTab,
 ) -> ExitCode {
     let catalogue = CommandCatalogue::get();
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let runtime_handle = tokio::runtime::Handle::current();
 
     // Build the App and decide whether the normal startup auto-spawn runs — it
     // does only for a directory-bound tab, never for the squad tab.
     let (mut app, run_startup_spawn) = match initial_tab {
-        InitialTab::Normal(session) => {
-            let tab = Tab::new(session);
+        InitialTab::Normal => {
+            let session = ctx.session.read().await.clone();
+            session_manager
+                .create(session.clone())
+                .expect("startup session id must be unique");
+            let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
             let app = App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
             (app, true)
         }
@@ -128,21 +119,21 @@ pub async fn run(
             // accepting it builds the squad tab through the ordinary path.
             Ok(SquadTabStart::KeyMissing) => {
                 let session = ctx.session.read().await.clone();
-                let tab = Tab::new(session);
+                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
                 let mut app =
                     App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
                 app.active_dialog = Some(Dialog::SquadKeyMissing);
                 (app, false)
             }
-            Err(message) => {
+            Err(error) => {
                 // `main.rs` calls `ensure_running` before routing here, so this
                 // should not happen; degrade to a normal tab on the cwd session
                 // and surface the specific error rather than failing to open.
                 let session = ctx.session.read().await.clone();
-                let tab = Tab::new(session);
+                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
                 let mut app =
                     App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
-                app.status_bar.text = message;
+                app.status_bar.text = error.to_string();
                 (app, false)
             }
         },

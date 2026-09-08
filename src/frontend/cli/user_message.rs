@@ -28,6 +28,7 @@ impl CliUserMessageQueue {
         self.pty_active = active;
     }
 
+    #[cfg(test)]
     pub fn pty_active(&self) -> bool {
         self.pty_active
     }

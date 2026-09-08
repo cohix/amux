@@ -19,6 +19,7 @@ pub mod instance;
 pub mod io_bridge;
 pub mod naming;
 pub mod options;
+mod process;
 pub mod runtime;
 pub mod timing;
 

@@ -8,7 +8,6 @@
 //! interactive `sbx run` PTY session is bridged by [`super::io_bridge`] after
 //! its argv is announced on the sink.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -20,9 +19,8 @@ use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentStats, ExecutionBackend,
 };
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentStatus};
-use crate::engine::agent_runtime::ExecOutput;
 use crate::engine::error::EngineError;
-use crate::engine::sandbox::backend::{SandboxBackend, SandboxId};
+use crate::engine::sandbox::backend::SandboxBackend;
 use crate::engine::sandbox::dsbx::auth;
 use crate::engine::sandbox::dsbx::io_bridge;
 use crate::engine::sandbox::dsbx::session_config::DSbxSessionConfig;
@@ -45,61 +43,10 @@ impl DSbxBackend {
 }
 
 impl SandboxBackend for DSbxBackend {
-    fn start_sandbox(&self, opts: &ResolvedSandboxOptions) -> Result<SandboxId, EngineError> {
-        let agent = require_agent(opts)?;
-        let name = resolve_sandbox_name(opts);
-        let kit_dir = kit_dir_for(&agent)?;
-        // Background create writes the per-launch config but cannot inject
-        // credentials (no sink to report through); the interactive launch path
-        // owns all credential registration.
-        DSbxSessionConfig::write_for(opts, &opts.workspace_dir)?;
-        SbxCommand::new(create_argv(&name, &agent, &kit_dir, opts)).run_checked()?;
-        Ok(SandboxId::new(name))
-    }
-
-    fn restart_sandbox(&self, id: &SandboxId) -> Result<(), EngineError> {
-        // `--name` is creation-only; an existing sandbox is run by passing its
-        // name as the positional: `sbx run SANDBOX [-- AGENT_ARGS...]`.
-        SbxCommand::new(["run", id.as_str()]).run_checked()?;
-        Ok(())
-    }
-
-    fn exec_in_sandbox(
-        &self,
-        id: &SandboxId,
-        command: &str,
-        working_dir: &str,
-        env: Option<&HashMap<String, String>>,
-    ) -> Result<ExecOutput, EngineError> {
-        let mut argv = vec!["exec".to_string()];
-        if let Some(env) = env {
-            for (k, v) in env {
-                argv.push("--env".to_string());
-                argv.push(format!("{k}={v}"));
-            }
-        }
-        argv.push(id.0.clone());
-        argv.push("sh".to_string());
-        argv.push("-lc".to_string());
-        argv.push(format!("cd {} && {command}", shell_quote(working_dir)));
-        let out = SbxCommand::new(argv).run_quiet()?;
-        Ok(ExecOutput {
-            stdout: out.stdout,
-            stderr: out.stderr,
-            exit_code: out.exit_code,
-        })
-    }
-
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // `sbx stop` pauses the VM and preserves its persistent volume.
         // Best-effort: a non-zero exit (already stopped) is not an error.
         let _ = SbxCommand::new(["stop", &handle.name]).run_quiet();
-        Ok(())
-    }
-
-    fn remove(&self, id: &SandboxId) -> Result<(), EngineError> {
-        // `sbx rm` deletes the VM and its persistent volume.
-        let _ = SbxCommand::new(["rm", id.as_str()]).run_quiet();
         Ok(())
     }
 
@@ -136,11 +83,6 @@ fn warn(sink: &mut dyn crate::data::message::UserMessageSink, text: String) {
         level: crate::data::message::MessageLevel::Warning,
         text,
     });
-}
-
-/// Single-quote a string for `sh -c`, escaping embedded single quotes.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn require_agent(opts: &ResolvedSandboxOptions) -> Result<String, EngineError> {
@@ -802,12 +744,6 @@ mod tests {
         let name = resolve_sandbox_name(&o);
         assert!(name.starts_with("awman-"));
         assert!(name.ends_with("-gemini"));
-    }
-
-    #[test]
-    fn shell_quote_handles_spaces_and_quotes() {
-        assert_eq!(shell_quote("/work tree/a"), "'/work tree/a'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     // ─── Outside-workspace overlay rejection ───────────────────────────────

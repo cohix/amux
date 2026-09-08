@@ -24,8 +24,7 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
-use crate::command::commands::api_server::ApiServeConfig;
-use crate::command::commands::api_server::ApiServerCommandFrontend;
+use crate::command::commands::api_server::{ApiServerCommandFrontend, ApiServerRuntime};
 use crate::command::commands::auth::AuthCommandFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
@@ -96,6 +95,31 @@ pub struct ApiDispatchFrontend {
 
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for ApiDispatchFrontend {}
+
+impl crate::command::commands::squad::attach::SquadAttachFrontend for ApiDispatchFrontend {
+    fn ask_pick_candidate(
+        &mut self,
+        _candidates: &[crate::command::commands::squad::attach::SquadContainer],
+    ) -> Result<Option<usize>, CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_attached(
+        &mut self,
+        _step: &str,
+        _instance: Box<dyn crate::engine::agent_runtime::AgentInstance>,
+    ) -> Result<(), CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_exited(&mut self, _step: &str) {}
+}
 
 impl ApiDispatchFrontend {
     /// Construct a new frontend from the HTTP request's subcommand + args.
@@ -445,8 +469,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
 }
@@ -454,8 +476,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
 /// Standalone container frontend that emits events to the EventBus.
 struct ApiContainerSink {
     event_bus: EventBusSender,
-    line_buffer_stdout: String,
-    line_buffer_stderr: String,
 }
 
 impl UserMessageSink for ApiContainerSink {
@@ -955,8 +975,6 @@ impl InitFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &InitSummary) {}
@@ -989,8 +1007,6 @@ impl ReadyFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &ReadySummary) {}
@@ -1029,7 +1045,10 @@ impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFronte
 
 #[async_trait]
 impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(&mut self, _config: ApiServeConfig) -> Result<(), CommandError> {
+    async fn serve_until_shutdown(
+        &mut self,
+        _runtime: ApiServerRuntime,
+    ) -> Result<(), CommandError> {
         Err(CommandError::Other(
             "Cannot start a nested API server from within API dispatch".into(),
         ))

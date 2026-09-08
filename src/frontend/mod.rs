@@ -12,7 +12,6 @@
 //! Layer 2.
 
 pub mod api;
-pub mod attach;
 pub mod cli;
 pub mod squad;
 pub mod tui;

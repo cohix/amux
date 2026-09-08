@@ -1,7 +1,7 @@
 //! WI 0101 — squad refuses to run under the sandbox tier, at both daemon
 //! startup and task creation.
 //!
-//! `frontend::squad::serve_with` is the injectable bootstrap seam designed
+//! `SquadDaemonHandles::bootstrap` is the injectable bootstrap seam designed
 //! for exactly this: it calls `require_container_tier` as its very first
 //! action, before any path resolution, database open, or port bind. A fake
 //! `AgentRuntimeEngine` reporting the sandbox tier's name lets this test
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
+use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::commands::squad::gateway::{CreateTask, LocalTaskGateway, TaskGateway};
 use awman::command::dispatch::Engines;
 use awman::data::fs::{
@@ -143,15 +144,16 @@ async fn daemon_startup_under_sandbox_runtime_fails_opens_no_store_binds_no_port
         dangerously_skip_auth: true,
     };
 
-    // `serve_with` reads `AWMAN_CONFIG_HOME`/friends from the real process
+    // The bootstrap reads `AWMAN_CONFIG_HOME`/friends from the real process
     // environment (`Env::from_process()`), so scope it to this isolated root
     // for the duration of the call.
     let _env_guard = ENV_LOCK.lock().await;
     let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
     std::env::set_var("AWMAN_CONFIG_HOME", tmp.path());
 
-    let result =
-        awman::frontend::squad::serve_with(config, engines, Arc::new(NeverCalledEvaluator)).await;
+    let result = SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverCalledEvaluator))
+        .await
+        .map(|_| ());
 
     match previous {
         Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),

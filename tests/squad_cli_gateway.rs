@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
+use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::parsed_input::parse as parse_command_box;
@@ -24,6 +25,7 @@ use awman::command::error::CommandError;
 use awman::command::CommandOutcome;
 use awman::data::config::env::Env;
 use awman::data::fs::daemon_guard::{DaemonGuard, DaemonKind};
+use awman::data::fs::daemon_process::{DaemonProcess, ServerMeta};
 use awman::data::fs::task_store::{MountScope, Run, RunStatus, Task, TaskStatus};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
 use awman::data::session::Session;
@@ -508,7 +510,8 @@ async fn cli_dispatch_succeeds_with_an_empty_home_and_never_reads_awman_db() {
 
 /// `squad status` overlays live scheduler counts from the injected gateway with
 /// exactly one `status()` call (§9.4). A stopped daemon (no gateway injected)
-/// falls back to the pidfile-only answer and makes no call — see `cli::run`.
+/// falls back to the pidfile-only answer and makes no call — that is what
+/// `GatewayNeed::IfRunning` buys.
 #[tokio::test]
 async fn cli_status_uses_exactly_one_gateway_call() {
     let env = helpers::IsolatedEnv::new();
@@ -523,6 +526,110 @@ async fn cli_status_uses_exactly_one_gateway_call() {
     .await
     .expect("status command must succeed");
     assert_eq!(gateway.calls(), vec!["status".to_string()]);
+}
+
+/// A `GatewayNeed::Running` command against a daemon this shell holds no key
+/// for is refused by `Dispatch` before the request, with the typed answer —
+/// not left to surface as a bare `HTTP 401` from a request that was never
+/// going to be accepted (WI 0113 F-04).
+///
+/// The daemon is *represented*, not started: a pidfile naming this live test
+/// process plus an endpoint sidecar is exactly what `SquadSupervisor` reads to
+/// decide a daemon is already running, so the supervisor takes its
+/// already-running branch and never spawns anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_running_need_with_no_key_in_this_shell_is_refused_before_the_request() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().expect("temporary home");
+    let squad_root = home.path().join("squad");
+    std::fs::create_dir_all(&squad_root).expect("squad root");
+
+    let restore = ScopedProcessEnv::set(&[
+        ("HOME", home.path().to_str().unwrap()),
+        (
+            "AWMAN_CONFIG_HOME",
+            home.path().join("config").to_str().unwrap(),
+        ),
+        ("AWMAN_API_ROOT", home.path().join("api").to_str().unwrap()),
+        ("AWMAN_SQUAD_ROOT", squad_root.to_str().unwrap()),
+        // An empty key is treated as unset, which is the state under test.
+        ("AWMAN_SQUAD_KEY", ""),
+    ]);
+
+    // A live process whose name contains "awman" — `check_already_running`
+    // rejects a pidfile naming anything else, and the test binary is not it.
+    let holder = FakeAwmanProcess::spawn();
+    let paths = SquadPaths::from_root(&squad_root);
+    let process = DaemonProcess::new(paths.daemon(), "awman-squad-test", "io.awman.squad.test");
+    process.force_write_pidfile(holder.id()).expect("pidfile");
+    process
+        .write_meta(&ServerMeta {
+            port: 1,
+            bind_ip: "127.0.0.1".to_string(),
+            scheme: "http".to_string(),
+            auth_disabled: false,
+        })
+        .expect("endpoint sidecar");
+    // A hash on disk with no plaintext anywhere is precisely `Missing`: the
+    // daemon will check a key this process cannot produce.
+    paths
+        .daemon()
+        .write_key_hash("0000000000000000000000000000000000000000000000000000000000000000")
+        .expect("key hash");
+
+    let env = helpers::IsolatedEnv::new();
+    let session = env.open_session();
+    let matches = cli_matches("squad list");
+    let path = command_path_from_matches(&matches);
+    let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+    let dispatch = Dispatch::new(
+        CliFrontend::new(matches),
+        Arc::new(tokio::sync::RwLock::new(session.clone())),
+        engines_at(env.home_dir.path()),
+    );
+    let error = dispatch
+        .run_command(&path_refs)
+        .await
+        .expect_err("a daemon this shell holds no key for must be refused");
+
+    drop(restore);
+    drop(holder);
+
+    assert!(
+        matches!(error, CommandError::SquadKeyMissing),
+        "the refusal must be typed, not a stringly-typed `Other`: {error:?}"
+    );
+}
+
+/// Scope the real process environment for one test and restore it on drop.
+/// `Dispatch` resolves the squad gateway through `Env::from_process()`, so a
+/// test that exercises that path has to move the process environment.
+struct ScopedProcessEnv(Vec<(&'static str, Option<String>)>);
+
+impl ScopedProcessEnv {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        Self(
+            vars.iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    std::env::set_var(key, value);
+                    (*key, previous)
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for ScopedProcessEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 // ─── Live CLI / daemon JSON integration ─────────────────────────────────────
@@ -601,8 +708,9 @@ async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, Fake
         .acquire(holder.id())
         .expect("test daemon guard must claim squad");
 
+    // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it.
     let handle = tokio::spawn(async move {
-        let _ = awman::frontend::squad::serve_with(
+        let handles = SquadDaemonHandles::bootstrap(
             SquadServeConfig {
                 port: 0,
                 dangerously_skip_auth: true,
@@ -610,7 +718,9 @@ async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, Fake
             engines,
             Arc::new(NeverTriggeredEvaluator),
         )
-        .await;
+        .await
+        .expect("squad daemon bootstrap");
+        let _ = awman::frontend::squad::serve(handles).await;
         let _ = daemon_guard.release();
     });
 

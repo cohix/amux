@@ -163,7 +163,7 @@ fn api_running_blocks_squad_start() {
 
     // With API stopped, squad may now start without contention. (Whether the
     // start additionally binds a port or opens the shared database is
-    // `require_container_tier`/`serve_with`'s contract, covered by
+    // `require_container_tier`/`SquadDaemonHandles::bootstrap`'s contract, covered by
     // `tests/squad_sandbox_refusal.rs` and `tests/squad_daemon_http.rs`.)
     assert!(squad_guard.check().is_ok());
 }
@@ -267,7 +267,7 @@ fn concurrent_start_race_produces_exactly_one_winner_every_time() {
 // claims a pidfile, or binds a port — the properties the work item's
 // "fails without binding a port or opening the database" bullet asks for.
 
-use awman::command::commands::squad::commands::{SquadCommandFrontend, SquadServeConfig};
+use awman::command::commands::squad::commands::SquadCommandFrontend;
 use awman::command::commands::squad::daemon::{
     SquadDaemonCommand, SquadDaemonSubcommand, SquadStartFlags,
 };
@@ -297,7 +297,10 @@ impl UserMessageSink for NeverServesFrontend {
 
 #[async_trait::async_trait]
 impl SquadCommandFrontend for NeverServesFrontend {
-    async fn serve_squad_daemon(&mut self, _config: SquadServeConfig) -> Result<(), CommandError> {
+    async fn serve_squad_daemon(
+        &mut self,
+        _handles: awman::command::commands::squad::daemon_runtime::SquadDaemonHandles,
+    ) -> Result<(), CommandError> {
         panic!("the squad daemon must never start while awman api is running");
     }
 }

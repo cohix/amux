@@ -76,6 +76,15 @@ pub enum DialogRequest {
         body: String,
         keys: Vec<(char, String)>,
     },
+    /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
+    /// Sent, never awaited: a notice has no answer to give back, and the
+    /// command thread must not block on the user dismissing it.
+    KeySetupNotice {
+        title: String,
+        body: String,
+        copy_key: String,
+        copy_zshrc_snippet: String,
+    },
 }
 
 /// A dialog response returned from the event loop to the command thread.
@@ -447,8 +456,7 @@ pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
         dialog_area,
         frame,
     );
-    let text =
-        "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
+    let text = "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,

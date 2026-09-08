@@ -6,11 +6,12 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
 };
 
+use crate::engine::git::{GitDiffSummary, GitFileChangeType, GitFileEntry};
 use crate::frontend::tui::acp_view;
 use crate::frontend::tui::app::{App, Focus};
 use crate::frontend::tui::container_view;
 use crate::frontend::tui::dialogs;
-use crate::frontend::tui::git_sidebar::{self, GitDiffSummary, GitFileChangeType, GitFileEntry};
+use crate::frontend::tui::git_sidebar;
 use crate::frontend::tui::tabs::{
     self, compute_tab_bar_width, phase_label, tab_color, window_border_color, ContainerWindowState,
     ExecutionPhase,

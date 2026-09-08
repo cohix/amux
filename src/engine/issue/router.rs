@@ -1,27 +1,41 @@
 //! `IssueSourceRouter` — selects the correct `IssueSource` at runtime.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::message::UserMessageSink;
+use crate::engine::git::GitEngine;
 
 use super::github::GithubIssueSource;
 use super::{Issue, IssueSource, IssueSourceError};
 
 pub struct IssueSourceRouter {
     sources: Vec<Box<dyn IssueSource>>,
+    git_engine: Arc<GitEngine>,
+    github_token: Option<String>,
 }
 
 impl Default for IssueSourceRouter {
     /// Constructs a router with all built-in providers registered.
     /// GitHub is first (claims bare integers). Future providers are added after.
     fn default() -> Self {
-        Self {
-            sources: vec![Box::new(GithubIssueSource)],
-        }
+        let env = Env::from_process();
+        Self::new(Arc::new(GitEngine::new()), &env)
     }
 }
 
 impl IssueSourceRouter {
+    /// Constructs the provider router with the command/session's immutable
+    /// external-system dependencies.
+    pub fn new(git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
+        Self {
+            sources: vec![Box::new(GithubIssueSource)],
+            git_engine,
+            github_token: env.github_token().map(str::to_owned),
+        }
+    }
+
     /// Returns the first provider whose `can_handle(input)` returns true.
     pub fn route(&self, input: &str) -> Result<&dyn IssueSource, IssueSourceError> {
         for source in &self.sources {
@@ -41,7 +55,12 @@ impl IssueSourceRouter {
         git_root: &Path,
     ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
         let source = self.route(input)?;
-        let issue = source.fetch_issue(input, git_root)?;
+        let issue = source.fetch_issue_with_engine(
+            input,
+            git_root,
+            &self.git_engine,
+            self.github_token.as_deref(),
+        )?;
         Ok((issue, source))
     }
 
@@ -53,7 +72,13 @@ impl IssueSourceRouter {
         sink: &mut dyn UserMessageSink,
     ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
         let source = self.route(input)?;
-        let issue = source.fetch_issue_with_progress(input, git_root, sink)?;
+        let issue = source.fetch_issue_with_engine_progress(
+            input,
+            git_root,
+            sink,
+            &self.git_engine,
+            self.github_token.as_deref(),
+        )?;
         Ok((issue, source))
     }
 }

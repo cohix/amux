@@ -12,9 +12,10 @@ use crate::command::commands::squad::daemon::{
 };
 use crate::command::commands::squad::gateway::{
     CreateTask, DaemonStatus, TaskDetail, TaskGateway, UpdateTask, DEFAULT_RUN_HISTORY_LIMIT,
+    DEFAULT_WORKSPACE_FLAG_VALUE,
 };
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::config::global::GlobalConfig;
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
@@ -43,11 +44,40 @@ pub struct SquadServeConfig {
 
 #[async_trait]
 pub trait SquadCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_squad_daemon(&mut self, _config: SquadServeConfig) -> Result<(), CommandError> {
+    /// The unattended frontends the daemon's evaluator drives leader agents
+    /// and workflows with. Only the host that can actually serve the daemon
+    /// supplies them; every other frontend answers `None` and is refused a
+    /// foreground start.
+    fn squad_run_frontends(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
+    {
+        None
+    }
+
+    /// Serve the bootstrapped daemon until shutdown. Layer 2 has already
+    /// opened the store, reconciled orphaned runs and started the scheduler;
+    /// the frontend builds a router over `_handles`, binds, and serves.
+    async fn serve_squad_daemon(
+        &mut self,
+        _handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
+    ) -> Result<(), CommandError> {
         Err(CommandError::NotAvailableForFrontend {
             command: "squad start".into(),
             frontend: "this".into(),
         })
+    }
+
+    /// Disclose a squad bearer key this process just minted.
+    ///
+    /// Called by `Dispatch` immediately after the gateway is resolved, and
+    /// exactly once per key: the plaintext exists nowhere else, so a frontend
+    /// that drops it has lost it. The default does nothing, which is right
+    /// only for a frontend with no user in front of it (the daemon's own).
+    fn show_key_setup(
+        &mut self,
+        _setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
+    ) {
     }
 
     // ── Task-creation interview (BLOCKER-3, §9.3) ──────────────────────
@@ -316,6 +346,168 @@ impl SquadCommand {
             engines,
         }
     }
+
+    pub fn subcommand(&self) -> &SquadSubcommand {
+        &self.sub
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10).
+    ///
+    /// Every `squad` leaf shares this entry point, selected by the caller's
+    /// canonical path. The gateway is whatever `Dispatch::admit` resolved for
+    /// the spec's `GatewayNeed`; the leaves that declare `GatewayNeed::None`
+    /// simply never read it. `--interval` (`"6h"`), `--mount-scope`
+    /// (`"gitroot"`) and both `--port`s come from the catalogue.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "start" => SquadSubcommand::Start(SquadStartFlags {
+                port: ctx.flags.require_u16("port")?,
+                background: ctx.flags.bool("background"),
+                refresh_key: ctx.flags.bool("refresh-key"),
+                dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
+            }),
+            "stop" => SquadSubcommand::Stop(SquadStopFlags),
+            // Carries the gateway so Layer 2 can overlay live scheduler counts
+            // onto the pidfile-derived liveness (§9.4).
+            "squad" | "status" => SquadSubcommand::Status(SquadStatusFlags),
+            "logs" => SquadSubcommand::Logs(SquadLogsFlags {
+                follow: ctx.flags.bool("follow"),
+            }),
+            "add" => SquadSubcommand::Add(squad_add_request(ctx)?),
+            "edit" => SquadSubcommand::Edit {
+                name: ctx.args.require("name")?,
+                interview: ctx.flags.bool("interview"),
+                update: squad_update(ctx)?,
+            },
+            "list" => SquadSubcommand::List,
+            "show" => SquadSubcommand::Show(ctx.args.require("name")?),
+            "remove" => SquadSubcommand::Remove {
+                name: ctx.args.require("name")?,
+                yes: ctx.flags.bool("yes"),
+            },
+            "pause" => SquadSubcommand::Pause(ctx.args.require("name")?),
+            "resume" => SquadSubcommand::Resume(ctx.args.require("name")?),
+            "trigger" => SquadSubcommand::Trigger(ctx.args.require("name")?),
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.boxed_gateway(), ctx.engines.clone()))
+    }
+}
+
+/// Assemble `squad add`'s request.
+///
+/// Interview mode collects every field in Layer 2 through the frontend trait
+/// (BLOCKER-3, §9.3), so only the intent is recorded here. Non-interview keeps
+/// the flag-driven behaviour: required name and description, catalogue
+/// defaults for the rest.
+fn squad_add_request(ctx: &BuildContext) -> Result<SquadAddRequest, CommandError> {
+    // `-n` never reaches the interview (the catalogue makes the two flags
+    // conflict); it governs the one confirmation scripted creation can still
+    // raise — the parent-directory mount scope.
+    let non_interactive = ctx.flags.bool("non-interactive");
+    if ctx.flags.bool("interview") {
+        return Ok(SquadAddRequest {
+            interview: true,
+            non_interactive,
+            prefilled: None,
+        });
+    }
+    // `--workspace` is the scripted equivalent of the interview's
+    // workspace-choice step: `default` binds the task to its durable per-task
+    // workspace, anything else is a custom folder or repo. `--repo` predates
+    // it and is kept as the same thing said differently, so an existing
+    // scripted `--repo <path>` still means "use that path"; `--workspace` wins
+    // when both are given.
+    let workspace = match ctx.flags.str("workspace") {
+        Some(DEFAULT_WORKSPACE_FLAG_VALUE) => TaskWorkspace::Default,
+        Some(path) => TaskWorkspace::Custom(PathBuf::from(path)),
+        None => match ctx.flags.path("repo") {
+            Some(repo) => TaskWorkspace::Custom(repo),
+            None => TaskWorkspace::Default,
+        },
+    };
+    let mount_scope = match ctx.flags.r#enum("mount-scope") {
+        Some("cwd") => MountScope::Cwd,
+        Some("gitroot") => MountScope::GitRoot,
+        other => unreachable!("catalogue enum validation admitted {other:?}"),
+    };
+    Ok(SquadAddRequest {
+        interview: false,
+        non_interactive,
+        prefilled: Some(CreateTask {
+            name: ctx.flags.require_str("name")?,
+            description: ctx.flags.require_str("description")?,
+            workspace,
+            mount_scope,
+            interval_secs: crate::command::dispatch::parse_squad_interval(
+                &ctx.path(),
+                &ctx.flags.require_str("interval")?,
+            )?,
+            agent: ctx.flags.string("agent"),
+            model: ctx.flags.string("model"),
+            // Raw specs only; syntax is validated once, in the gateway, before
+            // anything is persisted.
+            overlays: ctx.flags.strs("overlay").to_vec(),
+            agents_to_models: crate::command::dispatch::parse_squad_agent_models(
+                &ctx.path(),
+                ctx.flags.strs("agent-models"),
+            )?,
+        }),
+    })
+}
+
+/// Assemble `squad edit`'s update.
+///
+/// In interview mode Layer 2 collects the fields through the frontend,
+/// prefilled from the task as it stands, so nothing is assembled here.
+fn squad_update(ctx: &BuildContext) -> Result<UpdateTask, CommandError> {
+    if ctx.flags.bool("interview") {
+        return Ok(UpdateTask::default());
+    }
+    // A `--clear-*` flag and its value flag conflict in the catalogue, so at
+    // most one of each pair is present and "clear" and "set" can never
+    // disagree here.
+    let agent = match ctx.flags.string("agent") {
+        Some(agent) => Some(Some(agent)),
+        None if ctx.flags.bool("clear-agent") => Some(None),
+        None => None,
+    };
+    let model = match ctx.flags.string("model") {
+        Some(model) => Some(Some(model)),
+        None if ctx.flags.bool("clear-model") => Some(None),
+        None => None,
+    };
+    let overlay_specs = ctx.flags.strs("overlay");
+    let overlays = if !overlay_specs.is_empty() {
+        Some(overlay_specs.to_vec())
+    } else if ctx.flags.bool("clear-overlays") {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    let pool_specs = ctx.flags.strs("agent-models");
+    let agents_to_models = if !pool_specs.is_empty() {
+        Some(crate::command::dispatch::parse_squad_agent_models(
+            &ctx.path(),
+            pool_specs,
+        )?)
+    } else if ctx.flags.bool("clear-agent-models") {
+        Some(Default::default())
+    } else {
+        None
+    };
+    Ok(UpdateTask {
+        description: ctx.flags.string("description"),
+        interval_secs: ctx
+            .flags
+            .str("interval")
+            .map(|raw| crate::command::dispatch::parse_squad_interval(&ctx.path(), raw))
+            .transpose()?,
+        agent,
+        model,
+        overlays,
+        agents_to_models,
+    })
 }
 
 #[async_trait]

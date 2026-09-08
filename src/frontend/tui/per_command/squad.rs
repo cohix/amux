@@ -55,6 +55,22 @@ impl SquadCommandFrontend for TuiCommandFrontend {
         true
     }
 
+    /// The same dismissable notice the squad tab raises on a first start,
+    /// with the `[c]`/`[z]` copy actions the key snippet needs. Sent, not
+    /// asked: a notice has no answer, so blocking the command thread on it
+    /// would only stall the command that minted the key.
+    fn show_key_setup(
+        &mut self,
+        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
+    ) {
+        let _ = self.dialog_tx.send(DialogRequest::KeySetupNotice {
+            title: "squad authentication".to_string(),
+            body: setup.body.clone(),
+            copy_key: setup.key.clone(),
+            copy_zshrc_snippet: setup.zshrc_snippet.clone(),
+        });
+    }
+
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::TextInput {
             title: "Task name".into(),

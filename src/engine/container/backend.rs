@@ -32,7 +32,13 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError>;
 
-    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
+    /// Stop and remove a container this process owns. Every CLI-shaped backend
+    /// spells this the same way, so the default is the implementation; a backend
+    /// whose CLI diverges overrides it.
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        super::process::stop_and_remove(self.cli_binary(), &handle.name);
+        Ok(())
+    }
 
     /// List stopped (exited/dead) awman containers. Backends that cannot
     /// enumerate stopped containers fall back to an empty list.
@@ -48,14 +54,25 @@ pub(super) trait ContainerBackend: Send + Sync {
     }
 
     /// Build the CLI arguments for `docker exec -it` (or equivalent) into a
-    /// running container. Used by TUI re-attach.
+    /// running container. Used by TUI re-attach. Docker and Apple accept the
+    /// identical argv, so the default is the implementation.
     fn exec_args(
         &self,
         container_id: &str,
         working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String>;
+    ) -> Vec<String> {
+        let mut args = vec!["exec".to_string(), "-it".to_string()];
+        args.extend(["-w".to_string(), working_dir.to_string()]);
+        for (k, v) in env_vars {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(container_id.to_string());
+        args.extend(entrypoint.iter().map(|s| s.to_string()));
+        args
+    }
 
     /// Attach to an already-running container this process did not start,
     /// via `<cli> exec` (argv from `exec_args`). The returned instance's
