@@ -114,7 +114,7 @@ All four fields are optional and independent.
 
 ### `agentsToModels`
 
-Restricts the leader to a known, approved set of agents and models instead of everything discovered from `.awman/Dockerfile.<agent>` files. When set and non-empty, this list — not Dockerfile discovery — is what the leader prompt's "Available Agents" section shows, so the leader only schedules steps against agents and models your team has vetted.
+Restricts the leader to a known, approved set of agents and models instead of everything discovered from `.awman/Dockerfile.<agent>` files. When set and non-empty, this list — not Dockerfile discovery — is what the leader prompt's "Available Agents and Models" section shows, so the leader only schedules steps against agents and models your team has vetted.
 
 - Every key must name an agent that has a `.awman/Dockerfile.<agent>` in the project. If any configured agent has no matching Dockerfile, the workflow fails immediately, before any container is spawned:
 

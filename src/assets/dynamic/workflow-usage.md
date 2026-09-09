@@ -14,6 +14,10 @@ Workflows are written in TOML or YAML. The file extension determines the parser:
 
 `.md` and `.json` are not supported.
 
+Values written as `<like this>` in the examples below are placeholders, not valid values.
+Replace `<agent>` and `<model>` with names from the Available Agents listing in your prompt,
+and replace the placeholder shell commands with the project's real ones.
+
 ---
 
 ## Top-Level Fields
@@ -22,8 +26,8 @@ Workflows are written in TOML or YAML. The file extension determines the parser:
 title = "My Workflow"          # Optional. Human-readable name shown in the UI.
 # name = "My Workflow"         # Alias for title.
 
-agent = "claude"               # Optional. Default agent for all steps. Overridden per-step.
-model = "claude-sonnet-4-6"    # Optional. Default model for all steps. Overridden per-step.
+agent = "<agent>"              # Optional. Default agent for all steps. Overridden per-step.
+model = "<model>"              # Optional. Default model for all steps. Overridden per-step.
 
 overlays = ["skill(*)", "env(API_KEY)"]  # Optional. Applied to every agent step.
 
@@ -73,7 +77,7 @@ Run a shell command on the host.
 ```toml
 [[setup]]
 type = "run_shell"
-command = "cargo fetch --locked"
+command = "<the project's dependency-fetch command>"
 # env = { VAR = "value" }   # Optional environment variables for this command.
 # abort_on_failure = true    # Optional. Default: false. Stop workflow on non-zero exit.
 ```
@@ -139,12 +143,12 @@ repeats up to `max_attempts` times.
 ```toml
 [[setup]]
 type = "run_shell"
-command = "cargo build"
+command = "<the project's build command>"
 
 [setup.on_failure]
 prompt = "The build failed. Fix the compilation errors and make it pass."
-# agent = "claude"           # Optional. Defaults to workflow/repo default.
-# model = "claude-opus-4-8"  # Optional.
+# agent = "<agent>"          # Optional. Defaults to workflow/repo default.
+# model = "<model>"          # Optional.
 max_attempts = 2             # Required. Must be >= 1.
 ```
 
@@ -163,8 +167,8 @@ depends_on = ["other-step"]         # Optional. List of step names that must com
                                     # Steps with no depends_on run in parallel with other
                                     # independent steps.
 
-agent = "claude"                    # Optional. Overrides workflow-level agent for this step.
-model = "claude-opus-4-8"           # Optional. Overrides workflow-level model for this step.
+agent = "<agent>"                   # Optional. Overrides workflow-level agent for this step.
+model = "<model>"                   # Optional. Overrides workflow-level model for this step.
 
 overlays = ["skill(*)", "ssh()"]    # Optional. Merged with workflow-level overlays.
 
@@ -188,7 +192,7 @@ When `teardown_on_failure = true` at the top level, these also run if the workfl
 ```toml
 [[teardown]]
 type = "run_shell"
-command = "make test"
+command = "<the project's test command>"
 # env = { CI = "true" }     # Optional.
 # abort_on_failure = true    # Optional. Default: false.
 ```
@@ -243,7 +247,7 @@ Same as setup `on_failure` — remediation agent + retry loop.
 ```toml
 [[teardown]]
 type = "run_shell"
-command = "make test"
+command = "<the project's test command>"
 
 [teardown.on_failure]
 prompt = "Tests are failing. Fix them."
@@ -357,8 +361,8 @@ When designing a workflow for a specific work item, consider:
 5. **Keep prompts specific** — reference the work item number, paste relevant spec sections,
    and give the agent precise success criteria rather than open-ended instructions
 
-6. **Match model to task complexity** — use a capable model (e.g. `claude-opus-4-8`) for
-   the implementation step; a lighter model (e.g. `claude-haiku-4-5`) works well for docs
+6. **Match model to task complexity** — use the most capable model available to you for
+   the implementation and review steps; a lighter one is usually enough for documentation
 
 7. **Teardown for automation** — include `commit_changes`, `push_branch`, and
    `create_pull_request` teardown steps if you want the workflow to produce a PR automatically;
