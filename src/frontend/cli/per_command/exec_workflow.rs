@@ -49,19 +49,13 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
             eprintln!("  [{}] {label}", i + 1);
         }
         eprintln!("  [f] {}", prompt.fresh_label);
+        eprintln!("  [q] Cancel — leave the saved run alone and do nothing");
 
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
-            return Ok(WorkflowResumeDecision::Fresh);
+            return Ok(WorkflowResumeDecision::Cancel);
         }
-        Ok(buf
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n >= 1)
-            .and_then(|n| prompt.start_points.get(n - 1))
-            .map(|p| WorkflowResumeDecision::ResumeFrom(p.name.clone()))
-            .unwrap_or(WorkflowResumeDecision::Fresh))
+        Ok(parse_resume_answer(&buf, prompt))
     }
 
     fn notify_dynamic_workflow_resume_unavailable(
@@ -80,5 +74,83 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
         let mut buf = String::new();
         let _ = std::io::stdin().read_line(&mut buf);
         Ok(())
+    }
+}
+
+/// Map a typed line to a resume decision.
+///
+/// Only an explicit `f` discards the previous run — that deletes progress
+/// which cannot be got back, and in dynamic mode a leader design with it — so
+/// everything ambiguous (an empty line, EOF, a typo, a number nobody offered)
+/// cancels the command instead, leaving the saved run exactly as it was.
+fn parse_resume_answer(input: &str, prompt: &WorkflowResumePrompt) -> WorkflowResumeDecision {
+    let answer = input.trim();
+    if answer.eq_ignore_ascii_case("f") {
+        return WorkflowResumeDecision::Fresh;
+    }
+    answer
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .and_then(|n| prompt.start_points.get(n - 1))
+        .map(|p| WorkflowResumeDecision::ResumeFrom(p.name.clone()))
+        .unwrap_or(WorkflowResumeDecision::Cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::commands::exec_workflow::WorkflowResumeStep;
+
+    fn prompt() -> WorkflowResumePrompt {
+        WorkflowResumePrompt::new(
+            "wf".into(),
+            None,
+            None,
+            false,
+            1,
+            3,
+            vec![
+                WorkflowResumeStep {
+                    name: "b".into(),
+                    role: "the step that failed".into(),
+                },
+                WorkflowResumeStep {
+                    name: "a".into(),
+                    role: "the step before it".into(),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn a_number_picks_that_start_point() {
+        assert_eq!(
+            parse_resume_answer("2\n", &prompt()),
+            WorkflowResumeDecision::ResumeFrom("a".into())
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_f_discards_the_saved_run() {
+        for answer in ["f", "F", " f \n"] {
+            assert_eq!(
+                parse_resume_answer(answer, &prompt()),
+                WorkflowResumeDecision::Fresh,
+                "answer={answer:?}"
+            );
+        }
+    }
+
+    /// Nothing ambiguous may be read as "delete the previous run".
+    #[test]
+    fn anything_unrecognised_cancels_rather_than_discarding() {
+        for answer in ["", "\n", "  ", "0", "9", "yes", "fresh"] {
+            assert_eq!(
+                parse_resume_answer(answer, &prompt()),
+                WorkflowResumeDecision::Cancel,
+                "answer={answer:?}"
+            );
+        }
     }
 }

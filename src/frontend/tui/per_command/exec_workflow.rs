@@ -51,13 +51,15 @@ impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
                     .start_points
                     .get(d as usize - 1)
                     .map(|p| WorkflowResumeDecision::ResumeFrom(p.name.clone()))
-                    // 'f', or a digit past the offered list.
-                    .unwrap_or(WorkflowResumeDecision::Fresh),
+                    // A digit past the offered list: not an answer.
+                    .unwrap_or(WorkflowResumeDecision::Cancel),
+                // 'f' — the only way to discard the previous run.
                 _ => WorkflowResumeDecision::Fresh,
             },
-            // Esc: starting over is the reversible choice — the worktree and
-            // its commits are left untouched until the user says otherwise.
-            _ => WorkflowResumeDecision::Fresh,
+            // Esc cancels the command. Starting over deletes the previous run's
+            // progress (and, in dynamic mode, its leader design), which is far
+            // too destructive to be what dismissing a dialog means.
+            _ => WorkflowResumeDecision::Cancel,
         })
     }
 

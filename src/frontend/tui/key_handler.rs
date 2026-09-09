@@ -937,19 +937,34 @@ pub(super) fn squad_edit_by_name(app: &mut App, name: &str) {
 ///
 /// Returns `true` if the key was consumed; `false` to let it fall through to
 /// the generic dialog handler (for char keys like 'a', Esc, etc.).
+///
+/// Each arrow is gated on the engine's matching `can_*` flag: the board already
+/// renders an unavailable action greyed out with its reason, and sending the
+/// action anyway just makes the engine re-present the same board — a keystroke
+/// that looks broken. An unavailable arrow is swallowed instead, leaving the
+/// board up (WI-0115 §1).
 fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    let can_finish = matches!(
-        &app.active_dialog,
-        Some(Dialog::WorkflowControlBoard(state)) if state.can_finish
+    let Some(Dialog::WorkflowControlBoard(state)) = &app.active_dialog else {
+        return false;
+    };
+    let (can_finish, can_launch_next, can_restart, can_go_back, can_continue) = (
+        state.can_finish,
+        state.can_launch_next,
+        state.can_restart,
+        state.can_go_back,
+        state.can_continue_current,
     );
 
     let response = match key.code {
-        KeyCode::Right => DialogResponse::Char('>'),
-        KeyCode::Down => DialogResponse::Char('v'),
-        KeyCode::Up => DialogResponse::Char('^'),
-        KeyCode::Left => DialogResponse::Char('<'),
+        KeyCode::Right if can_launch_next => DialogResponse::Char('>'),
+        KeyCode::Down if can_continue => DialogResponse::Char('v'),
+        KeyCode::Up if can_restart => DialogResponse::Char('^'),
+        KeyCode::Left if can_go_back => DialogResponse::Char('<'),
+        // An arrow for an action this board does not offer: consume it so it
+        // cannot fall through to the generic handler, and leave the board up.
+        KeyCode::Right | KeyCode::Down | KeyCode::Up | KeyCode::Left => return true,
         // Many terminals cannot distinguish Ctrl+Enter from bare Enter
         // without the kitty keyboard protocol, so accept plain Enter too.
         KeyCode::Enter if can_finish => DialogResponse::Char('f'),

@@ -30,8 +30,8 @@ use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureContext, StepOutcome, WorkflowOutcome,
-    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepFailureContext, StepOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -96,10 +96,16 @@ type StuckFanIn = tokio::sync::mpsc::UnboundedSender<(String, StuckEvent)>;
 
 /// Result of `run_parallel_group`.
 enum GroupOutcome {
-    /// The whole group reached a terminal state. `failed` carries a non-abort
-    /// step failure (name + exit code) for the outer loop to handle via the
-    /// standard failure prompt; `None` when every member succeeded/cancelled.
-    Drained { failed: Option<(String, i32)> },
+    /// The whole group reached a terminal state. `failed` carries every
+    /// non-abort step failure (name + exit code), in the order the containers
+    /// exited, for the outer loop to walk through the failure recovery path;
+    /// empty when every member succeeded/cancelled.
+    ///
+    /// Every failure is carried, not just the first: a step left `Failed` is
+    /// not in `completed_steps`, so the DAG still reports it ready and the next
+    /// iteration would relaunch it — silently, with no recovery board and no
+    /// retry accounting (WI-0115 §1).
+    Drained { failed: Vec<(String, i32)> },
     /// A workflow-level action ended the run (abort_on_failure, WCB abort/pause).
     Ended(WorkflowOutcome),
 }
@@ -490,6 +496,25 @@ impl WorkflowEngine {
             ),
         };
 
+        // Drop step entries the workflow no longer defines. A saved state is
+        // matched to the workflow by hash, and the user may have accepted the
+        // drift prompt above against a file that since lost or renamed a step.
+        // Such an entry can never be launched — `next_ready` reads the DAG, not
+        // `step_states` — but `is_complete()` reads `step_states`, so leaving a
+        // non-terminal orphan behind means the run can never finish: it would
+        // end on "no ready steps remaining" instead. Pruning is safe because
+        // the DAG is the only thing that decides what actually runs.
+        let orphans = state.retain_steps_in(&dag);
+        if !orphans.is_empty() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: format!(
+                    "The saved run has steps this workflow no longer defines: {}. Dropping them.",
+                    orphans.join(", "),
+                ),
+            });
+        }
+
         let interrupted = state.interrupted_running_steps();
         if !interrupted.is_empty() {
             frontend.write_message(crate::data::message::UserMessage {
@@ -610,9 +635,12 @@ impl WorkflowEngine {
                 match self.run_parallel_group(ready).await? {
                     GroupOutcome::Ended(wo) => return Ok(wo),
                     GroupOutcome::Drained { failed } => {
-                        if let Some((name, exit_code)) = failed {
+                        // One board (or one unattended retry) per failed step,
+                        // in exit order. Recovering the first failure must not
+                        // leave its peers to be silently relaunched.
+                        for (name, exit_code) in failed {
                             match self.handle_group_step_failure(&name, exit_code).await? {
-                                IterationOutcome::Continue => continue,
+                                IterationOutcome::Continue => {}
                                 IterationOutcome::Ended(wo) => return Ok(wo),
                             }
                         }
@@ -779,7 +807,7 @@ impl WorkflowEngine {
         }
 
         let total = timing::YOLO_COUNTDOWN_DURATION;
-        let mut failed: Option<(String, i32)> = None;
+        let mut failed: Vec<(String, i32)> = Vec::new();
 
         while !self.active_steps.is_empty() {
             tokio::select! {
@@ -838,7 +866,9 @@ impl WorkflowEngine {
                         }
                         // Non-abort failure: record it, keep draining the rest
                         // of the group, but do NOT launch further queued steps.
-                        failed.get_or_insert((name.clone(), exit_code));
+                        // Every failure is recorded — each one gets its own
+                        // recovery board once the group drains.
+                        failed.push((name.clone(), exit_code));
                     } else if self.active_steps.len() < slot_cap {
                         if let Some(next) = queue.pop_front() {
                             self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
@@ -1523,7 +1553,8 @@ impl WorkflowEngine {
     ) -> Result<YoloTickOutcome, EngineError> {
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let start = Instant::now();
-        self.frontend.yolo_countdown_started(step_name);
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::FailureRetry);
         let outcome = loop {
             let elapsed = start.elapsed();
             let remaining = total.saturating_sub(elapsed);
@@ -2044,7 +2075,8 @@ impl WorkflowEngine {
             step_name,
             timing::YOLO_COUNTDOWN_DURATION.as_secs(),
         ));
-        self.frontend.yolo_countdown_started(step_name);
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::StuckStep);
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let start = std::time::Instant::now();
 
@@ -3521,6 +3553,9 @@ mod tests {
         /// retry countdown to a single tick so unattended tests stay fast;
         /// `Cancel` (the default) is the pre-existing safe answer.
         yolo_tick: YoloTickOutcome,
+        /// Every board the engine raised, shared so a test can read them back
+        /// after the engine has taken ownership of the frontend.
+        boards: Arc<Mutex<Vec<AvailableActions>>>,
     }
 
     impl FakeWorkflowFrontend {
@@ -3532,7 +3567,13 @@ mod tests {
                 confirm_resume_response: true,
                 interactive: true,
                 yolo_tick: YoloTickOutcome::Cancel,
+                boards: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Handle on the boards this frontend will be shown.
+        fn boards(&self) -> Arc<Mutex<Vec<AvailableActions>>> {
+            self.boards.clone()
         }
 
         fn unattended(mut self) -> Self {
@@ -3560,8 +3601,9 @@ mod tests {
         fn show_workflow_control_board(
             &mut self,
             _state: &WorkflowState,
-            _available: &AvailableActions,
+            available: &AvailableActions,
         ) -> Result<NextAction, EngineError> {
+            self.boards.lock().unwrap().push(available.clone());
             let action = self
                 .actions
                 .lock()
@@ -4206,6 +4248,51 @@ mod tests {
         assert!(available.can_restart_current_step);
     }
 
+    /// WI-0115 §1: a step left `Failed` is not in `completed_steps`, so the DAG
+    /// still reports it ready. Recovering only the first failure of a drained
+    /// parallel group would let its peers be relaunched silently — no board, no
+    /// retry accounting, no way for the user to know a second step even failed.
+    #[tokio::test]
+    async fn every_failure_in_a_parallel_group_gets_its_own_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-two-failures"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+        // Both members of the group fail.
+        let factory = FakeAgentExecutionFactory::new([1, 1]);
+        // One decision per failure; the second ends the run so the test does
+        // not depend on what a re-run of the skipped steps would do.
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::RestartCurrentStep, NextAction::Abort]);
+        let boards = frontend.boards();
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let outcome = engine.run_to_completion().await.unwrap();
+        assert_eq!(outcome, WorkflowOutcome::Aborted);
+
+        let boards = boards.lock().unwrap();
+        let failed_on: Vec<&str> = boards
+            .iter()
+            .filter_map(|b| b.step_failure.as_ref())
+            .map(|f| f.step_name.as_str())
+            .collect();
+        assert_eq!(
+            failed_on.len(),
+            2,
+            "one board per failed step, got boards for {failed_on:?}"
+        );
+        let mut named = failed_on.clone();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec!["a", "b"],
+            "each board must name its own failure, not repeat the first"
+        );
+    }
+
     // ── WI-0115 §3: unattended countdown-and-retry ───────────────────────
 
     #[tokio::test]
@@ -4410,6 +4497,66 @@ mod tests {
             engine.state().status_of("b"),
             Some(StepState::Succeeded)
         ));
+    }
+
+    /// WI-0115 §2: a saved state outlives edits to its workflow file. A step
+    /// dropped from the file since the state was written can never run — the
+    /// DAG decides what runs — but it still counts towards `is_complete()`,
+    /// which the load-time reset would have just put back to `Pending`. Left
+    /// in, it strands the run on "no ready steps remaining"; pruned, the run
+    /// finishes.
+    #[tokio::test]
+    async fn resuming_a_state_whose_workflow_dropped_a_step_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+
+        // The workflow as it was: a → b → publish, aborted partway.
+        let before = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("publish", &["b"], None),
+            ],
+        );
+        {
+            let factory = FakeAgentExecutionFactory::new([0, 1]);
+            let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::Abort]);
+            let mut engine = make_engine_with_frontend(&session, before, factory, frontend);
+            assert_eq!(
+                engine.run_to_completion().await.unwrap(),
+                WorkflowOutcome::Aborted
+            );
+        }
+
+        // The workflow as it is now: 'publish' has been deleted. Same title,
+        // so the saved state is still found; the hash differs, and the fake
+        // frontend confirms the drift prompt.
+        let after = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let mut engine = WorkflowEngine::resume(
+            &session,
+            after,
+            None,
+            Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
+            Box::new(FakeAgentExecutionFactory::new([0])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.state().status_of("publish"),
+            None,
+            "a step the workflow no longer defines must be dropped, not reset"
+        );
+
+        assert_eq!(
+            engine.run_to_completion().await.unwrap(),
+            WorkflowOutcome::Completed,
+        );
     }
 
     /// WI 0106 §6a: a squad task bound to its durable workspace has no
@@ -5056,7 +5203,7 @@ mod tests {
                 // Cancel immediately to keep the test fast.
                 Ok(YoloTickOutcome::Cancel)
             }
-            fn yolo_countdown_started(&mut self, _: &str) {
+            fn yolo_countdown_started(&mut self, _: &str, _: CountdownKind) {
                 self.yolo_started.store(true, Ordering::Relaxed);
             }
             fn yolo_countdown_finished(&mut self, _: &str) {

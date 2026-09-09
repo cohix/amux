@@ -201,10 +201,11 @@ impl WorktreeLifecycle {
     /// [`Self::prepare`], with the existing-worktree question already answered.
     ///
     /// A caller that has just asked the user a question which *implies* the
-    /// answer — the dynamic-workflow resume prompt, which only makes sense
-    /// against the worktree that is already there (WI-0115 §2) — passes
-    /// `Some(Resume)` rather than asking a second, near-identical question.
-    /// `None` asks as usual.
+    /// answer — the workflow resume prompt, which only makes sense against the
+    /// worktree that is already there (WI-0115 §2) — passes `Some(Resume)`
+    /// rather than asking a second, near-identical question. It is not only
+    /// redundant: `Recreate` deletes the worktree, and with it the state the
+    /// accepted resume just rewound. `None` asks as usual.
     pub async fn prepare_with_existing(
         &self,
         frontend: &mut dyn WorktreeLifecycleFrontend,

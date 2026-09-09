@@ -7,7 +7,7 @@ use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -108,7 +108,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         Ok(YoloTickOutcome::Continue)
     }
 
-    fn yolo_countdown_started(&mut self, _step_name: &str) {
+    fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {
         // State is set by yolo_countdown_tick; nothing extra needed.
     }
 
@@ -661,18 +661,6 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         );
         (frontend, req_rx, resp_tx)
-    }
-
-    fn dummy_step() -> crate::data::workflow_definition::WorkflowStep {
-        crate::data::workflow_definition::WorkflowStep {
-            name: "test-step".into(),
-            depends_on: vec![],
-            prompt_template: "do the thing".into(),
-            agent: None,
-            model: None,
-            overlays: None,
-            abort_on_failure: false,
-        }
     }
 
     #[test]

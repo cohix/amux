@@ -61,8 +61,8 @@ use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome, WorkflowStepStatus,
-    YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
+    WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -91,6 +91,10 @@ pub struct ApiDispatchFrontend {
     done_emitted: std::sync::atomic::AtomicBool,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
+    /// What the countdown currently being ticked will do when it expires
+    /// (WI-0115 §3). An API consumer reading "auto-advancing" through a
+    /// failure retry would draw the wrong conclusion about its run.
+    countdown_kind: CountdownKind,
 }
 
 #[async_trait::async_trait]
@@ -155,6 +159,7 @@ impl ApiDispatchFrontend {
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             last_sink_message_time: None,
+            countdown_kind: CountdownKind::StuckStep,
         }
     }
 
@@ -649,21 +654,26 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             .map(|t| t.elapsed() >= YOLO_SINK_THROTTLE_INTERVAL)
             .unwrap_or(true);
         if should_emit {
+            let what = match self.countdown_kind {
+                CountdownKind::StuckStep => "auto-advancing",
+                CountdownKind::FailureRetry => "retrying after failure",
+            };
             self.event_bus.emit(EventPayload::StatusMessage {
                 phase: "yolo_countdown".to_string(),
-                message: format!(
-                    "Step '{}': auto-advancing in {}s",
-                    step_name,
-                    remaining.as_secs()
-                ),
+                message: format!("Step '{}': {what} in {}s", step_name, remaining.as_secs()),
             });
             self.last_sink_message_time = Some(std::time::Instant::now());
         }
         Ok(YoloTickOutcome::Continue)
     }
 
+    fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
+        self.countdown_kind = kind;
+    }
+
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
         self.last_sink_message_time = None;
+        self.countdown_kind = CountdownKind::default();
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -1351,6 +1361,67 @@ mod tests {
             }
         }
         count
+    }
+
+    /// Collect the `yolo_countdown` status messages emitted so far.
+    fn countdown_messages(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if let EventPayload::StatusMessage { phase, message } = &evt.payload {
+                if phase == "yolo_countdown" {
+                    out.push(message.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// WI-0115 §3: a failure retry and a stuck-step advance share one reporting
+    /// channel, but they mean opposite things. An API consumer told a failing
+    /// run is "auto-advancing" would conclude the workflow is making progress.
+    #[tokio::test]
+    async fn a_failure_retry_countdown_is_not_reported_as_auto_advancing() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        fe.yolo_countdown_started("build", CountdownKind::FailureRetry);
+        fe.yolo_countdown_tick(
+            "build",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("retrying after failure"),
+            "a retry must say so: {}",
+            messages[0]
+        );
+
+        // And the kind resets, so the next stuck-step countdown reads normally.
+        fe.yolo_countdown_finished("build");
+        fe.yolo_countdown_tick(
+            "test",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("auto-advancing"),
+            "a stuck-step countdown must keep its own wording: {}",
+            messages[0]
+        );
     }
 
     /// Ten rapid ticks must produce exactly one `yolo_countdown` status message

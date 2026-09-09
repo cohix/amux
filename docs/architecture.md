@@ -1011,18 +1011,27 @@ pub trait ContainerExecutionFactory: Send + Sync {
 #### `WorkflowFrontend` trait
 
 ```rust
-pub trait WorkflowFrontend: UserMessageSink + Send + Sync {
-    fn user_choose_next_action(&mut self, state, available) -> Result<NextAction, EngineError>;
+pub trait WorkflowFrontend: UserMessageSink + Send {
+    fn show_workflow_control_board(&mut self, state, available) -> Result<NextAction, EngineError>;
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
-    fn user_choose_after_step_failure(&mut self, step, exit) -> Result<StepFailureChoice, EngineError>;
+    /// Capability, not a question: can a human here be asked what to do when a
+    /// step fails? Decides between the control board and countdown-and-retry.
+    fn supports_interactive_recovery(&self) -> bool { false }
     fn report_step_status(&mut self, step, status: WorkflowStepStatus);
     fn report_step_output(&mut self, step, output: StepOutput);
-    fn report_step_stuck(&mut self, step);
-    fn report_step_unstuck(&mut self, step);
-    fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError>;
+    fn report_container_exited(&mut self, exit_code: i32);
+    fn yolo_countdown_started(&mut self, step_name, kind: CountdownKind);
+    fn yolo_countdown_tick(&mut self, step_name, remaining, total) -> Result<YoloTickOutcome, EngineError>;
+    fn yolo_countdown_finished(&mut self, step_name);
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome);
+    // …plus setup/teardown and parallel-group notifications, all defaulted.
 }
 ```
+
+A failed step is *not* a separate frontend question. The engine asks
+`supports_interactive_recovery()` and then either opens the Workflow Control
+Board with `AvailableActions::step_failure` set, or runs a countdown and one
+automatic retry. The engine never learns which frontend is attached.
 
 #### Stuck detection and yolo countdown
 
@@ -2362,8 +2371,7 @@ Available dialog variants:
 | `MultilineInput { title, prompt, editor }` | Multiline text input; Ctrl+Enter submits |
 | `ListPicker { title, items, selected }` | Arrow-key selection list; Enter selects |
 | `KindSelect { title, options }` | Numbered option select |
-| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc) |
-| `WorkflowStepError(..)` | Step failure prompt: `[r]`/`[1]` retry, `[q]`/`[2]`/Esc pause, `[a]` abort |
+| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc). Also the step-failure surface: a red frame and the failure's detail lines when `failure_lines` is non-empty. Arrows the engine has not enabled are inert |
 | `WorkflowYoloCountdown(..)` | Yolo countdown display; Esc dismisses |
 | `AgentSetup(..)` | Agent build/setup confirmation |
 | `MountScope(..)` | Git root vs CWD mount selection |

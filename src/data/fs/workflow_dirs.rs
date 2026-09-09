@@ -58,8 +58,14 @@ impl WorkflowDirs {
     /// directory, which is keyed by a random session UUID and so is
     /// unreachable from a later run. Saving a copy here — beside the engine's
     /// `WorkflowState` JSON, inside the run's worktree — is what makes a failed
-    /// dynamic run resumable (WI-0115 §2). Both halves are gitignored and both
-    /// die with the worktree.
+    /// dynamic run resumable (WI-0115 §2). Both halves die with the worktree,
+    /// and a run that finishes cleanly deletes both itself.
+    ///
+    /// Note this directory is also where a repo keeps its own committed
+    /// workflow definitions, so these files are not gitignored for free —
+    /// awman writes no ignore rule. They are named `dynamic-NNNN.toml` to stay
+    /// obviously machine-written, and they live inside a worktree that is
+    /// itself transient.
     pub fn dynamic_workflow_path(git_root: &Path, work_item: u32) -> PathBuf {
         Self::repo_dir_for(git_root).join(format!("dynamic-{work_item:04}.toml"))
     }

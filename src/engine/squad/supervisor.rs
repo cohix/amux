@@ -350,11 +350,9 @@ impl SquadSupervisor {
                 ))
             });
         }
-        let binary = resolve_daemon_binary(
-            std::env::current_exe().map_err(|e| {
-                EngineError::SquadDaemonStartup(format!("cannot determine awman binary: {e}"))
-            })?,
-        )?;
+        let binary = resolve_daemon_binary(std::env::current_exe().map_err(|e| {
+            EngineError::SquadDaemonStartup(format!("cannot determine awman binary: {e}"))
+        })?)?;
         self.discard_stale_endpoint()?;
         // TODO(WI 0114 F-29): route through the Layer 1 `DaemonSupervisor`.
         self.process

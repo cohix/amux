@@ -284,14 +284,20 @@ awman exec workflow --dynamic --work-item 42
 │  [2] Resume from 'design' (the step before it)             │
 │  [3] Resume from 'review' (the step after it)              │
 │  [f] Start a fresh dynamic workflow                        │
+│                                                            │
+│  [Esc] cancel                                              │
 ╰────────────────────────────────────────────────────────────╯
 ```
 
-This is the same prompt a plain `exec workflow` shows when it finds saved state — see [Resuming](05-workflows.md#resuming). The three offered start points are named after the real steps in the saved workflow: the one that failed, its predecessor, and its successor. Picking one rewinds the saved state — everything from that step onwards runs again; earlier steps that never succeeded are marked skipped so they do not block their dependents. The only thing dynamic mode adds is that accepting the resume also skips the leader-design pass entirely.
+This is the same prompt a plain `exec workflow` shows when it finds saved state — see [Resuming](05-workflows.md#resuming). The three offered start points are named after the real steps in the saved workflow: the one that failed, its predecessor, and its successor. Picking one rewinds the saved state — everything from that step onwards runs again; earlier steps that never succeeded are marked skipped so they do not block their dependents. The only thing dynamic mode adds is that accepting the resume also skips the leader-design pass entirely, so a resume costs no leader tokens at all.
 
-Choosing **`f`** (or pressing Esc) deletes the saved workflow and state, then designs a new workflow as usual. The worktree itself is left alone; you are asked separately whether to reuse or recreate it.
+Accepting a resume also answers the [existing-worktree question](05-workflows.md#worktrees): the run you are resuming lives in that worktree, so awman reuses it rather than asking whether to recreate it.
 
-If the worktree is still there but the run cannot be reconstructed, awman says exactly what is missing and waits for you to press Enter before designing a fresh workflow:
+Choosing **`f`** deletes the saved workflow *and* its state, then designs a new workflow as usual — a leader pass you have already paid for is gone for good, so it is the one answer you have to type. The worktree itself is left alone; you are asked separately whether to reuse or recreate it.
+
+Pressing **Esc cancels the command**. Nothing is designed, nothing is deleted, no worktree is touched, and the same offer is waiting the next time you run it. The prompt is raised before the worktree is prepared and before any leader launches, so there is nothing to undo.
+
+If the worktree is still there but a previous run cannot be reconstructed, awman says exactly what is missing and waits for you to press Enter before designing a fresh workflow:
 
 ```
 ╭──── Cannot resume previous workflow ───────────────────────╮
@@ -307,7 +313,9 @@ If the worktree is still there but the run cannot be reconstructed, awman says e
 ╰────────────────────────────────────────────────────────────╯
 ```
 
-A dynamic run that finishes cleanly deletes its saved copy, so the next run on that work item always starts from a fresh design.
+This notice only appears when a run really did leave half of itself behind. A worktree with no previous run in it, or one kept after a run that finished, is simply a fresh start — you are not told that a successful run "cannot be resumed".
+
+A dynamic run that finishes cleanly deletes both its saved workflow and its state, so the next run on that work item always starts from a fresh design — whether it finished on its first attempt or on a resume.
 
 ---
 
@@ -358,7 +366,9 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Re-run after cancelling a failed run, worktree kept | Resume prompt offers the failed step, the one before it, and the one after it, by name |
 | Re-run after cancelling, worktree discarded | Nothing to find; a fresh leader designs a new workflow |
 | Worktree kept but `.awman/workflows` cleaned out | The reason is shown, and a fresh dynamic workflow starts once you press Enter |
-| Previous run completed every step | Nothing to resume; you are told so, and a fresh workflow is designed |
+| Esc at the resume prompt | The command cancels: no leader, no worktree change, and the saved run is left exactly as it was |
+| Worktree kept after a run that finished | Both halves were already deleted; a fresh workflow is designed with no notice |
+| Previous run completed every step but its state survived | Nothing to resume; you are told so, and a fresh workflow is designed |
 | Leader becomes unstuck during yolo countdown | Countdown cancelled; leader continues running normally |
 | `--leader` and `--model` both set | `--leader` controls the leader's agent and model; `--model` applies to the generated workflow's steps |
 | Context directory already contains a `workflow.toml` from a previous run | Deleted before the leader launches; stale files are never executed |

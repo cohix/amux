@@ -30,7 +30,7 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::credential_refresh::{global as credential_refresh_monitor, RefreshOutcome};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
@@ -126,13 +126,14 @@ pub trait ExecWorkflowCommandFrontend:
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary);
 
     /// A previous run of this workflow left resumable state on disk. Offer to
-    /// pick it back up from one of the named steps, or to discard that state
-    /// and start over (WI-0115 §2).
+    /// pick it back up from one of the named steps, to discard that state and
+    /// start over, or to cancel the command (WI-0115 §2).
     ///
     /// Both `exec workflow` and `exec workflow --dynamic` ask this same
     /// question, with the same offered start points, so the two modes behave
-    /// identically on a resume. Dynamic mode asks it earlier — before the
-    /// leader phase, since a resume means no leader runs at all.
+    /// identically on a resume. Both ask it before anything is created on
+    /// disk, so [`WorkflowResumeDecision::Cancel`] can back out of the whole
+    /// command leaving the previous run exactly as it was.
     fn ask_workflow_resume(
         &mut self,
         prompt: &WorkflowResumePrompt,
@@ -271,6 +272,15 @@ pub enum WorkflowResumeDecision {
     /// Discard the saved state and start over. In dynamic mode that also means
     /// a leader designs a new workflow.
     Fresh,
+    /// Cancel the command outright: run nothing and change nothing. The saved
+    /// state and (in dynamic mode) the saved `workflow.toml` are left exactly
+    /// as they were, so the same choice is on offer next time.
+    ///
+    /// This is what Esc means on the prompt. Discarding a previous run's
+    /// progress — and, in dynamic mode, a paid-for leader design — is not
+    /// something to do by dismissing a dialog, so the destructive answer has
+    /// to be chosen deliberately.
+    Cancel,
 }
 
 /// Offered resume points, named: the step the previous run stopped on, the step
@@ -284,9 +294,18 @@ fn workflow_resume_start_points(
         return Vec::new();
     };
     let order = dag.topological_order();
+    // `resume_stop_point` finds a `Failed`/`Cancelled` step when there is one,
+    // and otherwise falls back to the first step that never succeeded — which
+    // is what an interrupted or paused run leaves behind. Naming that second
+    // case "the step that failed" would describe a failure that never happened.
+    let stopped_role = match state.status_of(&order[idx]) {
+        Some(crate::data::workflow_state::StepState::Failed { .. }) => "the step that failed",
+        Some(crate::data::workflow_state::StepState::Cancelled) => "the step that was cancelled",
+        _ => "the step the run stopped on",
+    };
     let mut points = vec![WorkflowResumeStep {
         name: order[idx].clone(),
-        role: "the step that failed".to_string(),
+        role: stopped_role.to_string(),
     }];
     if idx > 0 {
         points.push(WorkflowResumeStep {
@@ -311,6 +330,125 @@ fn completed_step_count(state: &crate::data::workflow_state::WorkflowState) -> u
         .values()
         .filter(|s| matches!(s, StepState::Succeeded | StepState::Skipped))
         .count()
+}
+
+/// What the shared saved-state resume question decided (WI-0115 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StateResumeOutcome {
+    /// Carry on with the run. `resumed` is true when saved state was rewound,
+    /// which also answers the existing-worktree question: the caller must not
+    /// ask it again.
+    Proceed { resumed: bool },
+    /// The user cancelled the command at the prompt. Nothing was written and
+    /// nothing was deleted.
+    Cancelled,
+}
+
+/// Ask the shared workflow-resume question for whatever state `store` holds for
+/// `(work_item, workflow_name)`, and apply the answer (WI-0115 §2).
+///
+/// One implementation for every caller — the plain path asks it before the
+/// worktree is prepared, the dynamic path asks its own richer version before
+/// the leader phase, and `execute_prepared` asks it for the runs that reach the
+/// engine without either. Keeping the decision *and* its consequences here is
+/// what stops "resume" meaning three subtly different things.
+///
+/// Applying the answer means: `ResumeFrom` rewinds the saved state and writes
+/// it back so the engine restarts at the chosen step; `Fresh` deletes the state
+/// file; `Cancel` touches nothing at all.
+fn offer_state_resume(
+    store: &crate::data::workflow_state_store::WorkflowStateStore,
+    workflow: &Workflow,
+    workflow_name: &str,
+    work_item: Option<u32>,
+    worktree_path: Option<&Path>,
+    frontend: &mut dyn ExecWorkflowCommandFrontend,
+) -> Result<StateResumeOutcome, CommandError> {
+    let proceed = StateResumeOutcome::Proceed { resumed: false };
+    let drop_state = |frontend: &mut dyn ExecWorkflowCommandFrontend| {
+        if let Err(e) = store.delete(work_item, workflow_name) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!("exec workflow: failed to delete workflow state file: {e}"),
+            });
+        }
+    };
+
+    let mut saved = match store.load(work_item, workflow_name) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return Ok(proceed),
+        Err(e) => {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!(
+                    "exec workflow: failed to read workflow state file: {e}; starting fresh",
+                ),
+            });
+            return Ok(proceed);
+        }
+    };
+
+    let dag = match crate::data::workflow_dag::WorkflowDag::build(&workflow.steps) {
+        Ok(dag) => dag,
+        Err(e) => {
+            // The saved state cannot be mapped onto the workflow as it stands
+            // now; starting fresh is the only safe reading.
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!(
+                    "exec workflow: saved state cannot be matched to this workflow ({e}); \
+                     starting fresh"
+                ),
+            });
+            drop_state(frontend);
+            return Ok(proceed);
+        }
+    };
+
+    let start_points = workflow_resume_start_points(&dag, &saved);
+    if start_points.is_empty() {
+        // Every step of the saved run succeeded. Resuming it would run
+        // nothing, so retire the state rather than offer a choice that has
+        // only one sane answer.
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "The saved run of '{workflow_name}' completed every step; starting fresh."
+            ),
+        });
+        drop_state(frontend);
+        return Ok(proceed);
+    }
+
+    let prompt = WorkflowResumePrompt::new(
+        workflow_name.to_string(),
+        work_item,
+        worktree_path.map(|p| p.to_path_buf()),
+        false,
+        completed_step_count(&saved),
+        saved.step_states.len(),
+        start_points,
+    );
+    match frontend.ask_workflow_resume(&prompt)? {
+        WorkflowResumeDecision::ResumeFrom(start) => {
+            // Rewind before the engine loads the file, so a run that ended on
+            // a failure or an abort — every step terminal — is runnable again.
+            saved.rewind_to(&dag, &start);
+            store.save(&saved).map_err(|e| {
+                CommandError::Other(format!("rewinding the resumed workflow state: {e}"))
+            })?;
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("Resuming '{workflow_name}' from step '{start}'"),
+            });
+            Ok(StateResumeOutcome::Proceed { resumed: true })
+        }
+        WorkflowResumeDecision::Fresh => {
+            drop_state(frontend);
+            Ok(proceed)
+        }
+        WorkflowResumeDecision::Cancel => Ok(StateResumeOutcome::Cancelled),
+    }
 }
 
 pub struct ExecWorkflowCommand {
@@ -472,8 +610,11 @@ impl WorkflowFrontend for WorkflowProxy {
             .yolo_countdown_tick(step_name, remaining, total)
     }
 
-    fn yolo_countdown_started(&mut self, step_name: &str) {
-        self.0.lock().unwrap().yolo_countdown_started(step_name);
+    fn yolo_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.0
+            .lock()
+            .unwrap()
+            .yolo_countdown_started(step_name, kind);
     }
 
     fn yolo_countdown_finished(&mut self, step_name: &str) {
@@ -1280,6 +1421,11 @@ impl Command for ExecWorkflowCommand {
             });
         }
         let mut worktree_path: Option<PathBuf> = None;
+        // Set once the worktree branch below has asked the resume question, so
+        // `execute_prepared` does not ask it a second time (WI-0115 §2). A run
+        // without a worktree creates nothing before `execute_prepared`, so it
+        // is left to ask there.
+        let mut state_resume_settled = false;
         let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
         {
             let git_root = match self.engines.git_engine.resolve_root(&cwd) {
@@ -1377,7 +1523,52 @@ impl Command for ExecWorkflowCommand {
                     }
                 }
             };
-            let wt_path = match lifecycle.prepare(&mut *frontend).await {
+            // 4a. Ask the resume question *before* the worktree is prepared
+            //     (WI-0115 §2), the same way the dynamic path asks before its
+            //     leader phase. Cancelling is only a true cancellation if
+            //     nothing has been created yet, and a resume that recreated
+            //     the worktree first would delete the very state it resumes.
+            let state_root = self.workflow_state_root_for(lifecycle.worktree_path());
+            let store =
+                crate::data::workflow_state_store::WorkflowStateStore::at_git_root(state_root);
+            let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
+            let resumed = match offer_state_resume(
+                &store,
+                &workflow,
+                &workflow_name,
+                work_item_context.as_ref().map(|c| c.number),
+                Some(lifecycle.worktree_path()),
+                &mut *frontend,
+            )? {
+                StateResumeOutcome::Cancelled => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: "exec workflow: cancelled; nothing was created or changed."
+                            .to_string(),
+                    });
+                    return Ok(ExecWorkflowOutcome {
+                        workflow: workflow_name,
+                        exit_code: None,
+                        worktree_used: false,
+                    });
+                }
+                StateResumeOutcome::Proceed { resumed } => resumed,
+            };
+            state_resume_settled = true;
+
+            let wt_path = match lifecycle
+                .prepare_with_existing(
+                    &mut *frontend,
+                    // An accepted resume is an answer to the existing-worktree
+                    // question: the saved run lives in that worktree, and
+                    // recreating it would throw away both the commits and the
+                    // state we just rewound.
+                    resumed.then_some(
+                        crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision::Resume,
+                    ),
+                )
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     frontend.write_message(UserMessage {
@@ -1451,7 +1642,7 @@ impl Command for ExecWorkflowCommand {
             original_session: self.session,
             issue_temp_file: _issue_temp_file,
             launch_modes,
-            skip_state_resume_prompt: false,
+            skip_state_resume_prompt: state_resume_settled,
         };
         execute_prepared(
             &self.flags,
@@ -1538,113 +1729,47 @@ async fn execute_prepared(
     }
 
     // 5b. Detect a persisted workflow-state file and ask the user where to
-    //     pick it up — the same question, with the same named start points,
-    //     that the dynamic path asks before its leader phase (WI-0115 §2).
-    //     The check uses the session_root the engine will pick up below — the
-    //     worktree path when --worktree is active, otherwise cwd. Done before
-    //     PTY activation so the dialog renders immediately, like the
-    //     existing-worktree dialog does in the lifecycle step above.
-    //     A caller that supplied `workflow_state_root` keeps its state file
-    //     out of the session root entirely, so the resume check must look
-    //     where the engine will actually read and write it.
+    //     pick it up (WI-0115 §2). The check uses the session_root the engine
+    //     will pick up below — the worktree path when --worktree is active,
+    //     otherwise cwd. A caller that supplied `workflow_state_root` keeps
+    //     its state file out of the session root entirely, so the resume check
+    //     must look where the engine will actually read and write it.
     //
-    //     `skip_state_resume_prompt` is set only by the dynamic resume path,
-    //     which has already asked and already rewound the state.
-    let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
-    let git_root_for_state = match workflow_state_root {
-        Some(root) => root.to_path_buf(),
-        None => match Arc::clone(&engines.git_engine).resolve_root(&session_root_for_state) {
-            Ok(r) => r,
-            Err(_) => session_root_for_state.clone(),
-        },
-    };
-    let workflow_name_for_state = crate::engine::workflow::workflow_name_for(&workflow);
-    let work_item_number_for_state = work_item_context.as_ref().map(|c| c.number);
+    //     `skip_state_resume_prompt` is set by the paths that already asked
+    //     this question before anything was created on disk — the plain path
+    //     ahead of `WorktreeLifecycle::prepare`, and the dynamic resume path
+    //     ahead of the leader phase. This is the fallback site for the runs
+    //     that reach the engine without either.
     if !skip_state_resume_prompt {
-        let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
-            git_root_for_state.clone(),
-        );
-        let drop_state = |frontend: &mut dyn ExecWorkflowCommandFrontend| {
-            if let Err(e) = store.delete(work_item_number_for_state, &workflow_name_for_state) {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!("exec workflow: failed to delete workflow state file: {e}"),
-                });
-            }
+        let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
+        let git_root_for_state = match workflow_state_root {
+            Some(root) => root.to_path_buf(),
+            None => match Arc::clone(&engines.git_engine).resolve_root(&session_root_for_state) {
+                Ok(r) => r,
+                Err(_) => session_root_for_state,
+            },
         };
-        match store.load(work_item_number_for_state, &workflow_name_for_state) {
-            Ok(Some(mut saved)) => {
-                match crate::data::workflow_dag::WorkflowDag::build(&workflow.steps) {
-                    Ok(dag) => {
-                        let start_points = workflow_resume_start_points(&dag, &saved);
-                        if start_points.is_empty() {
-                            // Every step of the saved run succeeded. Resuming it
-                            // would run nothing, so retire the state rather than
-                            // offer a choice that has only one sane answer.
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Info,
-                                text: format!(
-                                    "The saved run of '{workflow_name_for_state}' completed every \
-                                 step; starting fresh."
-                                ),
-                            });
-                            drop_state(frontend.as_mut());
-                        } else {
-                            let prompt = WorkflowResumePrompt::new(
-                                workflow_name_for_state.clone(),
-                                work_item_number_for_state,
-                                worktree_path.clone(),
-                                false,
-                                completed_step_count(&saved),
-                                saved.step_states.len(),
-                                start_points,
-                            );
-                            match frontend.ask_workflow_resume(&prompt)? {
-                                WorkflowResumeDecision::ResumeFrom(start) => {
-                                    // Rewind before the engine loads the file, so
-                                    // a run that ended on a failure or an abort —
-                                    // every step terminal — is runnable again.
-                                    saved.rewind_to(&dag, &start);
-                                    if let Err(e) = store.save(&saved) {
-                                        return Err(CommandError::Other(format!(
-                                            "rewinding the resumed workflow state: {e}"
-                                        )));
-                                    }
-                                    frontend.write_message(UserMessage {
-                                        level: MessageLevel::Info,
-                                        text: format!(
-                                        "Resuming '{workflow_name_for_state}' from step '{start}'"
-                                    ),
-                                    });
-                                }
-                                WorkflowResumeDecision::Fresh => drop_state(frontend.as_mut()),
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // The saved state cannot be mapped onto the workflow as it
-                        // stands now; starting fresh is the only safe reading.
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Warning,
-                            text: format!(
-                                "exec workflow: saved state cannot be matched to this workflow \
-                             ({e}); starting fresh"
-                            ),
-                        });
-                        drop_state(frontend.as_mut());
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!(
-                        "exec workflow: failed to read workflow state file: {e}; \
-                         starting fresh",
-                    ),
-                });
-            }
+        let store =
+            crate::data::workflow_state_store::WorkflowStateStore::at_git_root(git_root_for_state);
+        let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
+        let decision = offer_state_resume(
+            &store,
+            &workflow,
+            &workflow_name,
+            work_item_context.as_ref().map(|c| c.number),
+            worktree_path.as_deref(),
+            frontend.as_mut(),
+        )?;
+        if decision == StateResumeOutcome::Cancelled {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "exec workflow: cancelled; the saved run is unchanged.".to_string(),
+            });
+            return Ok(ExecWorkflowOutcome {
+                workflow: workflow_name,
+                exit_code: None,
+                worktree_used: worktree_path.is_some(),
+            });
         }
     }
 
@@ -2494,42 +2619,66 @@ struct PreviousDynamicRun {
     state: crate::data::workflow_state::WorkflowState,
 }
 
+/// Why [`discover_previous_dynamic_run`] found no resumable run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DynamicDiscoveryMiss {
+    /// There is simply no previous run recorded here. Ordinary and silent —
+    /// a worktree kept after a clean run looks exactly like this, and telling
+    /// the user a completed run "cannot be resumed" would be noise.
+    NothingToResume,
+    /// A previous run left something behind, but it cannot be reconstructed.
+    /// The string says what is missing, phrased for the user.
+    Unusable(String),
+}
+
 /// Look for a resumable dynamic run inside `worktree_path`.
 ///
-/// Returns `Err(reason)` — phrased for the user — when any half of the pair is
-/// missing or unreadable, so the caller can say exactly what stopped the resume
-/// rather than silently starting over.
+/// A run is resumable only as a pair — the leader's `workflow.toml` and the
+/// engine state that references it. Neither half present is
+/// [`DynamicDiscoveryMiss::NothingToResume`]; one half present without the
+/// other is [`DynamicDiscoveryMiss::Unusable`], which is worth interrupting the
+/// user over because it means a run *was* there and something ate half of it.
 fn discover_previous_dynamic_run(
     state_git_root: &Path,
     work_item: u32,
-) -> Result<PreviousDynamicRun, String> {
+) -> Result<PreviousDynamicRun, DynamicDiscoveryMiss> {
     use crate::data::fs::WorkflowDirs;
     use crate::data::workflow_state_store::WorkflowStateStore;
+    use DynamicDiscoveryMiss::{NothingToResume, Unusable};
 
     let workflow_path = WorkflowDirs::dynamic_workflow_path(state_git_root, work_item);
     if !workflow_path.exists() {
-        return Err(format!(
-            "no saved workflow.toml at {} — the previous run's generated workflow is gone",
-            workflow_path.display()
-        ));
+        // A run that finished cleanly deletes its saved workflow but keeps its
+        // (all-succeeded) state file, so a kept worktree lands here routinely.
+        // Only a state file with work still left in it means something is
+        // genuinely missing.
+        return Err(
+            match unresumed_dynamic_state_exists(state_git_root, work_item) {
+                true => Unusable(format!(
+                    "no saved workflow.toml at {} — the previous run's generated workflow is gone",
+                    workflow_path.display()
+                )),
+                false => NothingToResume,
+            },
+        );
     }
     let raw = std::fs::read_to_string(&workflow_path)
-        .map_err(|e| format!("reading {}: {e}", workflow_path.display()))?;
+        .map_err(|e| Unusable(format!("reading {}: {e}", workflow_path.display())))?;
     let workflow = Workflow::parse(&raw, crate::data::workflow_definition::WorkflowFormat::Toml)
-        .map_err(|e| format!("the saved workflow.toml no longer parses: {e}"))?;
+        .map_err(|e| Unusable(format!("the saved workflow.toml no longer parses: {e}")))?;
 
     let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
     let store = WorkflowStateStore::at_git_root(state_git_root.to_path_buf());
     let state = match store.load(Some(work_item), &workflow_name) {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return Err(format!(
+            return Err(Unusable(format!(
                 "no saved workflow state for '{workflow_name}' at {} — there is no progress to \
                  resume from",
                 store.state_path(Some(work_item), &workflow_name).display()
-            ))
+            )))
         }
-        Err(e) => return Err(format!("reading the saved workflow state: {e}")),
+        Err(e) => return Err(Unusable(format!("reading the saved workflow state: {e}"))),
     };
 
     Ok(PreviousDynamicRun {
@@ -2537,6 +2686,53 @@ fn discover_previous_dynamic_run(
         workflow_path,
         state,
     })
+}
+
+/// Does `state_git_root` hold a dynamic workflow state for `work_item` that
+/// still has steps left to run?
+///
+/// Used to tell "the previous run finished and tidied up after itself" apart
+/// from "the previous run's generated workflow went missing". The state file is
+/// named after the workflow title, which is exactly what the missing
+/// `workflow.toml` would have told us — so this scans the workflows directory
+/// for the work item's state file rather than guessing the title.
+fn unresumed_dynamic_state_exists(state_git_root: &Path, work_item: u32) -> bool {
+    let dir = crate::data::fs::WorkflowDirs::repo_dir_for(state_git_root);
+    let marker = format!("-{work_item:04}-");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json")
+            || !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&marker))
+        {
+            return false;
+        }
+        match crate::data::workflow_state_store::WorkflowStateStore::read_state_path(&path) {
+            // A state whose every step succeeded or was skipped has nothing
+            // left to resume, so its workflow.toml is not missed. Note this
+            // deliberately is not `is_complete()`: a failed or aborted run is
+            // "complete" by that predicate — every step terminal — and it is
+            // exactly the run whose missing workflow the user needs told about.
+            Ok(Some(state)) => completed_step_count(&state) < state.step_states.len(),
+            _ => false,
+        }
+    })
+}
+
+/// What [`ExecWorkflowCommand::offer_dynamic_resume`] decided.
+enum DynamicResumeOutcome {
+    /// Resume the previous run from the chosen step; no leader runs.
+    /// Boxed because the plan is far larger than the other two variants.
+    Resume(Box<DynamicResumePlan>),
+    /// Design a new workflow with a fresh leader pass.
+    Fresh,
+    /// The user cancelled the command; nothing was created or deleted.
+    Cancelled,
 }
 
 /// A resume the user confirmed: which saved workflow to run, and from where.
@@ -2588,6 +2784,32 @@ fn save_dynamic_workflow_copy(state_git_root: &Path, work_item: u32, generated_p
             dest = %dest.display(),
             error = %e,
             "failed to save the dynamic workflow copy; this run will not be resumable"
+        );
+    }
+}
+
+/// Retire both halves of a resumable dynamic run — the saved `workflow.toml`
+/// and the engine state that references it (WI-0115 §2b).
+///
+/// Called when a dynamic run finishes with exit code 0, from both the
+/// leader-designed and the resumed path. Best-effort: a worktree the user kept
+/// is only tidier for this, and failing to delete it must not fail the run.
+/// Both must go together — a state file with no workflow beside it is what
+/// produces a spurious "cannot be resumed" notice on the next invocation.
+fn clear_dynamic_resume_artifacts(state_git_root: &Path, work_item: u32, workflow_name: &str) {
+    let _ = std::fs::remove_file(crate::data::fs::WorkflowDirs::dynamic_workflow_path(
+        state_git_root,
+        work_item,
+    ));
+    let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
+        state_git_root.to_path_buf(),
+    );
+    if let Err(e) = store.delete(Some(work_item), workflow_name) {
+        tracing::warn!(
+            work_item,
+            workflow = %workflow_name,
+            error = %e,
+            "failed to delete the finished dynamic run's workflow state"
         );
     }
 }
@@ -2697,7 +2919,25 @@ impl ExecWorkflowCommand {
         // state file inside its own worktree. Both survive a Ctrl-C abort and
         // both die with the worktree, so an existing worktree is the one place
         // worth looking before paying for another leader-design pass.
-        let resume_plan = self.offer_dynamic_resume(&lifecycle, wi_number, frontend.as_mut())?;
+        let resume_plan =
+            match self.offer_dynamic_resume(&lifecycle, wi_number, frontend.as_mut())? {
+                DynamicResumeOutcome::Resume(plan) => Some(plan),
+                DynamicResumeOutcome::Fresh => None,
+                DynamicResumeOutcome::Cancelled => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "exec workflow: cancelled; the previous dynamic run for work item \
+                         {wi_number:04} is unchanged."
+                        ),
+                    });
+                    return Ok(ExecWorkflowOutcome {
+                        workflow: format!("dynamic-{wi_number:04}"),
+                        exit_code: None,
+                        worktree_used: false,
+                    });
+                }
+            };
 
         let worktree_path = lifecycle
             .prepare_with_existing(
@@ -2711,7 +2951,7 @@ impl ExecWorkflowCommand {
             .await?;
         let mount_path = worktree_path.clone();
         let worktree_git_mount = worktree_git_overlay(&mount_path)?;
-        let state_git_root = self.dynamic_state_root(&worktree_path);
+        let state_git_root = self.workflow_state_root_for(&worktree_path);
 
         // Re-root a session at the worktree so the leader operates on the
         // isolated checkout.
@@ -2741,7 +2981,7 @@ impl ExecWorkflowCommand {
                 dag,
                 start_step,
                 state_root,
-            } = plan;
+            } = *plan;
             state.rewind_to(&dag, &start_step);
             let store =
                 crate::data::workflow_state_store::WorkflowStateStore::at_git_root(state_root);
@@ -2755,7 +2995,8 @@ impl ExecWorkflowCommand {
                      from step '{start_step}'"
                 ),
             });
-            return self
+            let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
+            let outcome = self
                 .execute_generated_workflow(DynamicExecution {
                     effective_flags,
                     workflow,
@@ -2775,7 +3016,12 @@ impl ExecWorkflowCommand {
                     skip_state_resume_prompt: true,
                     frontend,
                 })
-                .await;
+                .await?;
+            // A resumed run that finishes clean is as done as a fresh one.
+            if outcome.exit_code == Some(0) {
+                clear_dynamic_resume_artifacts(&state_git_root, wi_number, &workflow_name);
+            }
+            return Ok(outcome);
         }
 
         // ── Resolve the leader agent + model (WI-0092 §7). Deliberately after
@@ -2999,6 +3245,10 @@ impl ExecWorkflowCommand {
         // be resumed without a second leader-design pass (WI-0115 §2).
         save_dynamic_workflow_copy(&state_git_root, wi_number, &generated_path);
 
+        // Captured before the workflow moves into the execution tail: the state
+        // file is keyed by workflow name, and the cleanup below needs it.
+        let dynamic_workflow_name = crate::engine::workflow::workflow_name_for(&validated_workflow);
+
         let outcome = self
             .execute_generated_workflow(DynamicExecution {
                 effective_flags: effective_flags.clone(),
@@ -3019,13 +3269,10 @@ impl ExecWorkflowCommand {
             })
             .await?;
 
-        // A clean finish means there is nothing left to resume; drop the saved
-        // copy so the next run on this work item starts from a fresh design.
+        // A clean finish means there is nothing left to resume; drop *both*
+        // halves so the next run on this work item starts from a fresh design.
         if outcome.exit_code == Some(0) {
-            let _ = std::fs::remove_file(crate::data::fs::WorkflowDirs::dynamic_workflow_path(
-                &state_git_root,
-                wi_number,
-            ));
+            clear_dynamic_resume_artifacts(&state_git_root, wi_number, &dynamic_workflow_name);
         }
         Ok(outcome)
     }
@@ -3033,27 +3280,32 @@ impl ExecWorkflowCommand {
     /// Look for — and offer to resume — a previous `--dynamic` run on this work
     /// item (WI-0115 §2).
     ///
-    /// Returns the chosen plan, or `None` to design a fresh workflow. `None` is
-    /// also the answer when there is no worktree to look inside; when the
-    /// worktree is there but the run cannot be reconstructed the user is told
-    /// why before the fresh design starts.
+    /// Called before the worktree is prepared and before the leader launches,
+    /// so every answer is still free: `Resume` skips the leader entirely,
+    /// `Fresh` clears the previous run and designs a new workflow, and `Cancel`
+    /// backs out of the command with the previous run untouched.
+    ///
+    /// `Fresh` is also the answer when there is no worktree to look inside;
+    /// when the worktree is there but the run cannot be reconstructed the user
+    /// is told why before the fresh design starts.
     fn offer_dynamic_resume(
         &self,
         lifecycle: &WorktreeLifecycle,
         work_item: u32,
         frontend: &mut dyn ExecWorkflowCommandFrontend,
-    ) -> Result<Option<DynamicResumePlan>, CommandError> {
+    ) -> Result<DynamicResumeOutcome, CommandError> {
         let worktree_path = lifecycle.worktree_path();
         if !worktree_path.exists() {
-            return Ok(None);
+            return Ok(DynamicResumeOutcome::Fresh);
         }
-        let state_root = self.dynamic_state_root(worktree_path);
+        let state_root = self.workflow_state_root_for(worktree_path);
 
         let previous = match discover_previous_dynamic_run(&state_root, work_item) {
             Ok(p) => p,
-            Err(reason) => {
+            Err(DynamicDiscoveryMiss::NothingToResume) => return Ok(DynamicResumeOutcome::Fresh),
+            Err(DynamicDiscoveryMiss::Unusable(reason)) => {
                 frontend.notify_dynamic_workflow_resume_unavailable(work_item, &reason)?;
-                return Ok(None);
+                return Ok(DynamicResumeOutcome::Fresh);
             }
         };
 
@@ -3064,7 +3316,7 @@ impl ExecWorkflowCommand {
                     work_item,
                     &format!("the saved workflow's step graph is no longer valid: {e}"),
                 )?;
-                return Ok(None);
+                return Ok(DynamicResumeOutcome::Fresh);
             }
         };
 
@@ -3075,7 +3327,7 @@ impl ExecWorkflowCommand {
                 "the previous dynamic workflow ran every step to completion; there is nothing \
                  to resume",
             )?;
-            return Ok(None);
+            return Ok(DynamicResumeOutcome::Fresh);
         }
 
         let prompt = WorkflowResumePrompt::new(
@@ -3089,14 +3341,16 @@ impl ExecWorkflowCommand {
         );
 
         match frontend.ask_workflow_resume(&prompt)? {
-            WorkflowResumeDecision::ResumeFrom(start_step) => Ok(Some(DynamicResumePlan {
-                workflow: previous.workflow,
-                workflow_path: previous.workflow_path,
-                state: previous.state,
-                dag,
-                start_step,
-                state_root,
-            })),
+            WorkflowResumeDecision::ResumeFrom(start_step) => {
+                Ok(DynamicResumeOutcome::Resume(Box::new(DynamicResumePlan {
+                    workflow: previous.workflow,
+                    workflow_path: previous.workflow_path,
+                    state: previous.state,
+                    dag,
+                    start_step,
+                    state_root,
+                })))
+            }
             WorkflowResumeDecision::Fresh => {
                 // Clear both halves so neither this run's state check nor the
                 // next invocation trips over the abandoned run.
@@ -3111,21 +3365,30 @@ impl ExecWorkflowCommand {
                     });
                 }
                 let _ = std::fs::remove_file(&previous.workflow_path);
-                Ok(None)
+                Ok(DynamicResumeOutcome::Fresh)
             }
+            // Nothing has been created and nothing is deleted: the same
+            // resume is on offer next time the command runs.
+            WorkflowResumeDecision::Cancel => Ok(DynamicResumeOutcome::Cancelled),
         }
     }
 
-    /// Where this run's `WorkflowState` and saved `workflow.toml` live —
-    /// the same root [`execute_prepared`] hands the engine, so discovery reads
-    /// exactly the file the previous run wrote.
-    fn dynamic_state_root(&self, worktree_path: &Path) -> PathBuf {
+    /// Where this run's `WorkflowState` (and, in dynamic mode, the saved
+    /// `workflow.toml`) live — the same root [`execute_prepared`] hands the
+    /// engine, so a resume reads exactly the file the previous run wrote.
+    ///
+    /// Safe to call before a worktree has been prepared: an unborn worktree
+    /// cannot be resolved, and falling back to the path itself is the answer
+    /// `resolve_root` gives once it exists — a git worktree checkout is its own
+    /// root. Either way there is no state file there yet, so an early caller
+    /// correctly finds nothing to resume.
+    fn workflow_state_root_for(&self, session_root: &Path) -> PathBuf {
         if let Some(root) = &self.workflow_state_root {
             return root.clone();
         }
         Arc::clone(&self.engines.git_engine)
-            .resolve_root(worktree_path)
-            .unwrap_or_else(|_| worktree_path.to_path_buf())
+            .resolve_root(session_root)
+            .unwrap_or_else(|_| session_root.to_path_buf())
     }
 
     /// Shared tail of both dynamic paths: build any missing agent images, run
@@ -3528,7 +3791,10 @@ async fn run_leader_yolo_countdown(
     let total = YOLO_COUNTDOWN_DURATION;
     let tick = Duration::from_millis(200);
     let mut remaining = total;
-    shared.lock().unwrap().yolo_countdown_started(step_name);
+    shared
+        .lock()
+        .unwrap()
+        .yolo_countdown_started(step_name, CountdownKind::StuckStep);
 
     let outcome = loop {
         let tick_result = shared
@@ -4090,6 +4356,11 @@ mod tests {
         summary_calls: Vec<WorkflowSummary>,
         messages: Vec<UserMessage>,
         next_action_response: NextAction,
+        /// What `ask_workflow_resume` answers. `Fresh` keeps the historical
+        /// behaviour of every test that does not care.
+        resume_response: WorkflowResumeDecision,
+        /// Prompts the resume question was asked with.
+        resume_prompts: Vec<WorkflowResumePrompt>,
     }
 
     impl FakeExecWorkflowFrontend {
@@ -4101,7 +4372,14 @@ mod tests {
                 summary_calls: vec![],
                 messages: vec![],
                 next_action_response: NextAction::LaunchNext,
+                resume_response: WorkflowResumeDecision::Fresh,
+                resume_prompts: Vec::new(),
             }
+        }
+
+        fn answering_resume(mut self, response: WorkflowResumeDecision) -> Self {
+            self.resume_response = response;
+            self
         }
     }
 
@@ -4254,9 +4532,10 @@ mod tests {
         }
         fn ask_workflow_resume(
             &mut self,
-            _prompt: &WorkflowResumePrompt,
+            prompt: &WorkflowResumePrompt,
         ) -> Result<WorkflowResumeDecision, CommandError> {
-            Ok(WorkflowResumeDecision::Fresh)
+            self.resume_prompts.push(prompt.clone());
+            Ok(self.resume_response.clone())
         }
         fn notify_dynamic_workflow_resume_unavailable(
             &mut self,
@@ -6649,11 +6928,209 @@ prompt = "do something useful"
         );
     }
 
+    /// Build a workflow whose steps match `resume_fixture`'s linear chain, so
+    /// a saved state and a parsed workflow can be handed to
+    /// `offer_state_resume` together.
+    fn linear_workflow(steps: &[&str]) -> Workflow {
+        let mut toml = String::from("title = \"wf\"\nagent = \"claude\"\n");
+        for (i, name) in steps.iter().enumerate() {
+            toml.push_str(&format!("\n[[step]]\nname = \"{name}\"\nprompt = \"go\"\n"));
+            if i > 0 {
+                toml.push_str(&format!("depends_on = [\"{}\"]\n", steps[i - 1]));
+            }
+        }
+        Workflow::parse(
+            &toml,
+            crate::data::workflow_definition::WorkflowFormat::Toml,
+        )
+        .unwrap()
+    }
+
+    /// Seed a saved state for `wf` at `root` and return its store.
+    fn seed_state(
+        root: &Path,
+        statuses: &[StepState],
+    ) -> crate::data::workflow_state_store::WorkflowStateStore {
+        let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(root);
+        let (mut state, _) = resume_fixture(&["a", "b", "c"], statuses);
+        state.workflow_name = "wf".into();
+        state.work_item = None;
+        store.save(&state).unwrap();
+        store
+    }
+
+    /// Esc is a cancellation of the *command*, not an answer to the question:
+    /// the previous run must survive it byte for byte, so the same offer is
+    /// there next time.
+    #[test]
+    fn cancelling_the_resume_prompt_leaves_the_saved_run_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seed_state(
+            tmp.path(),
+            &[StepState::Succeeded, failed(1), StepState::Cancelled],
+        );
+        let path = store.state_path(None, "wf");
+        let before = std::fs::read(&path).unwrap();
+
+        let mut frontend =
+            FakeExecWorkflowFrontend::new().answering_resume(WorkflowResumeDecision::Cancel);
+        let outcome = offer_state_resume(
+            &store,
+            &linear_workflow(&["a", "b", "c"]),
+            "wf",
+            None,
+            None,
+            &mut frontend,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, StateResumeOutcome::Cancelled);
+        assert!(path.exists(), "cancelling must not delete the saved run");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "cancelling must not rewind the saved run either"
+        );
+    }
+
+    /// `Fresh` is the destructive answer, and the only one that is.
+    #[test]
+    fn starting_over_deletes_the_saved_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seed_state(
+            tmp.path(),
+            &[StepState::Succeeded, failed(1), StepState::Cancelled],
+        );
+        let path = store.state_path(None, "wf");
+
+        let mut frontend =
+            FakeExecWorkflowFrontend::new().answering_resume(WorkflowResumeDecision::Fresh);
+        let outcome = offer_state_resume(
+            &store,
+            &linear_workflow(&["a", "b", "c"]),
+            "wf",
+            None,
+            None,
+            &mut frontend,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, StateResumeOutcome::Proceed { resumed: false });
+        assert!(!path.exists());
+    }
+
+    /// Accepting a resume rewinds the state on disk *before* the engine reads
+    /// it, and reports `resumed` so the caller knows not to re-ask the
+    /// existing-worktree question.
+    #[test]
+    fn accepting_a_resume_rewinds_the_state_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seed_state(
+            tmp.path(),
+            &[StepState::Succeeded, failed(1), StepState::Cancelled],
+        );
+
+        let mut frontend = FakeExecWorkflowFrontend::new()
+            .answering_resume(WorkflowResumeDecision::ResumeFrom("b".into()));
+        let outcome = offer_state_resume(
+            &store,
+            &linear_workflow(&["a", "b", "c"]),
+            "wf",
+            None,
+            None,
+            &mut frontend,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, StateResumeOutcome::Proceed { resumed: true });
+        let saved = store.load(None, "wf").unwrap().unwrap();
+        assert_eq!(saved.status_of("a"), Some(&StepState::Succeeded));
+        assert_eq!(saved.status_of("b"), Some(&StepState::Pending));
+        assert_eq!(saved.status_of("c"), Some(&StepState::Pending));
+    }
+
+    /// A run that stopped without failing — interrupted, or paused — must not
+    /// be described as one that failed.
+    #[test]
+    fn the_stop_point_is_named_after_what_actually_stopped_the_run() {
+        let (state, dag) = resume_fixture(
+            &["a", "b", "c"],
+            &[StepState::Succeeded, StepState::Pending, StepState::Pending],
+        );
+        let points = workflow_resume_start_points(&dag, &state);
+        assert_eq!(points[0].name, "b");
+        assert_eq!(points[0].role, "the step the run stopped on");
+
+        let (cancelled, dag) = resume_fixture(
+            &["a", "b", "c"],
+            &[
+                StepState::Succeeded,
+                StepState::Cancelled,
+                StepState::Cancelled,
+            ],
+        );
+        assert_eq!(
+            workflow_resume_start_points(&dag, &cancelled)[0].role,
+            "the step that was cancelled"
+        );
+
+        let (failed_run, dag) = resume_fixture(
+            &["a", "b", "c"],
+            &[StepState::Succeeded, failed(1), StepState::Cancelled],
+        );
+        assert_eq!(
+            workflow_resume_start_points(&dag, &failed_run)[0].role,
+            "the step that failed"
+        );
+    }
+
+    /// An empty worktree is not a broken run — it is a worktree with no run in
+    /// it. Saying "cannot be resumed" here would interrupt every first run.
+    #[test]
+    fn discover_previous_dynamic_run_is_quiet_when_there_is_no_previous_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            discover_previous_dynamic_run(tmp.path(), 12).unwrap_err(),
+            DynamicDiscoveryMiss::NothingToResume
+        );
+    }
+
+    /// A run that finished cleanly deletes its workflow copy and its state, so
+    /// a worktree the user kept afterwards must also read as "nothing to
+    /// resume" — not as a run whose workflow went missing.
+    #[test]
+    fn discover_previous_dynamic_run_is_quiet_after_a_completed_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(tmp.path());
+        let (mut state, _) =
+            resume_fixture(&["a", "b"], &[StepState::Succeeded, StepState::Skipped]);
+        state.workflow_name = "saved".into();
+        state.work_item = Some(12);
+        store.save(&state).unwrap();
+
+        assert_eq!(
+            discover_previous_dynamic_run(tmp.path(), 12).unwrap_err(),
+            DynamicDiscoveryMiss::NothingToResume
+        );
+    }
+
+    /// State with work still in it, but no workflow to run it with: half a run
+    /// really did go missing, and the user should be told.
     #[test]
     fn discover_previous_dynamic_run_reports_a_missing_workflow_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = discover_previous_dynamic_run(tmp.path(), 12).unwrap_err();
-        assert!(err.contains("dynamic-0012.toml"), "err={err}");
+        let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(tmp.path());
+        let (mut state, _) = resume_fixture(&["a", "b"], &[StepState::Succeeded, failed(1)]);
+        state.workflow_name = "saved".into();
+        state.work_item = Some(12);
+        store.save(&state).unwrap();
+
+        let DynamicDiscoveryMiss::Unusable(reason) =
+            discover_previous_dynamic_run(tmp.path(), 12).unwrap_err()
+        else {
+            panic!("a half-present run must be reported, not passed over");
+        };
+        assert!(reason.contains("dynamic-0012.toml"), "reason={reason}");
     }
 
     #[test]
@@ -6667,8 +7144,15 @@ prompt = "do something useful"
         )
         .unwrap();
 
-        let err = discover_previous_dynamic_run(tmp.path(), 12).unwrap_err();
-        assert!(err.contains("no saved workflow state"), "err={err}");
+        let DynamicDiscoveryMiss::Unusable(reason) =
+            discover_previous_dynamic_run(tmp.path(), 12).unwrap_err()
+        else {
+            panic!("a saved workflow with no state is a broken pair, not a clean slate");
+        };
+        assert!(
+            reason.contains("no saved workflow state"),
+            "reason={reason}"
+        );
     }
 
     #[test]

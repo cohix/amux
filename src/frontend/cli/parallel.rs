@@ -26,7 +26,7 @@ use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -441,8 +441,8 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.inner.yolo_countdown_tick(step_name, remaining, total)
     }
 
-    fn yolo_countdown_started(&mut self, step_name: &str) {
-        self.inner.yolo_countdown_started(step_name);
+    fn yolo_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.inner.yolo_countdown_started(step_name, kind);
     }
 
     fn yolo_countdown_finished(&mut self, step_name: &str) {
@@ -609,7 +609,8 @@ impl WorkflowFrontend for CliParallelFrontend {
 
     fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
         if !self.chrome_active || self.is_focused(step_name) {
-            self.inner.yolo_countdown_started(step_name);
+            self.inner
+                .yolo_countdown_started(step_name, CountdownKind::StuckStep);
         }
     }
 

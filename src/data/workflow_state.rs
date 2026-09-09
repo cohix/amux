@@ -234,6 +234,37 @@ impl WorkflowState {
         }
     }
 
+    /// Drop every step this state records that `dag` does not define, and
+    /// return their names in sorted order.
+    ///
+    /// A saved state outlives edits to its workflow file. A step that was
+    /// removed or renamed since the state was written can never run again —
+    /// [`Self::next_ready`] asks the DAG, which has never heard of it — but it
+    /// still counts towards [`Self::is_complete`], which reads `step_states`.
+    /// A non-terminal orphan therefore makes `is_complete` permanently false
+    /// and strands the run. Pruning is the only reading that can be right: the
+    /// DAG decides what runs, so anything outside it is not part of this
+    /// workflow any more.
+    pub fn retain_steps_in(&mut self, dag: &WorkflowDag) -> Vec<String> {
+        let known: HashSet<String> = dag.topological_order().into_iter().collect();
+        let mut dropped: Vec<String> = self
+            .step_states
+            .keys()
+            .filter(|name| !known.contains(*name))
+            .cloned()
+            .collect();
+        dropped.sort();
+        for name in &dropped {
+            self.step_states.remove(name);
+            self.completed_steps.remove(name);
+        }
+        self.steps.retain(|s| !dropped.contains(&s.name));
+        if !dropped.is_empty() {
+            self.updated_at = Utc::now();
+        }
+        dropped
+    }
+
     /// Steps left in a non-recoverable terminal status (`Failed`/`Cancelled`)
     /// by the run that saved this state.
     pub fn unrecovered_steps(&self) -> Vec<String> {
@@ -425,6 +456,75 @@ mod tests {
         let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
         let before = s.step_states.clone();
         s.rewind_to(&dag, "nope");
+        assert_eq!(s.step_states, before);
+    }
+
+    #[test]
+    fn retain_steps_in_drops_steps_the_workflow_no_longer_defines() {
+        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
+        // The workflow file gained and lost a step since this state was saved.
+        s.set_status("publish", StepState::Cancelled);
+        s.steps.push(WorkflowStepInfo {
+            name: "publish".into(),
+            depends_on: vec!["c".into()],
+            agent: None,
+            model: None,
+        });
+
+        assert_eq!(s.retain_steps_in(&dag), vec!["publish".to_string()]);
+        assert_eq!(s.status_of("publish"), None);
+        assert!(!s.steps.iter().any(|i| i.name == "publish"));
+        for name in ["a", "b", "c"] {
+            assert!(s.status_of(name).is_some(), "{name} must survive");
+        }
+    }
+
+    #[test]
+    fn retain_steps_in_clears_dropped_steps_from_completed() {
+        let (mut s, dag) = linear_fixture(&[
+            StepState::Succeeded,
+            StepState::Succeeded,
+            StepState::Succeeded,
+        ]);
+        s.set_status("publish", StepState::Succeeded);
+        assert!(s.completed_steps.contains("publish"));
+
+        s.retain_steps_in(&dag);
+        assert!(
+            !s.completed_steps.contains("publish"),
+            "a dropped step must not keep counting as a satisfied dependency"
+        );
+    }
+
+    /// The reset in `resume_with_state_root` turns an orphan from terminal to
+    /// `Pending`, and `is_complete` reads `step_states` while `next_ready`
+    /// reads the DAG — so an unpruned orphan makes the run unfinishable.
+    #[test]
+    fn retain_steps_in_is_what_lets_a_drifted_state_finish() {
+        let (mut s, dag) = linear_fixture(&[
+            StepState::Succeeded,
+            StepState::Succeeded,
+            StepState::Succeeded,
+        ]);
+        s.set_status("publish", StepState::Pending);
+        assert!(
+            !s.is_complete(),
+            "precondition: the orphan blocks completion"
+        );
+        assert!(
+            s.next_ready(&dag).is_empty(),
+            "precondition: and can never be run"
+        );
+
+        s.retain_steps_in(&dag);
+        assert!(s.is_complete());
+    }
+
+    #[test]
+    fn retain_steps_in_is_a_no_op_when_nothing_drifted() {
+        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
+        let before = s.step_states.clone();
+        assert!(s.retain_steps_in(&dag).is_empty());
         assert_eq!(s.step_states, before);
     }
 

@@ -247,6 +247,54 @@ fn wcb_enter_ignored_when_finish_unavailable() {
     );
 }
 
+/// WI-0115 §1: the board renders an unavailable action greyed out with its
+/// reason, so its arrow must not raise it. On a failure board the engine would
+/// only re-present an identical board, which reads as a broken keystroke.
+#[test]
+fn wcb_arrows_are_inert_for_actions_the_board_does_not_offer() {
+    for (key, label) in [
+        (KeyCode::Right, "launch next"),
+        (KeyCode::Left, "back to previous"),
+        (KeyCode::Up, "restart"),
+        (KeyCode::Down, "continue in container"),
+    ] {
+        let mut app = make_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[app.active_tab].dialog_response_tx = Some(tx);
+        app.active_dialog = Some(Dialog::WorkflowControlBoard(
+            crate::frontend::tui::dialogs::WorkflowControlBoardState {
+                step_name: "test".into(),
+                can_launch_next: false,
+                can_continue_current: false,
+                can_restart: false,
+                can_go_back: false,
+                can_finish: false,
+                continue_unavailable_reason: None,
+                cancel_to_previous_unavailable_reason: None,
+                finish_workflow_unavailable_reason: None,
+                restart_unavailable_reason: None,
+                can_dismiss: false,
+                launch_next_label: None,
+                focused_step_name: "test".into(),
+                parallel_peer_count: 0,
+                parallel_peers_running: 0,
+                failure_lines: vec!["Exit code: 1".into()],
+            },
+        ));
+        app.command_dialog_active = true;
+
+        press_key(&mut app, key, KeyModifiers::NONE);
+        assert!(
+            rx.try_recv().is_err(),
+            "{label} must not be raised when the board does not offer it"
+        );
+        assert!(
+            app.active_dialog.is_some(),
+            "{label}: the board must stay up so the user can pick something real"
+        );
+    }
+}
+
 #[test]
 fn wcb_ctrl_c_sends_abort() {
     let mut app = make_app();
