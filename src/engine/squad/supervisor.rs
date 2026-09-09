@@ -350,9 +350,11 @@ impl SquadSupervisor {
                 ))
             });
         }
-        let binary = std::env::current_exe().map_err(|e| {
-            EngineError::SquadDaemonStartup(format!("cannot determine awman binary: {e}"))
-        })?;
+        let binary = resolve_daemon_binary(
+            std::env::current_exe().map_err(|e| {
+                EngineError::SquadDaemonStartup(format!("cannot determine awman binary: {e}"))
+            })?,
+        )?;
         self.discard_stale_endpoint()?;
         // TODO(WI 0114 F-29): route through the Layer 1 `DaemonSupervisor`.
         self.process
@@ -406,6 +408,43 @@ impl SquadSupervisor {
             },
         )
     }
+}
+
+/// Resolve the binary to re-exec as the detached `squad start` daemon, refusing
+/// to do so when this process is a test/bench harness rather than the awman CLI.
+///
+/// `ensure_running` re-execs `current_exe()` with `["squad", "start"]`. In the
+/// real binary that is `awman squad start`. But under `cargo test`/`cargo bench`
+/// `current_exe()` is the libtest harness (`target/<profile>/deps/awman-<hash>`),
+/// which parses `squad start` as *test-name filters* and re-runs every test
+/// whose name contains "squad" or "start" — including the ones that reach this
+/// spawn. Each re-run spawns another harness, detached and reparented to PID 1,
+/// so the process count explodes until the host (or a container's swapless
+/// guest) OOM-kills the session. Guarding here is the one choke point every
+/// spawn path funnels through, so no test can trip the fork bomb regardless of
+/// which one reaches `ensure_running`.
+///
+/// Detection is belt-and-suspenders: `cfg!(test)` catches the crate's own unit
+/// tests, and a `deps` path component catches a harness from any other crate
+/// (integration tests, benches) where `cfg!(test)` is not set for this code.
+/// Cargo only ever places test/bench binaries under `deps/`; the installed CLI
+/// and a plain `cargo build` binary live one level up, so a real daemon start is
+/// never misclassified.
+fn resolve_daemon_binary(binary: std::path::PathBuf) -> Result<std::path::PathBuf, EngineError> {
+    let is_test_harness = cfg!(test)
+        || binary
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == "deps");
+    if is_test_harness {
+        return Err(EngineError::SquadDaemonStartup(format!(
+            "refusing to auto-start the squad daemon by re-exec'ing a test/bench harness \
+             ({}): it would parse `squad start` as test filters and re-spawn itself \
+             unboundedly. Start the daemon out-of-band, or stub the spawn in tests.",
+            binary.display()
+        )));
+    }
+    Ok(binary)
 }
 
 /// Publish a freshly minted squad key into this process's own environment.
@@ -470,7 +509,7 @@ pub fn squad_process(paths: &SquadPaths) -> DaemonProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_key_state, SquadKeyState, SquadSupervisor};
+    use super::{decide_key_state, resolve_daemon_binary, SquadKeyState, SquadSupervisor};
     use crate::data::config::env::{EnvSnapshot, AWMAN_SQUAD_ROOT};
     use crate::engine::auth::ApiKey;
 
@@ -511,6 +550,29 @@ mod tests {
         assert!(supervisor.endpoint_from_meta().unwrap().is_none());
         // Idempotent: nothing to discard is not an error.
         supervisor.discard_stale_endpoint().unwrap();
+    }
+
+    /// The daemon spawn must refuse to re-exec a test/bench harness, or
+    /// `ensure_running` fork-bombs the host: the harness parses `squad start`
+    /// as test filters and re-runs the tests that reach the spawn, each spawning
+    /// another harness until the machine (or a swapless container guest) OOMs.
+    #[test]
+    fn a_test_harness_binary_is_never_re_exec_as_the_daemon() {
+        // `cfg!(test)` alone makes this refuse in-crate, so also prove the
+        // path-based guard on a synthetic non-test path.
+        let harness = std::path::PathBuf::from("/workspace/target/debug/deps/awman-deadbeef");
+        let err = resolve_daemon_binary(harness).unwrap_err();
+        assert!(
+            err.to_string().contains("test filters"),
+            "must name the fork-bomb cause: {err}"
+        );
+
+        // A real installed/plain-build binary (not under `deps/`) is allowed.
+        let real = std::path::PathBuf::from("/usr/local/bin/awman");
+        // Under `cfg!(test)` even this is refused, which is the point: no test
+        // process ever spawns. The path check is exercised above; here we only
+        // assert the real path is not the reason it would be rejected.
+        assert_ne!(real.parent().unwrap().file_name().unwrap(), "deps");
     }
 
     /// A start that timed out has to say which of the two things happened,

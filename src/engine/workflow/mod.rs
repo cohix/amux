@@ -4386,17 +4386,12 @@ mod tests {
 
         // Resuming must re-run 'b' rather than declare instant success.
         let factory2 = FakeAgentExecutionFactory::new([0]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::resume(
             &session,
             wf,
             None,
             Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
             Box::new(factory2),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await
         .unwrap();
