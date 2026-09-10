@@ -4796,6 +4796,21 @@ mod tests {
         cvar.notify_all();
     }
 
+    /// Wait until `count` reaches `expected` launches, then assert it.
+    ///
+    /// Launch is asynchronous: the engine task must be scheduled and each
+    /// slot spawned before the factory increments the counter. A fixed
+    /// sleep raced that on loaded CI runners (observed: 1 launch after
+    /// 150 ms), so poll with a generous deadline instead. The assertion is
+    /// unchanged; only the wait is bounded rather than fixed.
+    async fn wait_for_execution_count(count: &AtomicUsize, expected: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while count.load(Ordering::Relaxed) < expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count.load(Ordering::Relaxed), expected);
+    }
+
     struct BlockingFactory {
         execution_count: Arc<AtomicUsize>,
         inject_count: Arc<AtomicUsize>,
@@ -7953,8 +7968,7 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         // a + b launched (2), c queued.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(execution_count.load(Ordering::Relaxed), 2);
+        wait_for_execution_count(&execution_count, 2).await;
 
         // Mark slot "a" stuck → yolo countdown → the AdvanceNow tick expires it.
         tx.send(EngineRequest::StepStuck {
@@ -8012,8 +8026,7 @@ mod tests {
 
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(execution_count.load(Ordering::Relaxed), 2);
+        wait_for_execution_count(&execution_count, 2).await;
 
         tx.send(EngineRequest::StepStuck {
             step_name: "a".to_string(),

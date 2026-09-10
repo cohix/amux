@@ -230,8 +230,17 @@ fn squad_spawn_failure_is_wrapped_with_an_attributable_daemon_message() {
         std::fs::write(&launcher, "#!/bin/sh\nexit 1\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Prepend rather than replace: the stub only needs to shadow the real
+        // launcher. Other tests in this binary spawn `git` concurrently and
+        // must keep finding it on the process-global `PATH`.
         let old_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", &bin_dir);
+        std::env::set_var(
+            "PATH",
+            match old_path.as_ref() {
+                Some(path) => format!("{}:{}", bin_dir.display(), path.to_string_lossy()),
+                None => bin_dir.display().to_string(),
+            },
+        );
         PathGuard { _lock, old_path }
     };
 
