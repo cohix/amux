@@ -674,11 +674,40 @@ impl FakeAwmanProcess {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).expect("holder permissions");
-        let child = Command::new(&executable)
-            .arg("60")
-            .spawn()
-            .expect("awman-named holder must start");
-        Self { _dir: dir, child }
+        // Under `cargo test`'s default concurrent-test-function execution,
+        // another test can fork while this thread still holds the holder's
+        // write descriptor open; the kernel then reports the just-written
+        // executable as busy (`ETXTBSY`) until that fork execs. Retry briefly
+        // rather than require `--test-threads=1`, as the other squad fixtures do.
+        let mut attempt = 0;
+        let child = loop {
+            match Command::new(&executable).arg("60").spawn() {
+                Ok(child) => break child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("awman-named holder must start: {e}"),
+            }
+        };
+
+        // `spawn` returns once the child *exists*, not once it has finished
+        // `execve`. Until that exec lands, the child's command name is still
+        // the test-function name it inherited, which `pid_is_awman` correctly
+        // rejects; a supervisor checked inside that window would treat the
+        // pidfile as stale and try to auto-start a daemon. Wait for the
+        // identity this fixture exists to present.
+        let mut child = child;
+        let pid = child.id();
+        for _ in 0..500 {
+            if awman::data::fs::daemon_process::pid_is_awman(pid) {
+                return Self { _dir: dir, child };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("awman-named holder (PID {pid}) never presented an awman command name");
     }
 
     fn id(&self) -> u32 {

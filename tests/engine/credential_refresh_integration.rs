@@ -673,8 +673,58 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(250));
+    // Collect the fake agent's output as it arrives, so the test waits on what
+    // the container has actually observed rather than on a fixed sleep. On a
+    // loaded runner `docker run` can take longer to start than the 250 ms the
+    // old sleep allowed, in which case the rotation below landed before the
+    // container's first read and only one fingerprint was ever seen.
+    let observed_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let stdout_reader = {
+        use std::io::BufRead;
+        let stdout = child.stdout.take().unwrap();
+        let observed_lines = observed_lines.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                observed_lines.lock().unwrap().push(line);
+            }
+        })
+    };
+    let stderr_reader = {
+        use std::io::Read;
+        let mut stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    };
+    let distinct_fingerprints = || -> std::collections::BTreeSet<String> {
+        observed_lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect()
+    };
+    let wait_for_distinct_fingerprints = |expected: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = distinct_fingerprints();
+            if seen.len() >= expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake agent never reported {expected} distinct fingerprint(s) within 30s: {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     // The container has now read the pre-rotation staged file at least once.
+    wait_for_distinct_fingerprints(1);
     // Arm the rotation: a near-expiry host credential is what drives
     // `refresh_agent` to run the fixture `claude` binary, which copies the
     // refreshed token over the host file. The next tick is 60s away, so this
@@ -700,17 +750,17 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         ),
         "{outcome:?}"
     );
-    std::thread::sleep(Duration::from_millis(350));
+    // The still-running container must pick up the rotated staged file on one
+    // of its subsequent reads; give it a bounded wait rather than a fixed one.
+    wait_for_distinct_fingerprints(2);
     let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
-    let observed = String::from_utf8_lossy(&output.stdout);
-    let fingerprints: std::collections::BTreeSet<_> = observed
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .collect();
+    let _ = child.wait();
+    stdout_reader.join().unwrap();
+    let container_stderr = stderr_reader.join().unwrap();
+    let fingerprints = distinct_fingerprints();
     assert!(
         fingerprints.len() >= 2,
-        "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?}"
+        "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?} (container stderr: {container_stderr:?})"
     );
     assert_eq!(
         std::fs::read(&exited_delivery.staged_path).unwrap(),
