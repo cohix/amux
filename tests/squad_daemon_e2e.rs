@@ -9,8 +9,8 @@
 //! `RemoteTaskGateway`, the CLI) is on the path — only the daemon's
 //! loopback socket is.
 //!
-//! Boots the real daemon via `frontend::squad::serve_with` (the same
-//! injectable seam `tests/squad_daemon_http.rs` uses) and drives it purely
+//! Boots the real daemon via `SquadDaemonHandles::bootstrap` +
+//! `frontend::squad::serve` (the same injectable seam `tests/squad_daemon_http.rs` uses) and drives it purely
 //! over HTTP: add → list → show → pause → resume → workflow (404, none
 //! running yet) → remove.
 
@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
+use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::dispatch::Engines;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::daemon_process::{DaemonProcess, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
@@ -146,10 +147,14 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
     let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
     std::env::set_var("AWMAN_CONFIG_HOME", root);
 
+    // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
+    // the same seam `serve_with` was, split across the layer boundary.
     let handle = tokio::spawn(async move {
-        let _ =
-            awman::frontend::squad::serve_with(config, engines, Arc::new(NeverTriggeredEvaluator))
-                .await;
+        let handles =
+            SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverTriggeredEvaluator))
+                .await
+                .expect("squad daemon bootstrap");
+        let _ = awman::frontend::squad::serve(handles).await;
     });
 
     let daemon = DaemonProcess::new(

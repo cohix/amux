@@ -1,4 +1,4 @@
-//! `NextAction`, `AvailableActions`, `StepFailureChoice`, `YoloTickOutcome`.
+//! `NextAction`, `AvailableActions`, `StepFailureContext`, `YoloTickOutcome`.
 
 use std::time::Duration;
 
@@ -64,13 +64,29 @@ pub struct AvailableActions {
     /// "Start dynamic workflow" so CLI, TUI, and API frontends all render the
     /// same presentation hint without forking the rendering code (WI-0092 §8).
     pub launch_next_label: Option<String>,
+    /// Set when the board is being shown *because* the focused step just
+    /// failed (WI-0115 §1). Frontends render it as an error banner above the
+    /// action list; `None` is the ordinary between-steps board.
+    pub step_failure: Option<StepFailureContext>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepFailureChoice {
-    Retry,
-    Pause,
-    Abort,
+/// Why the Workflow Control Board is being shown after a step failure, and
+/// what the recovery actions will actually do. Composed by the engine so every
+/// frontend renders the same copy.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StepFailureContext {
+    /// The step whose container exited non-zero.
+    pub step_name: String,
+    pub exit_code: i32,
+    pub signal: Option<i32>,
+    /// Human-readable detail lines (exit code, signal, run duration). Rendered
+    /// verbatim, in order.
+    pub detail_lines: Vec<String>,
+    /// Step `CancelToPreviousStep` returns to, when one exists.
+    pub previous_step: Option<String>,
+    /// Step `LaunchNext` starts once the failed step is skipped, when one
+    /// exists.
+    pub next_step: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +94,23 @@ pub enum YoloTickOutcome {
     Continue,
     Cancel,
     AdvanceNow,
+}
+
+/// Why a countdown reported through the `yolo_countdown_*` hooks is running.
+///
+/// The two share one reporting channel deliberately — an unattended frontend
+/// surfaces both the same way (WI-0115 §3) — but they mean opposite things to
+/// whoever is reading, so the frontend is told which it is rather than left to
+/// assume the common one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CountdownKind {
+    /// A step's container has gone quiet; when the countdown expires the
+    /// engine kills it and advances to the next step.
+    #[default]
+    StuckStep,
+    /// A step's container exited non-zero and no one can be asked what to do;
+    /// when the countdown expires the engine retries that same step.
+    FailureRetry,
 }
 
 /// What `step_once` returned: the step that just executed plus its outcome.

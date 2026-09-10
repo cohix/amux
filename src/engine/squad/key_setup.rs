@@ -65,6 +65,13 @@ impl ShellFlavor {
     }
 }
 
+/// The bare export line alone, without the banner or the surrounding notes —
+/// what a "copy the .zshrc snippet" action puts on the clipboard, so pasting
+/// it into a shell startup file doesn't also paste prose.
+pub fn export_snippet(key: &str, shell: ShellFlavor) -> String {
+    shell.export_line(key)
+}
+
 /// The box-drawn key banner plus the shell snippet that makes the key usable.
 ///
 /// Printed exactly once, by whichever process mints the key — never by the

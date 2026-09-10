@@ -1,7 +1,13 @@
 //! squad — the always-on task scheduler (Layer 1).
 //!
-//! This module owns the *engine* half of squad's evaluation machinery:
+//! This module owns the *engine* half of squad's machinery:
 //!
+//! * [`SquadDaemonEngine`] — the daemon runtime itself: database relocation,
+//!   store open and migrate, orphaned-run reconciliation, the stray-container
+//!   scan, the scheduler, and the endpoint sidecar. Layer 3 adds only a
+//!   router and a socket (WI 0113 F-02).
+//! * [`SquadSupervisor`] — daemon lifecycle for *clients*: is one running,
+//!   what does this process authenticate with, and start one on demand.
 //! * [`SquadScheduler`] — the 30s tick loop that selects due tasks
 //!   (wholly in SQL, via [`TaskStore::due_for_evaluation`]), dispatches
 //!   each onto a bounded task set, records run rows, and grows an exponential
@@ -18,18 +24,24 @@
 //!
 //! [`TaskStore::due_for_evaluation`]: crate::data::fs::TaskStore::due_for_evaluation
 
+pub mod daemon;
 pub mod evaluator;
+pub mod key_setup;
 pub mod launcher;
 pub mod scheduler;
+pub mod supervisor;
 pub mod verdict;
 
+pub use daemon::{SquadDaemonDeps, SquadDaemonEngine};
 pub use evaluator::{
     EvaluationOutcome, EvaluationRequest, NoRunProgress, RunProgress, TaskEvaluator,
 };
 pub use launcher::{
-    drive_unattended_agent, ensure_directory_workspace_project, LeaderRunSpec, SquadAgentLauncher,
+    drive_unattended_agent, ensure_directory_workspace_project, LeaderExit, LeaderRunSpec,
+    SquadAgentLauncher, UnattendedExit,
 };
 pub use scheduler::{SchedulerStatus, SquadScheduler, TICK_INTERVAL};
+pub use supervisor::{SquadEndpoint, SquadKeyState, SquadSupervisor};
 pub use verdict::{
     read_verdict, verdict_path, RunVerdict, VerdictError, RUN_DIR_CONTAINER_PATH, VERDICT_FILE_NAME,
 };

@@ -58,6 +58,8 @@ Update to the new version. There is no `Cargo.lock` to worry about in this proje
 
 ## Step 3: Update README.md
 
+**Writing about squad:** squad is a *group of agents the reader owns*, not a daemon or a scheduler. Write "your squad is a group of agents that…", "create a squad to automate your work", "create a new task for your squad to tackle" — never "squad is a background daemon" or "automate work with squad". "squad daemon" stays only in lifecycle, auth, and API-conflict material (`squad start`/`stop`/`logs`, `AWMAN_SQUAD_KEY`), where it names the literal process and matches the literal error text a reader will hit.
+
 Check for any new top-level commands or major features that aren't mentioned. The README has a "Commands" section — add new subcommands there. Keep it brief: one line per command.
 
 If the feature is significant enough to have its own section (like `awman claws` got in v0.2), add one. Otherwise, a line in the commands table is enough.

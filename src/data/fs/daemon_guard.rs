@@ -16,7 +16,6 @@ use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::daemon_process::{
     DaemonProcess, API_PLIST_LABEL, API_UNIT_NAME, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
 };
-use crate::data::fs::data_paths::DataPaths;
 use crate::data::fs::squad_paths::SquadPaths;
 
 /// Name of the shared startup-arbitration lock. It lives beside the shared

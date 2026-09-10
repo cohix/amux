@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod error;
 pub mod session_create;
 pub mod session_setup;
+pub mod startup;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{
@@ -21,3 +22,4 @@ pub use session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest, DEFAULT_REPO_URL_SCHEMES,
 };
 pub use session_setup::{SessionSetup, SessionSetupObserver};
+pub use startup::{Startup, StartupOutcome};

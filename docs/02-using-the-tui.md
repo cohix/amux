@@ -19,7 +19,7 @@ The TUI runs `awman ready` automatically on the first tab. This checks that your
 
 **Outside a Git repository:**
 
-If the working directory is not inside a Git repository, the TUI runs `awman status --watch` instead, streaming a live status view. This is useful for monitoring an API server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**.
+If the working directory is not inside a Git repository, the TUI runs `awman status --watch` instead, streaming a live status view. This is useful for monitoring an API server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**. You can also use **Ctrl+T** to open a non-Git directory: awman keeps that directory as the tab's working directory and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
 
@@ -52,7 +52,13 @@ The TUI is composed of three areas:
 
 - **Tab bar** (top) — one entry per open session, with colour-coded state
 - **Execution window** (middle) — shows command output; overlaid by the container window when an agent is running
-- **Command box** (bottom) — where you type subcommands
+- **Command box** (bottom) — where you type subcommands. On the [squad tab](#the-squad-tab) it is permanently inactive and the card grid holds focus instead.
+
+The single row under the command box shows the working directory (or the
+active worktree) and, pinned to its right edge on every tab, the `squad ●`
+indicator — a circle whose colour is the squad daemon's health (grey not
+running, green healthy, yellow unreachable, blue a task is running, red a
+task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicator).
 
 ---
 
@@ -284,7 +290,7 @@ Whenever awman launches a container to run a code agent, a **container window** 
 │  [agent output — full terminal emulation]                    │
 │                                                               │
 ╰───────────────────────────────────────────────────────────────╯
-  Ctrl-M toggle  ·  scroll ↕ history  ·  drag select  ·  Ctrl+Y copy
+  ctrl-m minimize  ·  ctrl-\ detach  ·  scroll ↕ history
 ```
 
 The title bar shows the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 5 seconds.
@@ -299,6 +305,7 @@ When the container window is visible and maximized, almost all keyboard input is
 | **Esc** | Forwarded to the agent (`\x1b`) — for vim, fzf, REPLs, and other interactive programs |
 | **Tab / Shift+Tab** | Forwarded to the agent |
 | **Ctrl+M** | Toggle: minimize the container window (agent keeps running) |
+| **Ctrl+\\** | Detach: leave the container view without sending anything to the agent |
 | Mouse scroll | Sent to agent (if it has mouse tracking enabled), or scroll terminal scrollback (5 lines per tick) |
 | Mouse drag | Select text (highlighted with inverted colours) — always under awman's control |
 | **Ctrl+Y** | Copy the current selection to clipboard (ANSI stripped) |
@@ -353,6 +360,26 @@ From the minimized or hidden state:
 | **↑ / ↓** | Scroll the execution window (behind the status bar) |
 | **b / e** | Jump to beginning / end of execution window |
 | **Esc** | Return focus to command box |
+
+### Detaching from a container
+
+While a container is maximized, almost every key you press is forwarded to the
+agent — **including Ctrl+C**, which is what lets you interrupt an agent on
+purpose. That makes Ctrl+C the wrong way to simply stop looking at a container:
+it interrupts work you may want to leave running.
+
+**Ctrl+\\** detaches instead. awman intercepts it before the forwarding path, so
+not a byte reaches the agent:
+
+- On an ordinary tab, the container window is minimized. The command keeps
+  running, output keeps streaming into its 1-line status bar, and **Ctrl+M**
+  brings the view back.
+- On the [squad tab](12-squad.md#attaching-to-a-running-task), the attach session
+  ends: the local attach clients are closed, every container the squad daemon is
+  running is left alone, and you return to the task grid, where **a** reattaches.
+
+The hint bar above the command box shows `ctrl-\ detach` whenever keys are being
+forwarded to a container.
 
 ### When the container exits
 
@@ -425,7 +452,7 @@ A single container is just the one-container case of the same display: Maximized
 
 ## The Workflow Overview — Ctrl-O
 
-While a workflow runs, the **Workflow Overview** sits between the container area and the status bar, showing one rounded box per stage of the workflow with arrows joining the stages. Each box carries the step's status glyph and colour, its name, and — when the step overrides them — its `agent/model` label on the top border. See [Workflow Overview and step status](05-workflows.md#workflow-overview-and-step-status) for what each glyph and colour means.
+While a workflow runs, the **Workflow Overview** sits between the container area and the status bar, showing one rounded box per stage of the workflow with arrows joining the stages. Each box carries the step's status glyph and colour, its name, and a top-border title: the resolved `agent/model` for a main step (when it overrides them), or `[setup]`/`[teardown]` for a setup or teardown step — which always get their own leading/trailing column rather than being grouped in with the main steps. See [Workflow Overview and step status](05-workflows.md#workflow-overview-and-step-status) for what each glyph and colour means.
 
 The overview has two sizes. Press **Ctrl-O** (*o* for "overview") to minimize or maximize it. The status bar advertises whichever direction it can currently go — `ctrl-o maximize workflow overview` while it is minimized, `ctrl-o minimize workflow overview` while it is maximized.
 
@@ -547,6 +574,10 @@ The same per-entry edits work on the command line: `awman config set dynamicWork
 
 Press **Ctrl+T** to open a new tab. Each tab has its own working directory, execution window, and container session. Tabs run independently in the background when you switch away.
 
+The directory chosen in the New Tab dialog does not have to be a Git
+repository. For a non-Git directory, awman uses that directory as the tab's
+working directory and starts `status --watch`; Git-backed tabs start `ready`.
+
 ```
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab
@@ -593,13 +624,13 @@ For full details on creating remote-bound tabs, the create-session sub-modal, an
 
 ### The squad tab
 
-squad — awman's always-on task-watching daemon — gets its own singleton
+squad — your group of agents, working through the tasks you give them — gets its own singleton
 tab inside this same multi-tab TUI rather than a separate program. Open it
 either of two ways:
 
 - Press **Ctrl+T** to open the New Tab dialog, then press **Ctrl-S** while
-  it's focused. The dialog's prompt shows a hint — "Press Ctrl-S to open
-  squad" — as a reminder. This doesn't add a second global `Ctrl-S` binding:
+  it's focused. The dialog's key-hint row lists it — `[Ctrl+S] open squad` —
+  beside Enter and Esc. This doesn't add a second global `Ctrl-S` binding:
   outside the New Tab dialog, `Ctrl-S` keeps its usual meanings (cycling
   parallel container slots, submitting multiline dialogs).
 - Run `awman squad` with no subcommand from a terminal (with a TTY attached
@@ -612,27 +643,37 @@ directory name, since it isn't bound to a project directory.
 
 Otherwise it's an ordinary tab: it takes part in **Ctrl-A**/**Ctrl-D** tab
 cycling, closes through the normal close-tab flow, and keeps its state
-while you're on a different tab. The command box below it still works
-exactly as it does on any other tab — you can type `squad <subcommand> ...`
-directly into it. The one difference is what fills the execution window
-above the command box: squad's task list instead of plain command
-output, and, once you attach to a running task, the same
+while you're on a different tab. Two things differ. The command box below
+it is permanently inactive — it reads `command (inactive)` with a reminder
+to use the arrow keys and **Enter** — because the task grid holds focus the
+whole time you're on the tab, so the arrows work immediately and **Esc**
+does nothing (type `squad <subcommand> ...` into any other tab's command box
+instead). And what fills the execution window is squad's task list instead
+of plain command output — or, once you attach to a running task, the same
 container / Workflow Overview view a regular workflow tab shows. **Ctrl-G** (the
 git sidebar) is a no-op here, since the tab has no repository to show.
 
 The task list is a grid of generously sized rounded cards rather than a
-table. Each card shows the task name, a short description summary, the
-outcome and time of its last run (`workflow executed`, `not triggered`,
-`failed`, `interrupted`, `running`, or `never run`), and its next scheduled
-evaluation — which reads `paused` for a paused task. The grid reflows
-when the terminal is resized. Use **↑**, **↓**, **←**, and **→** to move among
+table. The task name is the card's title, and every value below it carries a
+grey label: `Description`, `Last run` (when it last ran), `Outcome` (what that
+run did — `workflow executed`, `not triggered`, `failed`, `interrupted`,
+`running`, or `never run`), and `Next` (its next scheduled evaluation, which
+reads `paused` for a paused task). The grid reflows when the terminal is
+resized. Use **↑**, **↓**, **←**, and **→** to move among
 cards; selection remains on the same task when the number of columns changes.
 
 Press **Enter** to open a task's details. The modal includes the task's
 workspace, mount scope, interval, overlays, agent/model, timestamps, and run
-history. Its footer repeats the available actions: **a** attach, **p** pause,
-**r** resume, **d** delete, and **Esc** close. These actions apply to the task
-shown by the modal.
+history. Its footer repeats the available actions: **a** attach, **e** edit,
+**t** trigger, **p** pause, **r** resume, **d** delete, and **Esc** close. These
+actions apply to the task shown by the modal.
+
+Press **t** to evaluate a task now rather than waiting for its interval. It
+changes nothing about the task's schedule — see
+[Triggering a task now](12-squad.md#triggering-a-task-now).
+
+When a squad action fails, the reason appears in red in the hint bar directly
+above the command box.
 
 Press **n** to create a task. The description step opens the same large,
 multiline editor used by the specification interview and asks:
@@ -651,6 +692,11 @@ the documented default, or ends the overlay list — while **Esc** dismisses the
 interview outright. Nothing is saved if the interview is dismissed before it
 is complete. See [squad](12-squad.md) and [Overlays](08-overlays.md)
 for the full behavior and overlay reference.
+
+If the squad daemon needs a bearer key this session does not have, the tab is
+not opened; a modal explains why and offers to mint a new key and restart the
+daemon onto it. Accepting shows you the new key and its shell snippet — see
+[squad: When the key is missing](12-squad.md#when-the-key-is-missing).
 
 See [squad](12-squad.md) for what tasks are, the squad tab's key
 bindings, and attaching to a running task.
@@ -683,6 +729,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |
+| **Ctrl+\\** | Detach from the container view, leaving every container running (see [Detaching](#detaching-from-a-container)) |
 | **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
 | **Ctrl+,** | Open / close the configuration dialog |
@@ -724,6 +771,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | Type | Forward input directly to the agent |
 | **Ctrl+M** | Minimize the container window |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (intercepted before the agent, like Ctrl+M) |
+| **Ctrl+\\** | Detach from the container view (intercepted before the agent — never reaches it) |
 | Mouse scroll | Scroll terminal scrollback history (5 lines per tick) |
 | Mouse drag | Select text in the terminal (highlighted with inverted colors) |
 | **Ctrl+Y** | Copy selected text to clipboard (ANSI codes stripped) |

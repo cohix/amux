@@ -207,7 +207,9 @@ impl SquadAgentLauncher {
         }
     }
 
-    /// Seed, launch, and await the leader agent, returning its exit info.
+    /// Seed, launch, and await the leader agent, returning its exit, the
+    /// container name it ran as, and whether the yolo countdown killed it
+    /// (WI 0112 Part 6: a countdown kill is never a failed run).
     ///
     /// Seeding is idempotent: the task directory is created once and never
     /// recreated per run (`context(global)` semantics). Leader-written files,
@@ -217,7 +219,7 @@ impl SquadAgentLauncher {
         &self,
         spec: LeaderRunSpec,
         frontend: Box<dyn AgentFrontend>,
-    ) -> Result<AgentExitInfo, EngineError> {
+    ) -> Result<LeaderExit, EngineError> {
         // `naming.rs` documents slug validation as the caller's responsibility.
         // Re-check it here so this primitive is self-defending: today the only
         // insertion path validates at task creation, but a future second
@@ -245,12 +247,21 @@ impl SquadAgentLauncher {
 
         let instance: Box<dyn AgentInstance> = self.runtime.build(resolved)?;
         let execution = instance.run_with_frontend(frontend)?;
+        let container_name = execution.handle().name.clone();
         // The leader runs interactively (PTY) under yolo, so its agent TUI
         // stays open after finishing its work rather than exiting. Drive it
         // through the same stuck → yolo countdown → auto-advance machinery a
         // dynamic workflow's leader uses, or the evaluation would wait on an
         // idle agent forever.
-        drive_unattended_agent(execution, &spec.task_name, "leader").await
+        let UnattendedExit {
+            exit,
+            killed_by_countdown,
+        } = drive_unattended_agent(execution, &spec.task_name, "leader").await?;
+        Ok(LeaderExit {
+            exit,
+            container_name,
+            killed_by_countdown,
+        })
     }
 
     /// Write the dynamic-workflow reference assets into the durable task
@@ -293,11 +304,16 @@ impl SquadAgentLauncher {
 ///
 /// Logging is lifecycle-only: countdown started / cancelled / auto-advanced.
 /// No per-tick messages ever reach the daemon log.
+///
+/// The result says whether the countdown did the killing (WI 0112 Part 6):
+/// that is the one exit a caller must not count as a failed run, and it is
+/// not recoverable from the exit code alone — a 137 the container produced on
+/// its own (an OOM kill, an external `docker kill`) looks identical.
 pub async fn drive_unattended_agent(
     mut execution: AgentExecution,
     task: &str,
     label: &str,
-) -> Result<AgentExitInfo, EngineError> {
+) -> Result<UnattendedExit, EngineError> {
     let cancel = execution.cancel_handle();
     let mut stuck_rx = execution.subscribe_stuck();
     let (wait_tx, mut wait_rx) =
@@ -312,7 +328,8 @@ pub async fn drive_unattended_agent(
             biased;
             result = &mut wait_rx => {
                 return result
-                    .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?;
+                    .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
+                    .map(UnattendedExit::own_exit);
             }
             ev = stuck_rx.recv() => match ev {
                 Ok(StuckEvent::Stuck) => {
@@ -324,7 +341,9 @@ pub async fn drive_unattended_agent(
                         YOLO_COUNTDOWN_DURATION.as_secs(),
                     );
                     match run_unattended_countdown(task, label, &mut wait_rx, &mut stuck_rx).await {
-                        CountdownOutcome::Exited(result) => return result,
+                        CountdownOutcome::Exited(result) => {
+                            return result.map(UnattendedExit::own_exit)
+                        }
                         CountdownOutcome::Recovered => {}
                         CountdownOutcome::Expired => {
                             tracing::info!(
@@ -339,14 +358,18 @@ pub async fn drive_unattended_agent(
                             // The kill makes the real wait resolve; fall back to
                             // a synthetic killed exit if the backend errors.
                             let now = chrono::Utc::now();
-                            return Ok((&mut wait_rx).await.ok().and_then(Result::ok).unwrap_or(
+                            let exit = (&mut wait_rx).await.ok().and_then(Result::ok).unwrap_or(
                                 AgentExitInfo {
                                     exit_code: KILLED_EXIT_CODE,
                                     signal: None,
                                     started_at: now,
                                     ended_at: now,
                                 },
-                            ));
+                            );
+                            return Ok(UnattendedExit {
+                                exit,
+                                killed_by_countdown: true,
+                            });
                         }
                     }
                 }
@@ -366,11 +389,43 @@ pub async fn drive_unattended_agent(
                     // No more stuck events can arrive — just wait for exit.
                     return (&mut wait_rx)
                         .await
-                        .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?;
+                        .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
+                        .map(UnattendedExit::own_exit);
                 }
             }
         }
     }
+}
+
+/// How an unattended agent ended: its exit, and whether the yolo countdown
+/// was what ended it.
+#[derive(Debug, Clone)]
+pub struct UnattendedExit {
+    pub exit: AgentExitInfo,
+    /// `true` only when [`drive_unattended_agent`]'s countdown expired and
+    /// killed the container. An agent that exited on its own — with any
+    /// code, 137 included — is `false`.
+    pub killed_by_countdown: bool,
+}
+
+impl UnattendedExit {
+    /// An exit the container produced on its own.
+    fn own_exit(exit: AgentExitInfo) -> Self {
+        Self {
+            exit,
+            killed_by_countdown: false,
+        }
+    }
+}
+
+/// What [`SquadAgentLauncher::run_leader`] returns: the leader's exit, the
+/// container it ran as (so the evaluator can name the run log it wrote), and
+/// whether the countdown killed it.
+#[derive(Debug, Clone)]
+pub struct LeaderExit {
+    pub exit: AgentExitInfo,
+    pub container_name: String,
+    pub killed_by_countdown: bool,
 }
 
 /// How one countdown window ended.
@@ -448,7 +503,35 @@ mod tests {
         let exit = drive_unattended_agent(execution, "t", "leader")
             .await
             .unwrap();
-        assert_eq!(exit.exit_code, 3);
+        assert_eq!(exit.exit.exit_code, 3);
+        assert!(
+            !exit.killed_by_countdown,
+            "an agent that exited on its own was not killed by the countdown"
+        );
+    }
+
+    /// WI 0112 Part 6: a self-produced 137 is *not* a countdown kill. Only the
+    /// `Expired` arm of the countdown sets the flag.
+    #[tokio::test]
+    async fn a_self_produced_137_is_not_reported_as_a_countdown_kill() {
+        let now = chrono::Utc::now();
+        let handle = crate::data::session::AgentHandle {
+            id: "id".into(),
+            image_tag: "img".into(),
+            name: "awman-squad-t-00000000".into(),
+            started_at: now,
+        };
+        let info = AgentExitInfo {
+            exit_code: KILLED_EXIT_CODE,
+            signal: Some(9),
+            started_at: now,
+            ended_at: now,
+        };
+        let exit = drive_unattended_agent(AgentExecution::finished(handle, info), "t", "leader")
+            .await
+            .unwrap();
+        assert_eq!(exit.exit.exit_code, KILLED_EXIT_CODE);
+        assert!(!exit.killed_by_countdown);
     }
 
     #[test]

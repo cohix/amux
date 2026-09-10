@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::data::workflow_definition::{SetupStep, TeardownStep};
+use crate::data::workflow_definition::{CloneConflictMode, SetupStep, TeardownStep};
 use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
 
 /// Quote `s` as a single POSIX shell word so embedded whitespace, quotes, and
@@ -31,18 +31,68 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
+/// Directory a `clone_repo` step will clone into: the `into` field when set,
+/// otherwise the "humanish" name git derives from the URL (last path
+/// component, trailing `/` and `.git` stripped).
+fn clone_target_dir(url: &str, into: Option<&str>) -> String {
+    if let Some(d) = into {
+        return d.to_string();
+    }
+    let trimmed = url.trim_end_matches('/');
+    let name = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
+    name.strip_suffix(".git").unwrap_or(name).to_string()
+}
+
 /// Translate a setup step into a shell command string and optional env overrides.
 pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, String>>) {
     match step {
-        SetupStep::CloneRepo { url, branch, into } => {
-            let mut cmd = "git clone".to_string();
+        SetupStep::CloneRepo {
+            url,
+            branch,
+            into,
+            conflict_mode,
+        } => {
+            let mut clone = "git clone".to_string();
             if let Some(b) = branch {
-                cmd.push_str(&format!(" -b {}", sh_quote(b)));
+                clone.push_str(&format!(" -b {}", sh_quote(b)));
             }
-            cmd.push_str(&format!(" {}", sh_quote(url)));
+            clone.push_str(&format!(" {}", sh_quote(url)));
             if let Some(d) = into {
-                cmd.push_str(&format!(" {}", sh_quote(d)));
+                clone.push_str(&format!(" {}", sh_quote(d)));
             }
+            // The step is a conflict only when the target directory already
+            // holds a clone of this exact URL (per remote.origin.url in its
+            // .git/config); `conflict_mode` decides what happens then. A
+            // directory occupied by anything else is left alone in every mode
+            // — `git clone` itself fails on it with a clear error.
+            let dir = clone_target_dir(url, into.as_deref());
+            let already_cloned = format!(
+                "[ -f {config_q} ] && [ \"$(git -C {dir_q} config --get remote.origin.url)\" = {url_q} ]",
+                config_q = sh_quote(&format!("{dir}/.git/config")),
+                dir_q = sh_quote(&dir),
+                url_q = sh_quote(url),
+            );
+            let cmd = match conflict_mode {
+                CloneConflictMode::Skip => format!(
+                    "if {already_cloned}; then echo {msg_q}; else {clone}; fi",
+                    msg_q = sh_quote(&format!(
+                        "clone_repo: {dir} already cloned from {url}; skipping"
+                    )),
+                ),
+                CloneConflictMode::Replace => format!(
+                    "if {already_cloned}; then echo {msg_q}; rm -rf {dir_q}; fi; {clone}",
+                    msg_q = sh_quote(&format!(
+                        "clone_repo: {dir} already cloned from {url}; replacing"
+                    )),
+                    dir_q = sh_quote(&dir),
+                ),
+                CloneConflictMode::Error => format!(
+                    "if {already_cloned}; then echo {msg_q} >&2; exit 1; else {clone}; fi",
+                    msg_q = sh_quote(&format!(
+                        "clone_repo: {dir} already cloned from {url} (conflict_mode = error)"
+                    )),
+                ),
+            };
             (cmd, None)
         }
         SetupStep::CheckoutCreateBranch { branch, base } => {
@@ -178,10 +228,16 @@ fn sub_opt(s: &Option<String>, ctx: Option<&WorkItemContext>) -> Option<String> 
 /// Apply work-item template substitution to all string fields of a setup step.
 pub fn substitute_setup_step(step: &SetupStep, ctx: Option<&WorkItemContext>) -> SetupStep {
     match step {
-        SetupStep::CloneRepo { url, branch, into } => SetupStep::CloneRepo {
+        SetupStep::CloneRepo {
+            url,
+            branch,
+            into,
+            conflict_mode,
+        } => SetupStep::CloneRepo {
             url: sub(url, ctx),
             branch: sub_opt(branch, ctx),
             into: sub_opt(into, ctx),
+            conflict_mode: *conflict_mode,
         },
         SetupStep::CheckoutCreateBranch { branch, base } => SetupStep::CheckoutCreateBranch {
             branch: sub(branch, ctx),
@@ -265,11 +321,12 @@ mod tests {
             url: "https://github.com/org/repo".to_string(),
             branch: Some("main".to_string()),
             into: Some("subdir".to_string()),
+            conflict_mode: CloneConflictMode::Skip,
         };
         let (cmd, env) = setup_step_to_shell(&step);
         assert_eq!(
             cmd,
-            "git clone -b 'main' 'https://github.com/org/repo' 'subdir'"
+            "if [ -f 'subdir/.git/config' ] && [ \"$(git -C 'subdir' config --get remote.origin.url)\" = 'https://github.com/org/repo' ]; then echo 'clone_repo: subdir already cloned from https://github.com/org/repo; skipping'; else git clone -b 'main' 'https://github.com/org/repo' 'subdir'; fi"
         );
         assert!(env.is_none());
     }
@@ -280,9 +337,67 @@ mod tests {
             url: "https://github.com/org/repo".to_string(),
             branch: None,
             into: None,
+            conflict_mode: CloneConflictMode::Skip,
         };
         let (cmd, _) = setup_step_to_shell(&step);
-        assert_eq!(cmd, "git clone 'https://github.com/org/repo'");
+        assert_eq!(
+            cmd,
+            "if [ -f 'repo/.git/config' ] && [ \"$(git -C 'repo' config --get remote.origin.url)\" = 'https://github.com/org/repo' ]; then echo 'clone_repo: repo already cloned from https://github.com/org/repo; skipping'; else git clone 'https://github.com/org/repo'; fi"
+        );
+    }
+
+    #[test]
+    fn clone_repo_conflict_mode_replace() {
+        let step = SetupStep::CloneRepo {
+            url: "https://github.com/org/repo".to_string(),
+            branch: None,
+            into: None,
+            conflict_mode: CloneConflictMode::Replace,
+        };
+        let (cmd, _) = setup_step_to_shell(&step);
+        assert_eq!(
+            cmd,
+            "if [ -f 'repo/.git/config' ] && [ \"$(git -C 'repo' config --get remote.origin.url)\" = 'https://github.com/org/repo' ]; then echo 'clone_repo: repo already cloned from https://github.com/org/repo; replacing'; rm -rf 'repo'; fi; git clone 'https://github.com/org/repo'"
+        );
+    }
+
+    #[test]
+    fn clone_repo_conflict_mode_error() {
+        let step = SetupStep::CloneRepo {
+            url: "https://github.com/org/repo".to_string(),
+            branch: None,
+            into: None,
+            conflict_mode: CloneConflictMode::Error,
+        };
+        let (cmd, _) = setup_step_to_shell(&step);
+        assert_eq!(
+            cmd,
+            "if [ -f 'repo/.git/config' ] && [ \"$(git -C 'repo' config --get remote.origin.url)\" = 'https://github.com/org/repo' ]; then echo 'clone_repo: repo already cloned from https://github.com/org/repo (conflict_mode = error)' >&2; exit 1; else git clone 'https://github.com/org/repo'; fi"
+        );
+    }
+
+    #[test]
+    fn clone_target_dir_derives_default_name() {
+        assert_eq!(
+            clone_target_dir("https://github.com/org/repo", None),
+            "repo"
+        );
+        assert_eq!(
+            clone_target_dir("https://github.com/org/repo.git", None),
+            "repo"
+        );
+        assert_eq!(
+            clone_target_dir("https://github.com/org/repo.git/", None),
+            "repo"
+        );
+        assert_eq!(
+            clone_target_dir("git@github.com:org/repo.git", None),
+            "repo"
+        );
+        assert_eq!(
+            clone_target_dir("https://github.com/org/repo", Some("subdir")),
+            "subdir"
+        );
     }
 
     #[test]
@@ -507,6 +622,7 @@ mod tests {
                 url: "https://x.com/repo".to_string(),
                 branch: None,
                 into: None,
+                conflict_mode: CloneConflictMode::Skip,
             }),
             "clone_repo: https://x.com/repo"
         );

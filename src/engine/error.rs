@@ -108,6 +108,31 @@ pub enum EngineError {
     #[error("image build for tag '{tag}' exited with code {exit_code}")]
     ImageBuildExitNonzero { tag: String, exit_code: i32 },
 
+    // ── squad daemon lifecycle (WI 0113 F-02) ─────────────────────────────
+    //
+    // `SquadSupervisor` and `SquadDaemonEngine` live at Layer 1 and must not
+    // reach for `CommandError`. Layer 2 maps these through the existing
+    // `From<EngineError> for CommandError` impl, so the user-facing text is
+    // unchanged from when the supervisor lived one layer up.
+    #[error(
+        "squad requires a container runtime. The configured runtime \"{runtime}\" cannot mount \
+         squad's task directories or run workflow setup/teardown steps. Set runtime to \
+         \"docker\" or \"apple-containers\" to use squad."
+    )]
+    SquadRuntimeUnsupported { runtime: String },
+
+    /// `awman api` already holds the machine. Typed separately from a
+    /// startup failure so a frontend can report a conflict as a conflict
+    /// without matching on the message text (WI 0113 F-04).
+    #[error("{0}")]
+    SquadDaemonConflict(String),
+
+    #[error("{0}")]
+    SquadDaemonStartup(String),
+
+    #[error("{0}")]
+    SquadDaemonUnreachable(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 

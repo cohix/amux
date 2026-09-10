@@ -1,7 +1,7 @@
 //! The task gateway keeps squad commands identical for local daemon and
 //! remote CLI/TUI callers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,9 +16,13 @@ use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::global::GlobalConfig;
-use crate::data::fs::task_store::{MountScope, Run, Task, TaskStatus, TaskStore, TaskWorkspace};
+use crate::data::config::repo::SquadConfig;
+use crate::data::fs::task_store::{
+    MountScope, Run, Task, TaskStatus, TaskStore, TaskUpdate, TaskWorkspace,
+};
 use crate::data::fs::SquadPaths;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
+use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::naming::validate_task_slug;
 use crate::engine::squad::SchedulerStatus;
 
@@ -56,6 +60,112 @@ pub struct CreateTask {
     /// (`docs/08-overlays.md`).
     #[serde(default)]
     pub overlays: Vec<String>,
+    /// The task's own agent pool, written to `tasks/<name>/config.json` as a
+    /// `squad.agentsToModels` block (WI 0110). Empty means "no task config":
+    /// the task inherits the global `squad` block whole.
+    #[serde(default)]
+    pub agents_to_models: BTreeMap<String, Vec<String>>,
+}
+
+/// The fields `squad edit` may change on an existing task (WI 0110).
+///
+/// Every field is "leave alone" when absent. The two nullable ones use
+/// `Option<Option<_>>` so an edit can distinguish *not mentioned* from
+/// *cleared back to the squad default*, which a bare `Option` could not.
+///
+/// Absent by design: `name` (the task's identity, its data directory, and its
+/// container names), `workspace` and `mount_scope` (capture-once isolation
+/// decisions — see [`Task`]'s type-level docs). Changing those means creating a
+/// different task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateTask {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    /// `None` leaves the agent alone; `Some(None)` clears it back to the squad
+    /// default; `Some(Some(a))` sets it.
+    #[serde(default)]
+    pub agent: Option<Option<String>>,
+    /// As [`agent`](Self::agent), for the model.
+    #[serde(default)]
+    pub model: Option<Option<String>>,
+    /// Replaces the whole overlay list when given (an empty vector clears it).
+    #[serde(default)]
+    pub overlays: Option<Vec<String>>,
+    /// Replaces the task's `config.json` agent pool when given; an empty map
+    /// removes the task config so the task inherits the global block again.
+    #[serde(default)]
+    pub agents_to_models: Option<BTreeMap<String, Vec<String>>>,
+}
+
+impl UpdateTask {
+    /// Whether this request would change nothing. `squad edit` refuses such a
+    /// request rather than writing an update whose only effect is bumping
+    /// `updated_at`.
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none()
+            && self.interval_secs.is_none()
+            && self.agent.is_none()
+            && self.model.is_none()
+            && self.overlays.is_none()
+            && self.agents_to_models.is_none()
+    }
+
+    /// The subset of this request the task *row* carries. `agents_to_models`
+    /// is deliberately absent: it lives in the task's `config.json`, not in
+    /// the database, so the store never learns about it.
+    fn to_store_update(&self) -> TaskUpdate {
+        TaskUpdate {
+            description: self.description.clone(),
+            interval_secs: self.interval_secs,
+            agent: self.agent.clone(),
+            model: self.model.clone(),
+            overlays: self.overlays.clone(),
+        }
+    }
+}
+
+/// Parse `--agent-models` specs (`<agent>=<model>[,<model>…]`) into the
+/// `agentsToModels` map they describe (WI 0110).
+///
+/// One spec per agent; repeating an agent merges its models, preserving order
+/// and dropping duplicates, so `--agent-models claude=a --agent-models claude=b`
+/// and `--agent-models claude=a,b` mean the same thing.
+pub fn parse_agent_models_specs(specs: &[String]) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for spec in specs {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let (agent, models) = spec.split_once('=').ok_or_else(|| {
+            format!("agent-models spec {spec:?} must be written <agent>=<model>[,<model>...]")
+        })?;
+        let agent = agent.trim();
+        if agent.is_empty() {
+            return Err(format!("agent-models spec {spec:?} names no agent"));
+        }
+        let entry = map.entry(agent.to_string()).or_default();
+        for model in models.split(',') {
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            if !entry.iter().any(|existing| existing == model) {
+                entry.push(model.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Render an `agentsToModels` map back into `--agent-models` spec strings, so
+/// the remote gateway can send over the wire exactly what the CLI parses.
+pub fn format_agent_models_specs(map: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    map.iter()
+        .map(|(agent, models)| format!("{agent}={}", models.join(",")))
+        .collect()
 }
 
 /// The `squad show` response: one task plus its recent run history.
@@ -82,12 +192,24 @@ pub struct DaemonStatus {
 #[async_trait]
 pub trait TaskGateway: Send + Sync {
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError>;
+    /// Apply an edit to an existing task, returning it as it now stands.
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError>;
     async fn list(&self) -> Result<Vec<Task>, CommandError>;
     async fn get(&self, name: &str) -> Result<Task, CommandError>;
     async fn runs(&self, name: &str, limit: usize) -> Result<Vec<Run>, CommandError>;
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError>;
+    /// Ask for `name` to be evaluated on the next scheduler tick, whatever its
+    /// interval and backoff would otherwise say.
+    async fn trigger(&self, name: &str) -> Result<(), CommandError>;
     async fn delete(&self, name: &str) -> Result<(), CommandError>;
     async fn status(&self) -> Result<DaemonStatus, CommandError>;
+    /// Read the state of the task's currently running workflow, if any.
+    ///
+    /// The default keeps lightweight test gateways source-compatible; real
+    /// gateways implement the transport-specific lookup below.
+    async fn workflow_state(&self, _task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        Ok(None)
+    }
 }
 
 /// Boxable adaptor for Dispatch's shared daemon gateway handle.
@@ -97,6 +219,9 @@ pub struct SharedTaskGateway(pub Arc<dyn TaskGateway>);
 impl TaskGateway for SharedTaskGateway {
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         self.0.create(req).await
+    }
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        self.0.update(name, req).await
     }
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
         self.0.list().await
@@ -110,11 +235,17 @@ impl TaskGateway for SharedTaskGateway {
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
         self.0.set_status(name, status).await
     }
+    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
+        self.0.trigger(name).await
+    }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.0.delete(name).await
     }
     async fn status(&self) -> Result<DaemonStatus, CommandError> {
         self.0.status().await
+    }
+    async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        self.0.workflow_state(task).await
     }
 }
 
@@ -178,6 +309,10 @@ impl LocalTaskGateway {
         if let Some(agent) = &req.agent {
             agents.insert(agent.clone());
         }
+        // The task's own pool counts as much as the global one: the leader
+        // picks its workflow's step agents from whichever pool applies, and
+        // every one of them needs a Dockerfile in the repository (WI 0110).
+        agents.extend(req.agents_to_models.keys().cloned());
         if let Some(pool) = GlobalConfig::load()?
             .squad
             .and_then(|cfg| cfg.agents_to_models)
@@ -295,6 +430,60 @@ impl LocalTaskGateway {
         std::fs::create_dir_all(dir)
             .map_err(|error| CommandError::Data(crate::data::error::DataError::io(dir, error)))
     }
+
+    /// Write (or remove) a task's own `config.json` (WI 0110).
+    ///
+    /// An empty pool removes the file rather than writing an empty block, so
+    /// "no task config" has exactly one on-disk representation and a task that
+    /// gives up its pool goes back to inheriting the global one cleanly.
+    ///
+    /// The document written is a whole [`GlobalConfig`] carrying only its
+    /// `squad` block, so the file the daemon writes and the file a user may
+    /// hand-edit are the same shape, parsed by the same loader.
+    fn write_task_config(
+        &self,
+        name: &str,
+        agents_to_models: &BTreeMap<String, Vec<String>>,
+    ) -> Result<(), CommandError> {
+        let path = self.paths.task_config_file(name)?;
+        if agents_to_models.is_empty() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(CommandError::Data(crate::data::error::DataError::io(
+                        &path, error,
+                    )));
+                }
+            }
+        }
+        let squad = SquadConfig {
+            agents_to_models: Some(
+                agents_to_models
+                    .iter()
+                    .map(|(agent, models)| (agent.clone(), models.clone()))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        // Validated before it is written, with the same rules the global file
+        // is held to, so the daemon can never author a task file its own
+        // loader would later reject.
+        squad.validate()?;
+        let document = GlobalConfig {
+            squad: Some(squad),
+            ..Default::default()
+        };
+        let body = serde_json::to_string_pretty(&document)
+            .map_err(|source| crate::data::error::DataError::ConfigSerialize { source })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                CommandError::Data(crate::data::error::DataError::io(parent, error))
+            })?;
+        }
+        std::fs::write(&path, body)
+            .map_err(|error| CommandError::Data(crate::data::error::DataError::io(&path, error)))
+    }
 }
 
 /// The effective root a task will be bound to, as resolved once at creation.
@@ -321,6 +510,7 @@ impl TaskGateway for LocalTaskGateway {
         let resolved = self.validate_create(&req)?;
         // Only now, with every check passed, does anything reach the disk.
         Self::ensure_durable_workspace(&resolved.durable_workspace)?;
+        self.write_task_config(&req.name, &req.agents_to_models)?;
         let now = Utc::now();
         let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
@@ -337,6 +527,7 @@ impl TaskGateway for LocalTaskGateway {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         };
         self.store.create(&task)?;
@@ -350,6 +541,76 @@ impl TaskGateway for LocalTaskGateway {
             "squad task created"
         );
         Ok(task)
+    }
+
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        tracing::info!(task = %name, "squad administrator requested task edit");
+        require_container_tier(&self.engines)?;
+        let existing = self
+            .store
+            .get(name)?
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))?;
+
+        // The same rules creation enforces, applied to whichever fields the
+        // edit actually carries — an edit must not be able to install a value
+        // `squad add` would have rejected.
+        if let Some(interval) = req.interval_secs {
+            if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&interval) {
+                return Err(CommandError::Other(format!(
+                    "task interval must be between {MIN_INTERVAL_SECS} and {MAX_INTERVAL_SECS} seconds"
+                )));
+            }
+        }
+        if let Some(overlays) = &req.overlays {
+            for spec in overlays {
+                crate::command::commands::parse_overlay_list(spec).map_err(|reason| {
+                    CommandError::InvalidOverlaySpec {
+                        spec: spec.clone(),
+                        reason,
+                    }
+                })?;
+            }
+        }
+        // Agent Dockerfiles are only discoverable for a repository-backed
+        // task, exactly as at creation; a directory-workspace task's images
+        // are scaffolded on its first run instead.
+        if existing.mount_scope.is_git_repo() {
+            let mut agents = BTreeSet::new();
+            match &req.agent {
+                Some(Some(agent)) => {
+                    agents.insert(agent.clone());
+                }
+                Some(None) => {}
+                None => {
+                    if let Some(agent) = &existing.agent {
+                        agents.insert(agent.clone());
+                    }
+                }
+            }
+            if let Some(pool) = &req.agents_to_models {
+                agents.extend(pool.keys().cloned());
+            }
+            validate_agent_dockerfiles(&existing.repo_scope, &agents)?;
+        }
+
+        // The task config is written before the row, so a failed config write
+        // leaves the task exactly as it was rather than half-edited.
+        if let Some(pool) = &req.agents_to_models {
+            self.write_task_config(name, pool)?;
+        }
+        let updated = self
+            .store
+            .update(name, &req.to_store_update())?
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))?;
+        tracing::info!(
+            task = %updated.name,
+            interval_secs = updated.interval_secs,
+            agent = ?updated.agent,
+            model = ?updated.model,
+            overlays = updated.overlays.len(),
+            "squad task edited"
+        );
+        Ok(updated)
     }
 
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
@@ -385,6 +646,31 @@ impl TaskGateway for LocalTaskGateway {
         }
     }
 
+    /// Ask the scheduler to evaluate `name` on its next tick.
+    ///
+    /// A paused task is refused rather than silently ignored: pausing is an
+    /// explicit "do not run this", and `due_for_evaluation` would drop the
+    /// request on the floor, leaving the user watching a task that was
+    /// triggered and never ran. Saying so — and naming `squad resume` — is the
+    /// only honest answer.
+    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
+        let task = self
+            .store
+            .get(name)?
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))?;
+        if task.status == TaskStatus::Paused {
+            return Err(CommandError::Other(format!(
+                "task {name:?} is paused and will not be evaluated; \
+                 run `awman squad resume {name}` first"
+            )));
+        }
+        if !self.store.request_trigger(name, Utc::now())? {
+            return Err(CommandError::Other(format!("task {name:?} was not found")));
+        }
+        tracing::info!(task = %name, "squad administrator triggered task");
+        Ok(())
+    }
+
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         if self.store.delete(name)? {
             tracing::info!(task = %name, "squad administrator removed task");
@@ -409,6 +695,21 @@ impl TaskGateway for LocalTaskGateway {
             last_tick: status.last_tick,
             in_flight: status.in_flight,
         })
+    }
+
+    async fn workflow_state(&self, name: &str) -> Result<Option<WorkflowState>, CommandError> {
+        let Some(task) = self.store.get(name)? else {
+            return Ok(None);
+        };
+        let Some(run) = self.store.running_run_for(&task.id)? else {
+            return Ok(None);
+        };
+        let Some(path) = run.workflow_state_path else {
+            return Ok(None);
+        };
+        Ok(crate::data::EngineWorkflowStateStore::read_state_path(
+            &path,
+        )?)
     }
 }
 
@@ -478,7 +779,54 @@ impl TaskGateway for RemoteTaskGateway {
         for overlay in req.overlays {
             args.extend(["--overlay".into(), overlay]);
         }
+        for spec in format_agent_models_specs(&req.agents_to_models) {
+            args.extend(["--agent-models".into(), spec]);
+        }
         self.command("squad add", args).await
+    }
+    /// Re-serialise the edit as the `squad edit` argv the daemon parses.
+    ///
+    /// The empty-vector cases are load-bearing and must stay explicit:
+    /// `--clear-overlays` and `--clear-agent-models` exist because "replace
+    /// with nothing" cannot be expressed by repeating a flag zero times, which
+    /// is indistinguishable from not mentioning it at all.
+    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
+        let mut args = vec![name.to_string()];
+        if let Some(description) = req.description {
+            args.extend(["--description".into(), description]);
+        }
+        if let Some(interval) = req.interval_secs {
+            args.extend(["--interval".into(), interval.to_string()]);
+        }
+        match req.agent {
+            Some(Some(agent)) => args.extend(["--agent".into(), agent]),
+            Some(None) => args.push("--clear-agent".into()),
+            None => {}
+        }
+        match req.model {
+            Some(Some(model)) => args.extend(["--model".into(), model]),
+            Some(None) => args.push("--clear-model".into()),
+            None => {}
+        }
+        match req.overlays {
+            Some(overlays) if overlays.is_empty() => args.push("--clear-overlays".into()),
+            Some(overlays) => {
+                for overlay in overlays {
+                    args.extend(["--overlay".into(), overlay]);
+                }
+            }
+            None => {}
+        }
+        match req.agents_to_models {
+            Some(pool) if pool.is_empty() => args.push("--clear-agent-models".into()),
+            Some(pool) => {
+                for spec in format_agent_models_specs(&pool) {
+                    args.extend(["--agent-models".into(), spec]);
+                }
+            }
+            None => {}
+        }
+        self.command("squad edit", args).await
     }
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
         self.command("squad list", vec![]).await
@@ -502,6 +850,11 @@ impl TaskGateway for RemoteTaskGateway {
             .await
             .map(|_| ())
     }
+    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
+        self.command::<serde_json::Value>("squad trigger", vec![name.into()])
+            .await
+            .map(|_| ())
+    }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.command::<serde_json::Value>("squad remove", vec![name.into()])
             .await
@@ -512,6 +865,23 @@ impl TaskGateway for RemoteTaskGateway {
         serde_json::from_value(response.body).map_err(|error| {
             CommandError::RemoteTransport(format!("invalid squad daemon status: {error}"))
         })
+    }
+
+    async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
+        // This route belongs to the remote gateway so route knowledge cannot
+        // leak into a frontend or a shared polling implementation.
+        let response = match self.core.get(&["tasks", task, "workflow"]).await {
+            Ok(response) => response,
+            Err(CommandError::RemoteHttpStatus { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_value(response.body)
+            .map(Some)
+            .map_err(|error| {
+                CommandError::RemoteTransport(format!(
+                    "invalid squad workflow state for {task:?}: {error}"
+                ))
+            })
     }
 }
 
@@ -548,4 +918,127 @@ fn validate_agent_dockerfiles(
         }
     ));
     Err(CommandError::Other(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--agent-models` is the scripted equivalent of the interview's
+    /// agent/model questions, so it has to accept the shapes a user will
+    /// actually type: several models in one spec, an agent repeated across
+    /// specs, and stray whitespace around either.
+    #[test]
+    fn agent_models_specs_parse_into_one_pool_per_agent() {
+        let pool = parse_agent_models_specs(&[
+            "claude=claude-opus-4-8,claude-sonnet-4-6".into(),
+            " codex = gpt-5 ".into(),
+            "claude=claude-opus-4-8".into(),
+            "claude=claude-haiku-4-5".into(),
+            "  ".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            pool.get("claude").map(Vec::as_slice),
+            Some(
+                ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
+                    .map(String::from)
+                    .as_slice()
+            ),
+            "a repeated agent merges its models in order, without duplicates"
+        );
+        assert_eq!(
+            pool.get("codex").map(Vec::as_slice),
+            Some(["gpt-5"].map(String::from).as_slice())
+        );
+    }
+
+    /// An agent named with no models is a legitimate answer — "this task may
+    /// use codex, with whatever model codex defaults to" — so it survives the
+    /// parse rather than being dropped.
+    #[test]
+    fn an_agent_with_no_models_still_joins_the_pool() {
+        let pool = parse_agent_models_specs(&["codex=".into()]).unwrap();
+        assert_eq!(pool.get("codex").map(Vec::as_slice), Some([].as_slice()));
+    }
+
+    #[test]
+    fn agent_models_specs_reject_a_missing_agent_or_separator() {
+        assert!(parse_agent_models_specs(&["claude".into()])
+            .unwrap_err()
+            .contains("<agent>=<model>"));
+        assert!(parse_agent_models_specs(&["=gpt-5".into()])
+            .unwrap_err()
+            .contains("names no agent"));
+    }
+
+    /// The remote gateway sends what the daemon parses, so the formatter must
+    /// round-trip through the parser unchanged — otherwise a pool set from the
+    /// TUI would arrive at the daemon subtly different from one set on the CLI.
+    #[test]
+    fn formatting_a_pool_round_trips_through_the_parser() {
+        let mut pool = BTreeMap::new();
+        pool.insert("claude".to_string(), vec!["a".to_string(), "b".to_string()]);
+        pool.insert("codex".to_string(), vec!["gpt-5".to_string()]);
+
+        let specs = format_agent_models_specs(&pool);
+        assert_eq!(
+            specs,
+            vec!["claude=a,b".to_string(), "codex=gpt-5".to_string()]
+        );
+        assert_eq!(parse_agent_models_specs(&specs).unwrap(), pool);
+    }
+
+    /// An edit that carries nothing is refused by Layer 2 rather than written;
+    /// `is_empty` is the predicate that decision rests on, so every field has
+    /// to count towards it.
+    #[test]
+    fn an_update_is_empty_only_until_some_field_is_set() {
+        assert!(UpdateTask::default().is_empty());
+        assert!(!UpdateTask {
+            description: Some("x".into()),
+            ..Default::default()
+        }
+        .is_empty());
+        // Clearing a field is a change like any other, even though the value
+        // it installs is "nothing".
+        assert!(!UpdateTask {
+            agent: Some(None),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!UpdateTask {
+            overlays: Some(Vec::new()),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!UpdateTask {
+            agents_to_models: Some(BTreeMap::new()),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    /// `agents_to_models` lives in the task's `config.json`, never in the
+    /// database, so the store's view of an edit must not carry it.
+    #[test]
+    fn the_store_update_carries_every_row_field_and_no_config_field() {
+        let mut pool = BTreeMap::new();
+        pool.insert("claude".to_string(), vec!["a".to_string()]);
+        let update = UpdateTask {
+            description: Some("d".into()),
+            interval_secs: Some(600),
+            agent: Some(Some("claude".into())),
+            model: Some(None),
+            overlays: Some(vec!["env(TOKEN)".into()]),
+            agents_to_models: Some(pool),
+        };
+        let stored = update.to_store_update();
+        assert_eq!(stored.description.as_deref(), Some("d"));
+        assert_eq!(stored.interval_secs, Some(600));
+        assert_eq!(stored.agent, Some(Some("claude".to_string())));
+        assert_eq!(stored.model, Some(None));
+        assert_eq!(stored.overlays, Some(vec!["env(TOKEN)".to_string()]));
+    }
 }

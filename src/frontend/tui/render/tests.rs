@@ -2,8 +2,8 @@ use super::command_box::{command_box_scroll_offset, truncate_middle};
 use super::dialog::{cursor_window, render_config_show};
 use super::execution_window::{apply_selection_highlight, capture_buffer_grid};
 use super::sidebar::{git_file_line, render_git_sidebar, truncate_path};
+use crate::engine::git::{GitDiffSummary, GitFileChangeType, GitFileEntry};
 use crate::frontend::tui::dialogs;
-use crate::frontend::tui::git_sidebar::{GitDiffSummary, GitFileChangeType, GitFileEntry};
 use crate::frontend::tui::tabs::TextSelection;
 use ratatui::prelude::*;
 
@@ -39,21 +39,21 @@ fn sample_summary() -> GitDiffSummary {
         files: vec![
             GitFileEntry {
                 path: "src/foo.rs".to_string(),
-                change_type: GitFileChangeType::Modified,
-                additions: 5,
-                deletions: 2,
+                change: GitFileChangeType::Modified,
+                added: 5,
+                removed: 2,
                 binary: false,
             },
             GitFileEntry {
                 path: "img.png".to_string(),
-                change_type: GitFileChangeType::Added,
-                additions: 0,
-                deletions: 0,
+                change: GitFileChangeType::Added,
+                added: 0,
+                removed: 0,
                 binary: true,
             },
         ],
-        total_additions: 5,
-        total_deletions: 2,
+        added: 5,
+        removed: 2,
         branch: Some("main".to_string()),
     }
 }
@@ -131,8 +131,8 @@ fn sidebar_title_shows_branch_and_change_count() {
 fn sidebar_title_clean_when_no_changed_files() {
     let summary = GitDiffSummary {
         files: Vec::new(),
-        total_additions: 0,
-        total_deletions: 0,
+        added: 0,
+        removed: 0,
         branch: Some("main".to_string()),
     };
     let buf = render_to_buffer(30, 8, |area, frame| {
@@ -160,9 +160,9 @@ fn sidebar_title_present_even_without_git_data() {
 fn git_file_line_added_is_green_with_stat_prefix() {
     let entry = GitFileEntry {
         path: "a.rs".to_string(),
-        change_type: GitFileChangeType::Added,
-        additions: 3,
-        deletions: 0,
+        change: GitFileChangeType::Added,
+        added: 3,
+        removed: 0,
         binary: false,
     };
     let line = git_file_line(&entry, 40);
@@ -179,16 +179,16 @@ fn git_file_line_added_is_green_with_stat_prefix() {
 fn git_file_line_deleted_is_red_and_modified_is_blue() {
     let deleted = GitFileEntry {
         path: "d.rs".to_string(),
-        change_type: GitFileChangeType::Deleted,
-        additions: 0,
-        deletions: 4,
+        change: GitFileChangeType::Deleted,
+        added: 0,
+        removed: 4,
         binary: false,
     };
     let modified = GitFileEntry {
         path: "m.rs".to_string(),
-        change_type: GitFileChangeType::Modified,
-        additions: 1,
-        deletions: 1,
+        change: GitFileChangeType::Modified,
+        added: 1,
+        removed: 1,
         binary: false,
     };
     assert_eq!(
@@ -205,9 +205,9 @@ fn git_file_line_deleted_is_red_and_modified_is_blue() {
 fn git_file_line_binary_has_suffix() {
     let entry = GitFileEntry {
         path: "img.png".to_string(),
-        change_type: GitFileChangeType::Added,
-        additions: 0,
-        deletions: 0,
+        change: GitFileChangeType::Added,
+        added: 0,
+        removed: 0,
         binary: true,
     };
     let line = git_file_line(&entry, 40);

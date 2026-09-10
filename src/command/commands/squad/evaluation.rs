@@ -163,6 +163,66 @@ pub fn decide_from_verdict(
     }
 }
 
+/// The error text for a leader that exited non-zero on its own, or `None`
+/// when the exit is not a failure (WI 0112 Part 6).
+///
+/// The rule: a container that exits non-zero *on its own* fails the run; a
+/// container the yolo countdown killed does not. `killed_by_countdown` is the
+/// launcher's word on which of those a 137 was — the exit code alone cannot
+/// tell them apart.
+pub fn leader_exit_failure(
+    exit_code: i32,
+    killed_by_countdown: bool,
+    log_path: &Path,
+) -> Option<String> {
+    if exit_code == 0 || killed_by_countdown {
+        return None;
+    }
+    Some(format!(
+        "leader agent exited with code {exit_code} (log: {})",
+        log_path.display()
+    ))
+}
+
+/// The reason recorded when the countdown killed a leader that never wrote a
+/// verdict.
+pub const LEADER_IDLE_KILL_REASON: &str =
+    "leader idle: killed by the yolo countdown before writing a verdict";
+
+/// Decide a first-attempt leader run from its exit *and* its verdict (WI
+/// 0112 Part 6), in this order:
+///
+/// 1. non-zero exit that was not the countdown's kill → `Failed`, whatever
+///    the verdict says — a crashing leader is a real error even after a
+///    valid `triggered: true`;
+/// 2. countdown kill with no verdict on disk → `NotTriggered` with
+///    [`LEADER_IDLE_KILL_REASON`], no backoff — the leader went idle before
+///    doing anything, which is not a failure;
+/// 3. otherwise the verdict decides exactly as [`decide_from_verdict`], with
+///    a protocol failure's message suffixed by the leader's log path.
+pub fn decide_leader_outcome(
+    exit_code: i32,
+    killed_by_countdown: bool,
+    verdict: Result<crate::engine::squad::RunVerdict, crate::engine::squad::VerdictError>,
+    log_path: &Path,
+) -> VerdictDecision {
+    if let Some(error) = leader_exit_failure(exit_code, killed_by_countdown, log_path) {
+        return VerdictDecision::Failed(error);
+    }
+    if killed_by_countdown && matches!(verdict, Err(crate::engine::squad::VerdictError::Missing(_)))
+    {
+        return VerdictDecision::NotTriggered {
+            reason: Some(LEADER_IDLE_KILL_REASON.to_string()),
+        };
+    }
+    match decide_from_verdict(verdict) {
+        VerdictDecision::Failed(error) => {
+            VerdictDecision::Failed(format!("{error} (log: {})", log_path.display()))
+        }
+        decision => decision,
+    }
+}
+
 /// Resolve the leader agent/model for one task.
 ///
 /// Precedence, highest first:
@@ -403,14 +463,35 @@ impl LocalTaskEvaluator {
             session.default_agent().map(|a| a.as_str()),
         )?;
         let agent = AgentName::new(leader.agent.clone()).map_err(CommandError::Data)?;
-        ensure_agent_image_with_build_output(
-            &self.engines,
-            &git_root,
-            &dockerfiles,
-            agent.as_str(),
-            &mut sink,
-            Some(&mut build_logs),
-        )?;
+        // WI 0110: build an image for every agent in the task's effective pool,
+        // not just the leader's. The leader picks its generated workflow's step
+        // agents from the listing it was shown, so an unbuilt pool agent would
+        // otherwise cost a build in the middle of the run — or, for a pool
+        // configured after the workspace was scaffolded, fail validation. The
+        // leader's own image is built first so it starts as soon as it can.
+        //
+        // `ensure_agent_image*` is an `image_exists` fast path, so a pool whose
+        // images are already built adds nothing but a runtime query per agent.
+        let mut pool_agents = vec![agent.as_str().to_string()];
+        if let Some(map) = request.agents_to_models.as_ref() {
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            for name in names {
+                if !pool_agents.contains(name) && available_agents.iter().any(|(a, _)| a == name) {
+                    pool_agents.push(name.clone());
+                }
+            }
+        }
+        for pool_agent in &pool_agents {
+            ensure_agent_image_with_build_output(
+                &self.engines,
+                &git_root,
+                &dockerfiles,
+                pool_agent,
+                &mut sink,
+                Some(&mut build_logs),
+            )?;
+        }
 
         // `guidance` is additive and never overridden by a task, so it is
         // rendered into every leader prompt regardless of which level supplied
@@ -488,13 +569,46 @@ impl LocalTaskEvaluator {
                 )
                 .await
                 .map_err(CommandError::from)?;
+            // The leader's own output lives here (the unattended frontend
+            // opened it when the container started); every line about this
+            // attempt names it so a failure can be debugged from the log.
+            let log_path = request
+                .run_log_dir
+                .join(format!("{}.log", exit.container_name));
             tracing::info!(
                 task = %task.name,
                 run_id = %request.run_id,
                 attempt = %label,
-                exit_code = exit.exit_code,
+                exit_code = exit.exit.exit_code,
+                log_path = %log_path.display(),
                 "squad evaluation container finished"
             );
+            if exit.killed_by_countdown {
+                tracing::warn!(
+                    task = %task.name,
+                    run_id = %request.run_id,
+                    attempt = %label,
+                    log_path = %log_path.display(),
+                    "squad evaluation leader was killed by the yolo countdown"
+                );
+            }
+
+            // WI 0112 Part 6: a leader that exits non-zero on its own fails
+            // the run on every attempt, repair attempts included. A countdown
+            // kill is exempt — it is the engine's normal auto-advance.
+            if let Some(error) =
+                leader_exit_failure(exit.exit.exit_code, exit.killed_by_countdown, &log_path)
+            {
+                tracing::error!(
+                    task = %task.name,
+                    run_id = %request.run_id,
+                    attempt = %label,
+                    exit_code = exit.exit.exit_code,
+                    log_path = %log_path.display(),
+                    "squad evaluation leader failed: {error}"
+                );
+                return Ok(EvaluationOutcome::Failed { error });
+            }
 
             // The leader's verdict for *this* run is the authority on whether
             // the task triggered. `workflow.toml`'s mere presence is not: the
@@ -506,14 +620,20 @@ impl LocalTaskEvaluator {
             // by definition re-running a leader that already said "triggered",
             // so its job is to fix validation, not to re-decide.
             if repair.is_first_attempt() {
-                match decide_from_verdict(read_verdict(&request.run_log_dir)) {
+                match decide_leader_outcome(
+                    exit.exit.exit_code,
+                    exit.killed_by_countdown,
+                    read_verdict(&request.run_log_dir),
+                    &log_path,
+                ) {
                     // A run that did not follow the protocol is an error, not a
                     // silent "not triggered": it backs off and alerts like any
                     // other evaluation failure rather than going quiet forever.
                     VerdictDecision::Failed(error) => {
-                        tracing::warn!(
+                        tracing::error!(
                             task = %task.name,
                             run_id = %request.run_id,
+                            log_path = %log_path.display(),
                             "squad evaluation produced no usable verdict: {error}"
                         );
                         return Ok(EvaluationOutcome::Failed { error });
@@ -992,6 +1112,79 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
 
+    // ── WI 0112 Part 6: the leader's exit and verdict decide together ──────
+
+    fn verdict(
+        triggered: bool,
+    ) -> Result<crate::engine::squad::RunVerdict, crate::engine::squad::VerdictError> {
+        Ok(crate::engine::squad::RunVerdict {
+            triggered,
+            reason: None,
+        })
+    }
+
+    fn missing() -> Result<crate::engine::squad::RunVerdict, crate::engine::squad::VerdictError> {
+        Err(crate::engine::squad::VerdictError::Missing(PathBuf::from(
+            "/run/verdict.json",
+        )))
+    }
+
+    #[test]
+    fn a_clean_exit_defers_to_the_verdict() {
+        let log = Path::new("/run/leader.log");
+        assert!(matches!(
+            decide_leader_outcome(0, false, verdict(true), log),
+            VerdictDecision::RunGeneratedWorkflow { .. }
+        ));
+        assert!(matches!(
+            decide_leader_outcome(0, false, verdict(false), log),
+            VerdictDecision::NotTriggered { .. }
+        ));
+        match decide_leader_outcome(0, false, missing(), log) {
+            VerdictDecision::Failed(error) => {
+                assert!(error.contains("wrote no verdict"), "{error}");
+                assert!(error.ends_with("(log: /run/leader.log)"), "{error}");
+            }
+            other => panic!("a clean exit with no verdict is a protocol failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_countdown_kill_honours_a_written_verdict_and_is_not_triggered_without_one() {
+        let log = Path::new("/run/leader.log");
+        assert!(matches!(
+            decide_leader_outcome(137, true, verdict(true), log),
+            VerdictDecision::RunGeneratedWorkflow { .. }
+        ));
+        match decide_leader_outcome(137, true, missing(), log) {
+            VerdictDecision::NotTriggered { reason } => {
+                assert_eq!(reason.as_deref(), Some(LEADER_IDLE_KILL_REASON));
+            }
+            other => panic!("an idle leader killed by the countdown is not a failure: {other:?}"),
+        }
+        assert!(leader_exit_failure(137, true, log).is_none());
+    }
+
+    #[test]
+    fn a_non_zero_exit_that_was_not_the_countdown_fails_whatever_the_verdict_says() {
+        let log = Path::new("/run/leader.log");
+        for code in [1, 137] {
+            for v in [verdict(true), verdict(false), missing()] {
+                match decide_leader_outcome(code, false, v, log) {
+                    VerdictDecision::Failed(error) => {
+                        assert_eq!(
+                            error,
+                            format!("leader agent exited with code {code} (log: /run/leader.log)")
+                        );
+                    }
+                    other => panic!("exit {code} must fail: {other:?}"),
+                }
+            }
+        }
+        assert!(leader_exit_failure(0, false, log).is_none());
+        assert!(leader_exit_failure(2, false, log).is_some());
+    }
+
     fn task(agent: Option<&str>, model: Option<&str>) -> Task {
         let now = Utc::now();
         Task {
@@ -1009,6 +1202,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         }
     }

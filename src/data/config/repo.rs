@@ -112,6 +112,33 @@ impl SquadConfig {
     pub fn max_concurrent_evaluations_or_default(&self) -> usize {
         self.max_concurrent_evaluations.unwrap_or(2)
     }
+
+    /// Layer this block over `base`, field by field: a field this block sets
+    /// wins, a field it omits is inherited (WI 0110).
+    ///
+    /// This is how a squad task's own `config.json` relates to the global one —
+    /// the same "more specific layer wins per field" rule
+    /// [`EffectiveConfig`](crate::data::config::EffectiveConfig) applies to
+    /// repo-over-global, expressed here because a task is not a session and
+    /// never passes through that merge.
+    ///
+    /// `maxConcurrentEvaluations` is deliberately **not** layered: it bounds
+    /// the daemon's whole in-flight set, so a per-task value would have no
+    /// coherent meaning. It is always the base's.
+    pub fn layered_over(&self, base: &SquadConfig) -> SquadConfig {
+        SquadConfig {
+            agents_to_models: self
+                .agents_to_models
+                .clone()
+                .or_else(|| base.agents_to_models.clone()),
+            max_concurrent_evaluations: base.max_concurrent_evaluations,
+            default_leader: self
+                .default_leader
+                .clone()
+                .or_else(|| base.default_leader.clone()),
+            guidance: self.guidance.clone().or_else(|| base.guidance.clone()),
+        }
+    }
 }
 
 /// Per-repo credential injection mode.
@@ -1102,5 +1129,82 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("squad.defaultLeader"));
+    }
+
+    /// WI 0110: a task's own `squad` block overrides the global one per field.
+    /// A field the task omits must be inherited, not reset to empty — that is
+    /// what lets a task narrow its agent pool while keeping the standing
+    /// guidance every task gets.
+    #[test]
+    fn a_task_squad_block_overrides_the_global_one_field_by_field() {
+        let global = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "claude".to_string(),
+                vec!["claude-opus-4-8".to_string()],
+            )])),
+            max_concurrent_evaluations: Some(4),
+            default_leader: Some("claude::claude-opus-4-8".to_string()),
+            guidance: Some(vec!["Keep changes focused.".to_string()]),
+        };
+        let task = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "codex".to_string(),
+                vec!["gpt-5".to_string()],
+            )])),
+            ..Default::default()
+        };
+
+        let effective = task.layered_over(&global);
+        assert_eq!(
+            effective
+                .agents_to_models
+                .as_ref()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["codex"],
+            "the task's pool replaces the global pool outright, not merged into it"
+        );
+        assert_eq!(
+            effective.default_leader.as_deref(),
+            Some("claude::claude-opus-4-8"),
+            "a field the task omits is inherited"
+        );
+        assert_eq!(effective.guidance, global.guidance);
+    }
+
+    /// `maxConcurrentEvaluations` bounds the daemon's whole in-flight set, so a
+    /// per-task value would mean nothing. It always comes from the global block,
+    /// even when a task file names one.
+    #[test]
+    fn max_concurrent_evaluations_is_never_taken_from_a_task_block() {
+        let global = SquadConfig {
+            max_concurrent_evaluations: Some(4),
+            ..Default::default()
+        };
+        let task = SquadConfig {
+            max_concurrent_evaluations: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            task.layered_over(&global).max_concurrent_evaluations,
+            Some(4)
+        );
+    }
+
+    /// An empty task block is the same as no task block at all: everything is
+    /// inherited.
+    #[test]
+    fn an_empty_task_block_inherits_the_whole_global_block() {
+        let global = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "claude".to_string(),
+                vec!["claude-opus-4-8".to_string()],
+            )])),
+            max_concurrent_evaluations: Some(2),
+            default_leader: Some("claude::claude-opus-4-8".to_string()),
+            guidance: Some(vec!["Be careful.".to_string()]),
+        };
+        assert_eq!(SquadConfig::default().layered_over(&global), global);
     }
 }

@@ -195,6 +195,22 @@ impl WorktreeLifecycle {
         &self,
         frontend: &mut dyn WorktreeLifecycleFrontend,
     ) -> Result<PathBuf, CommandError> {
+        self.prepare_with_existing(frontend, None).await
+    }
+
+    /// [`Self::prepare`], with the existing-worktree question already answered.
+    ///
+    /// A caller that has just asked the user a question which *implies* the
+    /// answer — the workflow resume prompt, which only makes sense against the
+    /// worktree that is already there (WI-0115 §2) — passes `Some(Resume)`
+    /// rather than asking a second, near-identical question. It is not only
+    /// redundant: `Recreate` deletes the worktree, and with it the state the
+    /// accepted resume just rewound. `None` asks as usual.
+    pub async fn prepare_with_existing(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        preselected: Option<ExistingWorktreeDecision>,
+    ) -> Result<PathBuf, CommandError> {
         if self.git_engine.is_detached_head(&self.git_root) {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
@@ -202,7 +218,11 @@ impl WorktreeLifecycle {
             });
         }
         if self.worktree_path.exists() {
-            match frontend.ask_existing_worktree(&self.worktree_path, &self.branch)? {
+            let decision = match preselected {
+                Some(d) => d,
+                None => frontend.ask_existing_worktree(&self.worktree_path, &self.branch)?,
+            };
+            match decision {
                 ExistingWorktreeDecision::Resume => {
                     return Ok(self.worktree_path.clone());
                 }

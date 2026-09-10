@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 //! Layer 0: data
 //!
 //! This layer owns every data definition, config concern, filesystem access,

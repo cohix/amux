@@ -264,7 +264,7 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
+| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional), `conflict_mode` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. `conflict_mode` controls what happens when the target directory already contains a clone of the same URL: `skip` (default) logs that the repo is already cloned and succeeds without re-cloning, `replace` deletes the existing clone and clones a fresh copy, and `error` fails the step. A target directory occupied by anything other than a clone of the same URL always fails the step, regardless of mode. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
 | `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. **Skipped when the workflow runs in an isolated worktree** (`--worktree`, or implied by `--yolo`/`--dynamic`): the run is already on its own branch, so awman skips the step with a warning instead of failing. |
 | `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
@@ -1063,6 +1063,54 @@ In command mode, the "same container" prompt is skipped entirely and the explana
 
 Ctrl+W works at any time when a workflow is active in the current tab — there are no other preconditions. It works mid-step, between steps, during a yolo countdown, or while another dialog is open (the existing dialog is dismissed first).
 
+### When a step fails
+
+If an agent step's container exits unexpectedly, awman does **not** end the workflow. It opens the control board with the failure attached, so you can recover in place:
+
+```
+╭──── Workflow Control — step failed ────╮
+│ Failed step: implement                 │
+│   Exit code: 1                         │
+│   Ran for 214s                         │
+│                                        │
+│    ↑ Restart failed step               │
+│                                        │
+│ ← Cancel to prev  → Skip to 'review'   │
+│                                        │
+│    ↓ Next: same container              │
+│      the failed step's container has   │
+│      exited                            │
+│                                        │
+│ [^C] Cancel workflow   [Esc] Pause     │
+╰────────────────────────────────────────╯
+```
+
+| Key | Effect |
+|-----|--------|
+| **↑** | Restart the failed step in a fresh container |
+| **←** | Go back to the previous step and re-run it — both it and the failed step return to pending, so the failed step runs again once its predecessor succeeds |
+| **→** | Skip the failed step and start the next one in a new container |
+| **Esc** | Pause the workflow — the state file is kept, so a later run can resume from here |
+| **Ctrl+C** | Cancel the workflow |
+
+There is no "Enter to finish workflow" on a failure board — finishing a run on a failed step is never what you want, so **Ctrl+C** is the deliberate way out. The container's recent output is also saved to a log file; see [Container failure logs](#container-failure-logs).
+
+An arrow the board does not offer does nothing. On the *first* step there is no previous step to go back to, and on the *last* one there is nothing to skip ahead to; those arrows are shown greyed out with the reason, and pressing them leaves the board where it is.
+
+In command mode the same choices are printed as a menu on stderr (`[r]` restart, `[b]` back, `[n]` next, `[p]` pause, `[a]` abort), and only the ones that apply are listed.
+
+If several steps of a [parallel group](#parallel-workflows) fail, the board opens once per failed step, in the order the containers exited. Each failure is a separate decision — recovering one does not quietly decide the others.
+
+### Failed steps without a user (squad, API, `--non-interactive`)
+
+An unattended run has nobody to ask, so the engine handles a failed step itself:
+
+1. It starts a 60-second countdown, reported through the same channel as a stuck-step countdown — but labelled as a retry, so a run that is recovering is never mistaken for one that is advancing.
+2. When the countdown expires, it retries the failed step **once**.
+3. If the same step fails again, the whole workflow fails with that step's exit code.
+
+A step marked `abort_on_failure = true` still stops the workflow immediately, with no countdown and no retry. The retry allowance is per step, and separate from the one a step gets for a credential refresh — a step can use both.
+
 ---
 
 ## Workflow Overview and step status
@@ -1093,6 +1141,18 @@ When a step declares its own `agent` and/or `model`, the box shows the resolved 
 ```
 
 Steps that declare **neither** an `agent` nor a `model` field inherit the project-default agent and model, so they carry no label — an unlabelled box always means "project defaults". If a step overrides only one of the two, the label shows just that part. The label is truncated to fit narrow boxes.
+
+### Setup and teardown steps
+
+Setup and teardown steps get their own dedicated column at the start and end of the overview — never mixed in with the main steps' columns, however those happen to be grouped by `depends_on`. Each box carries the same status glyph and colour as any other step, with a `[setup]` or `[teardown]` title on the top border instead of an `agent/model` label:
+
+```
+╭[setup]──────────╮   ╭claude/opus-4-8──╮   ╭[teardown]────────╮
+│ ✓ install deps  │ → │ ● implement     │ → │ ○ push and clean │
+╰─────────────────╯   ╰─────────────────╯   ╰─────────────────╯
+```
+
+Multiple setup (or teardown) steps share that one leading (or trailing) column, and collapse to a `N steps…` summary in the minimized overview the same way a parallel group of main steps does — the `[setup]`/`[teardown]` title stays on the collapsed box too.
 
 ### Remediation in progress
 
@@ -1228,14 +1288,39 @@ The file records the status of every step, the container ID used for each step, 
 
 ### Resuming
 
-If a saved state file exists when you run `exec workflow`, awman offers to resume:
+If a saved state file exists when you run `exec workflow`, awman offers to resume from a named step:
 
 ```
-Found a saved workflow state for 'implement-feature' (work item 0027).
-  1) Resume from where you left off
-  2) Restart from the beginning
-  [1/2]:
+╭──── Resume previous workflow? ─────────────────────────────╮
+│ A previous run of 'implement-feature' left resumable state │
+│ on disk.                                                   │
+│                                                            │
+│ Workflow: implement-feature                                │
+│ Work item: 0027                                            │
+│ Progress: 2/5 step(s) completed.                           │
+│                                                            │
+│ Resume it from one of these steps, or start over?          │
+│                                                            │
+│  [1] Resume from 'implement' (the step that failed)        │
+│  [2] Resume from 'design' (the step before it)             │
+│  [3] Resume from 'review' (the step after it)              │
+│  [f] Discard the saved state and start over                │
+│                                                            │
+│  [Esc] cancel                                              │
+╰────────────────────────────────────────────────────────────╯
 ```
+
+This is the same prompt, with the same three start points, that [`--dynamic`](06-dynamic-workflows.md#resuming-a-failed-dynamic-run) shows — the two modes resume identically. Picking a step rewinds the saved state: everything from that step onwards runs again, and earlier steps that never succeeded are marked skipped so they don't block their dependents.
+
+The first start point is named after what actually stopped the run: *the step that failed*, *the step that was cancelled*, or *the step the run stopped on* when the run was interrupted rather than failed.
+
+**`f` is the only way to discard the saved run**, and it is not undoable — the state file goes, and in `--dynamic` mode the generated workflow goes with it. **Esc cancels the command instead**: nothing runs, nothing is created, nothing is deleted, and the same prompt is waiting the next time you run it. In command mode the same applies, with `[q]` alongside Esc; anything awman cannot read as an answer (a blank line, EOF, a typo) cancels rather than discards.
+
+The question is asked before the worktree is prepared, so cancelling really does leave the disk untouched.
+
+When the previous run completed every step there is nothing to resume, so awman says so and starts fresh rather than offering a choice with one sane answer.
+
+Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. The squad daemon is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
 
 ### Workflow file changed
 
@@ -1250,14 +1335,26 @@ WARNING: The workflow file has changed since the last run.
 
 If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
 
-### Interrupted steps
+### Unfinished steps
 
-If a step was running when awman last exited:
+Two kinds of step are terminal in the saved state but not actually *done*, and awman resets both to pending when it loads that state, naming them as it goes:
 
 ```
-Step 'implement' was running when the previous session ended.
-Start it over (s) or skip to next step (n)? [s/n]:
+awman: Interrupted steps detected (prior crash?): implement. Resetting to Pending.
+awman: Previous run left these steps unfinished: review, ship. Resetting to Pending.
 ```
+
+The first line covers a step that was still running when awman exited — a crash or a kill. The second covers steps a previous run left `Failed` or `Cancelled`, which is what a failed step and an aborted workflow leave behind.
+
+This reset matters more than it looks: an aborted run marks *every* remaining step cancelled, so without it the saved state would read as "all steps terminal" — indistinguishable from a finished run — and resuming would report success without executing anything. Steps that genuinely succeeded or were skipped are never touched, so a resume still picks up exactly where the previous run got to.
+
+A third case is steps the saved run knows about that the workflow file no longer defines — you renamed or deleted a step and then chose to resume anyway at the [changed-file prompt](#workflow-file-changed):
+
+```
+awman: The saved run has steps this workflow no longer defines: publish. Dropping them.
+```
+
+These are dropped rather than reset. They can never run again — the step graph is what decides what runs, and it has never heard of them — but they would still count against the run ever being finished, leaving it to end on "no ready steps remaining" instead of completing.
 
 ---
 

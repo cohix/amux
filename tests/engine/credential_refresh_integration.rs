@@ -25,11 +25,9 @@ use awman::engine::credential_refresh::{
     install_global, CredentialRefreshMonitor, MonitorConfig, RefreshOutcome,
 };
 use awman::engine::error::EngineError;
-use awman::engine::git::GitEngine;
-use awman::engine::overlay::OverlayEngine;
 use awman::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, WorkflowOutcome,
-    WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, WorkflowOutcome, WorkflowStepStatus,
+    YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use awman::engine::workflow::{Frontend as WorkflowFrontend, WorkflowEngine};
@@ -254,12 +252,15 @@ impl AgentExecutionFactory for RetryFactory {
     }
 }
 
-struct AbortWorkflowFrontend;
-impl UserMessageSink for AbortWorkflowFrontend {
+/// An unattended frontend: `supports_interactive_recovery` keeps its `false`
+/// default, so a failed step takes the engine's countdown-and-retry path, and
+/// cancelling the countdown ends the run as `Failed` (WI-0115 §3).
+struct UnattendedTestFrontend;
+impl UserMessageSink for UnattendedTestFrontend {
     fn write_message(&mut self, _msg: UserMessage) {}
     fn replay_queued(&mut self) {}
 }
-impl WorkflowFrontend for AbortWorkflowFrontend {
+impl WorkflowFrontend for UnattendedTestFrontend {
     fn show_workflow_control_board(
         &mut self,
         _state: &awman::data::workflow_state::WorkflowState,
@@ -284,13 +285,6 @@ impl WorkflowFrontend for AbortWorkflowFrontend {
     fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
     fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         Ok(true)
-    }
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &awman::data::workflow_definition::WorkflowStep,
-        _exit: &awman::engine::agent_runtime::AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
     }
 }
 
@@ -330,22 +324,22 @@ fn run_retry_workflow() -> (usize, usize) {
         launches: launches.clone(),
         refreshes: refreshes.clone(),
     };
-    let overlay = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(root.path()));
     let mut engine = WorkflowEngine::new(
         &session,
         retry_workflow(),
         None,
-        Box::new(AbortWorkflowFrontend),
+        Box::new(UnattendedTestFrontend),
         Box::new(factory),
-        Arc::new(GitEngine::new()),
-        Arc::new(overlay),
     )
     .unwrap();
     let outcome = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(engine.run_to_completion())
         .unwrap();
-    assert!(matches!(outcome, WorkflowOutcome::Aborted));
+    assert!(
+        matches!(outcome, WorkflowOutcome::Failed { .. }),
+        "outcome={outcome:?}"
+    );
     (
         launches.load(Ordering::SeqCst),
         refreshes.load(Ordering::SeqCst),
@@ -714,7 +708,10 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .collect();
-    assert!(fingerprints.len() >= 2, "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?}");
+    assert!(
+        fingerprints.len() >= 2,
+        "running fake agent must observe old and new staged-file fingerprints without restart: {fingerprints:?}"
+    );
     assert_eq!(
         std::fs::read(&exited_delivery.staged_path).unwrap(),
         exited_before,

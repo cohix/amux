@@ -1,0 +1,16 @@
+# Phase 2 baseline (2026-09-03, working tree at 415f780d + uncommitted edits)
+- make architecture-lint: OK (0 violations); `use crate as`: none
+- cargo clippy --all-targets -D warnings: clean; cargo build warnings: 0
+- src: 280 .rs files, 137,408 lines
+- Largest: engine/workflow/mod.rs 7622, command/commands/exec_workflow.rs 5943, engine/overlay/mod.rs 3137, command/dispatch/catalogue.rs 3014, engine/agent/mod.rs 2706, engine/container/docker.rs 2305, command/dispatch/mod.rs 2167, frontend/tui/app.rs 1989, command/commands/config.rs 1975, command/commands/mod.rs 1804
+- pub fn / pub struct / pub trait: data 427/85/4, engine 332/131/16, command 209/132/33, frontend 282/67/1
+- fn count under src/frontend (non-test): 1682
+- Suppressed lints: 21 sites incl. crate-wide `#![allow(dead_code)]` (lib.rs:15, justification cites deleted oldsrc/) and `#![allow(unused_imports)]` (data/mod.rs:1). Removing both surfaces 29 warnings (see hidden-warnings.txt).
+- Stale markers: 7 `#[ignore]`d `todo!()` test stubs in exec_workflow.rs:5846-5894; 8 TODO(acp) in agent_matrix.rs; unimplemented!() only in test fakes.
+- Wide fns (>=7 params): 26; worst: tui/command_frontend.rs::new (19), exec_workflow.rs::drive_leader_agent (11), squad/evaluation.rs::leader_run_options (9)
+- Frontend-owned traits: 1 (tui/per_command/remote.rs:31 WorkflowStateSource)
+- `use crate::command::commands` in src/frontend (non-test): 117 lines
+- *Frontend traits in command+engine: 33 `pub trait` in command, 16 in engine
+- Hard-coded long user-facing strings in tui+cli (non-test): 120
+- Catalogue vs aspec/uxui/cli.md: catalogue has `clean` (catalogue.rs:403); cli.md has no `awman clean` section
+- Unreferenced pub fns (grep heuristic): 18 (unreferenced.txt)

@@ -10,9 +10,9 @@ use crate::command::commands::skill_library::{
     pull_all_libraries, pull_library, resolve_pull_target, PullOutcome,
 };
 use crate::command::commands::{resolve_agent, Command};
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
-use crate::data::fs::{SkillDirs, WorkflowDirs};
+use crate::data::fs::{SkillDirs, WorkflowDirs, SKILL_INTERVIEW_CONTAINER_DIR};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::engine::agent::AgentRunOptions;
@@ -22,7 +22,7 @@ use crate::engine::container::options::ContainerOption;
 pub struct NewSpecFlags {
     pub interview: bool,
     pub non_interactive: bool,
-    pub issue_source: crate::data::issue::IssueSourceFlags,
+    pub issue_source: crate::engine::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +223,52 @@ impl NewCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The three
+    /// `new` leaves share one entry point, selected by the caller's canonical
+    /// path; `--format` takes its `"toml"` from the catalogue.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "spec" => NewSubcommand::Spec(NewSpecFlags {
+                interview: ctx.flags.bool("interview"),
+                non_interactive: ctx.flags.bool("non-interactive"),
+                issue_source: crate::engine::issue::IssueSourceFlags {
+                    issue: ctx.flags.string("issue"),
+                },
+            }),
+            "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
+                interview: ctx.flags.bool("interview"),
+                non_interactive: ctx.flags.bool("non-interactive"),
+                global: ctx.flags.bool("global"),
+                format: ctx.flags.require_str("format")?,
+            }),
+            "skill" => {
+                let pull = ctx.flags.string("pull");
+                let pull_all = ctx.flags.bool("pull-all");
+                let subdir = ctx.flags.string("subdir");
+                // `--subdir` names a path *inside* a pulled repository, so it
+                // is meaningless without one. The catalogue cannot say
+                // "requires one of two flags", so the check lives here.
+                if subdir.is_some() && pull.is_none() && !pull_all {
+                    return Err(CommandError::InvalidFlagValue {
+                        command: ctx.path().iter().map(|part| (*part).to_string()).collect(),
+                        flag: "subdir".to_string(),
+                        reason: "--subdir requires --pull <repo>".to_string(),
+                    });
+                }
+                NewSubcommand::Skill(NewSkillFlags {
+                    interview: ctx.flags.bool("interview"),
+                    non_interactive: ctx.flags.bool("non-interactive"),
+                    global: ctx.flags.bool("global"),
+                    pull,
+                    pull_all,
+                    subdir,
+                })
+            }
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {
@@ -666,12 +712,18 @@ impl Command for NewCommand {
                                 }
                             };
                         let summary = frontend.ask_skill_summary().unwrap_or_default();
-                        let path_str = path.display().to_string();
-                        let prompt = render_skill_interview_prompt(&path_str, &summary);
+                        // The agent container always mounts the repo at
+                        // `/workspace`, which a `--global` skill never lives
+                        // under. Mount the new skill's own directory at a
+                        // fixed container path instead, and point the prompt
+                        // at that path rather than at the host one.
+                        let container_file = skill_interview_container_file(&path);
+                        let prompt = render_skill_interview_prompt(&container_file, &summary);
                         let run_opts = AgentRunOptions {
                             initial_prompt: Some(prompt),
                             non_interactive: f.non_interactive,
                             env_passthrough: None,
+                            directory_overlays: vec![skill_interview_overlay(&dir)],
                             ..Default::default()
                         };
                         // Sandbox-class runtimes: agent spawn lands in WI 0090.
@@ -763,6 +815,35 @@ impl Command for NewCommand {
     }
 }
 
+/// Container-side path of the skill file the interview agent is told to edit.
+///
+/// Pairs with [`skill_interview_overlay`]: the skill's directory is mounted at
+/// [`SKILL_INTERVIEW_CONTAINER_DIR`], so the file the host wrote at
+/// `<dir>/SKILL.md` is reachable at `/awman/skill/SKILL.md` inside the
+/// container. Naming the host path in the prompt instead would send the agent
+/// to a path that does not exist there.
+fn skill_interview_container_file(host_path: &std::path::Path) -> String {
+    let name = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("SKILL.md");
+    format!("{SKILL_INTERVIEW_CONTAINER_DIR}/{name}")
+}
+
+/// Structural mount for `new skill --interview`: the new skill's own
+/// directory, read-write, at [`SKILL_INTERVIEW_CONTAINER_DIR`].
+///
+/// Not a user-supplied overlay — it is how the interview agent reaches the
+/// only file it is asked to write, so its container path is fixed and the
+/// prompt names it outright.
+fn skill_interview_overlay(dir: &std::path::Path) -> crate::engine::overlay::DirectorySpec {
+    crate::engine::overlay::DirectorySpec {
+        host: dir.to_string_lossy().into_owned(),
+        container: SKILL_INTERVIEW_CONTAINER_DIR.to_string(),
+        permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+    }
+}
+
 fn pull_success_message(outcome: &PullOutcome) -> UserMessage {
     UserMessage {
         level: MessageLevel::Info,
@@ -787,42 +868,9 @@ fn pull_library_outcome(outcome: PullOutcome) -> PullLibraryOutcome {
     }
 }
 
-fn next_work_item_number(dir: &std::path::Path) -> u32 {
-    let mut max = 0u32;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if s.len() >= 5 && s.as_bytes()[4] == b'-' {
-                if let Ok(n) = s[..4].parse::<u32>() {
-                    if n > max {
-                        max = n;
-                    }
-                }
-            }
-        }
-    }
-    max + 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn next_work_item_number_empty_dir_is_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 1);
-    }
-
-    #[test]
-    fn next_work_item_number_finds_max_number() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("0001-first.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0010-tenth.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0005-fifth.md"), "").unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 11);
-    }
 
     struct FakeNewFrontend {
         workflow_name: String,
@@ -966,35 +1014,7 @@ mod tests {
     }
 
     fn make_engines(root: &std::path::Path) -> Engines {
-        use crate::data::fs::api_paths::ApiPaths;
-        use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::engine::container::ContainerRuntime;
-        use crate::engine::overlay::OverlayEngine;
-        use std::sync::Arc;
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            AuthPathResolver::at_home(root),
-        ));
-        let runtime = Arc::new(ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            AuthPathResolver::at_home(root),
-            ApiPaths::at_root(root),
-        ));
-        Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine: Arc::new(crate::engine::git::GitEngine::new()),
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                root,
-            )),
-        }
+        Engines::for_tests(root)
     }
 
     fn make_session(root: &std::path::Path) -> Session {
@@ -1223,5 +1243,56 @@ mod tests {
         } else {
             panic!("unexpected outcome variant");
         }
+    }
+
+    /// `new skill --interview` hands the skill file to an agent running in a
+    /// container that only ever has the repo mounted at `/workspace`. A
+    /// `--global` skill lives under `~/.awman/skills/`, which is nowhere
+    /// inside that mount, so the skill's own directory has to be mounted at
+    /// the fixed container path and the prompt has to name the file there —
+    /// naming the host path sent the agent to a path the container has not
+    /// got.
+    #[test]
+    fn the_skill_interview_mounts_the_skill_dir_and_names_it_in_the_prompt() {
+        use crate::engine::container::options::OverlayPermission;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A global skill dir: deliberately outside any repo/workspace root.
+        let dir = tmp.path().join("awman-home/skills/my-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("SKILL.md");
+        std::fs::write(&file, "# Skill: my-skill\n").unwrap();
+
+        let overlay = skill_interview_overlay(&dir);
+        assert_eq!(overlay.host, dir.to_string_lossy());
+        assert_eq!(overlay.container, SKILL_INTERVIEW_CONTAINER_DIR);
+        assert_eq!(
+            overlay.permission,
+            OverlayPermission::ReadWrite,
+            "the interview agent has to write the skill file"
+        );
+
+        // The spec must survive the same resolution every overlay goes
+        // through, and land at exactly the path the prompt names.
+        let engines = make_engines(tmp.path());
+        let resolved = engines
+            .overlay_engine
+            .resolve_user_overlay(&overlay, tmp.path(), None)
+            .expect("the skill dir exists, so its overlay must resolve");
+        assert_eq!(
+            resolved.container_path,
+            std::path::Path::new(SKILL_INTERVIEW_CONTAINER_DIR)
+        );
+
+        let prompt =
+            render_skill_interview_prompt(&skill_interview_container_file(&file), "a summary");
+        assert!(
+            prompt.contains("/awman/skill/SKILL.md"),
+            "the prompt must point at the mounted skill file: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&*dir.to_string_lossy()),
+            "the host path must never reach the agent: {prompt}"
+        );
     }
 }

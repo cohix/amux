@@ -17,6 +17,7 @@ use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::GlobalConfig;
 use crate::data::config::repo::RepoConfig;
 use crate::data::error::DataError;
+use crate::data::fs::SquadPaths;
 
 /// Newtype around the underlying session UUID.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -354,6 +355,25 @@ impl Session {
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Open the session the squad view is rooted at.
+    ///
+    /// The squad daemon owns tasks, not repositories, so there is no git root
+    /// to resolve: the session exists to satisfy the frontends' `Session` API
+    /// and is rooted at the squad storage root, which is created if it is not
+    /// there yet. Nothing a squad view renders derives from it.
+    pub fn open_squad_root(env: &EnvSnapshot) -> Result<Self, DataError> {
+        let root = SquadPaths::from_env(env)?.root().to_path_buf();
+        std::fs::create_dir_all(&root).map_err(|source| DataError::io(&root, source))?;
+        Self::open_at_git_root(
+            root.clone(),
+            root,
+            SessionOpenOptions {
+                env: Some(env.clone()),
+                ..Default::default()
+            },
+        )
     }
 
     /// Open a session with an explicit, pre-resolved git root.

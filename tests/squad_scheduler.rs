@@ -94,6 +94,7 @@ fn task(name: &str, interval_secs: u64) -> Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
 }
@@ -371,7 +372,7 @@ async fn squad_config_edits_take_effect_on_the_next_tick_without_a_restart() {
 
 // ─── Restart reconciliation ──────────────────────────────────────────────────
 
-/// `frontend::squad::serve_with` calls `TaskStore::reconcile_orphaned_runs`
+/// `SquadDaemonEngine::bootstrap` calls `TaskStore::reconcile_orphaned_runs`
 /// immediately after opening the store, before the scheduler is spawned —
 /// this test reproduces that exact sequence (open → reconcile → tick) against
 /// a store that already has an orphaned `running` row, simulating a daemon
@@ -401,7 +402,7 @@ async fn restart_reconciliation_moves_orphaned_running_row_to_interrupted() {
 
     // Second "daemon lifetime": re-open the same database (a fresh
     // `TaskStore`, mimicking a real restart) and reconcile — exactly
-    // what `serve_with` does before ever constructing the scheduler.
+    // what the daemon engine does before ever constructing the scheduler.
     let store = Arc::new(TaskStore::open(&db_path).unwrap());
     store.migrate().unwrap();
     let reconciled = store.reconcile_orphaned_runs(Utc::now()).unwrap();

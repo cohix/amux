@@ -9,6 +9,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::frontend::tui::text_edit::TextEdit;
 
+/// Title of the `Ctrl-T` New Tab dialog. The key handler's `Ctrl-S` intercept
+/// and the renderer's `[Ctrl+S] open squad` hint are both keyed off this one
+/// string, so the shortcut and its advertisement can never disagree.
+pub(crate) const NEW_TAB_DIALOG_TITLE: &str = "New Tab";
+
 /// A dialog request sent from the command thread to the event loop.
 #[derive(Debug)]
 pub enum DialogRequest {
@@ -28,6 +33,10 @@ pub enum DialogRequest {
     MultilineInput {
         title: String,
         prompt: String,
+        /// Text the editor opens holding (WI 0110). `None` opens empty. Used
+        /// by edit interviews, where an untouched box must mean "keep what
+        /// is there" rather than "erase it".
+        default_text: Option<String>,
     },
     ListPicker {
         title: String,
@@ -38,7 +47,6 @@ pub enum DialogRequest {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -67,6 +75,15 @@ pub enum DialogRequest {
         title: String,
         body: String,
         keys: Vec<(char, String)>,
+    },
+    /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
+    /// Sent, never awaited: a notice has no answer to give back, and the
+    /// command thread must not block on the user dismissing it.
+    KeySetupNotice {
+        title: String,
+        body: String,
+        copy_key: String,
+        copy_zshrc_snippet: String,
     },
 }
 
@@ -112,7 +129,6 @@ pub enum Dialog {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -130,6 +146,17 @@ pub enum Dialog {
     SquadRemoveConfirm {
         name: String,
     },
+    /// Confirmation before starting a squad daemon that is not already running
+    /// (WI 0110). Opening the squad tab starts a long-lived background
+    /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
+    /// no tab at all. Never raised when a daemon is already up.
+    SquadStartConfirm,
+    /// The squad daemon requires a bearer key this process does not hold: a
+    /// hash exists on disk, `AWMAN_SQUAD_KEY` is unset here, and the plaintext
+    /// key is unrecoverable. `y` mints a new key and restarts the daemon onto
+    /// it; `n`/`Esc` opens no squad tab, because one that 401s on every poll
+    /// would show nothing but that.
+    SquadKeyMissing,
     Loading {
         title: String,
     },
@@ -151,6 +178,14 @@ pub enum Dialog {
     Notice {
         title: String,
         body: String,
+        /// The raw squad bearer key, when this notice is the key-setup
+        /// snippet — `[c]` copies it to the clipboard. `None` for notices
+        /// unrelated to a key (e.g. "daemon did not start"), which shows no
+        /// copy hint.
+        copy_key: Option<String>,
+        /// The bare shell export line alone, so `[z]` can copy just what
+        /// belongs in the rc file, without the banner and notes around it.
+        copy_zshrc_snippet: Option<String>,
     },
 }
 
@@ -192,12 +227,10 @@ pub struct WorkflowControlBoardState {
     /// Live peers still running in the focused step's parallel group (excludes
     /// the focused step). Non-zero disables back/finish in the WCB.
     pub parallel_peers_running: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowStepErrorState {
-    pub step_name: String,
-    pub error_lines: Vec<String>,
+    /// Detail lines for the failure that opened this board (exit code, signal,
+    /// run duration), copied from `AvailableActions::step_failure`. Empty on an
+    /// ordinary between-steps board (WI-0115 §1).
+    pub failure_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -369,7 +402,13 @@ pub fn render_yes_no(title: &str, body: &str, area: Rect, frame: &mut Frame) {
         })
         .sum();
     let body_h = wrapped_lines as u16;
-    let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+    // The dialog frame costs 4 rows (two borders + a row of padding each
+    // side), and the content is `body_h` rows plus a blank separator plus the
+    // key-hint row. Anything less than `body_h + 6` clips the hint off the
+    // bottom — which is exactly the row a user needs to know that `y`/`n`/Esc
+    // are the answers. `.max(8)` keeps a one-line body's dialog from looking
+    // cramped.
+    let height = (body_h + 6).min(area.height.saturating_sub(2)).max(8);
     let dialog_area = centered_fixed(width, height, area);
     let inner = render_dialog_frame(title, Color::Yellow, dialog_area, frame);
     let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");
@@ -417,8 +456,7 @@ pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
         dialog_area,
         frame,
     );
-    let text =
-        "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
+    let text = "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,

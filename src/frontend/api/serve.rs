@@ -14,10 +14,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 
+use crate::command::commands::api_server::AuthMode;
 use crate::command::error::CommandError;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::engine::auth::TlsMaterial;
-use crate::frontend::api::routes::AuthMode;
 
 /// The single JSON error envelope every awman HTTP daemon emits.
 #[derive(serde::Serialize)]

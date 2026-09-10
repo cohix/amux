@@ -23,6 +23,7 @@ impl SpecsCommandFrontend for TuiCommandFrontend {
         let response = self.ask_dialog(DialogRequest::MultilineInput {
             title: "Spec summary".into(),
             prompt: "Enter a brief summary (Ctrl+Enter to submit):".into(),
+            default_text: None,
         })?;
         match response {
             DialogResponse::Text(t) => Ok(t),

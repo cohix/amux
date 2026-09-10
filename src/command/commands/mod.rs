@@ -34,7 +34,7 @@ pub mod new;
 pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
-pub(crate) mod remote_client;
+pub mod remote_client;
 pub mod skill_library;
 pub mod specs;
 pub mod status;

@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
+use crate::command::commands::squad::supervisor::SquadGatewayResolver;
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::command::error::CommandError;
+use crate::data::config::env::Env;
 use crate::data::session::Session;
 use crate::data::session_manager::SessionManager;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
@@ -50,13 +50,31 @@ pub struct StatusBar {
     pub text: String,
 }
 
+/// The outcome of the pre-event-loop squad tab build (`awman squad`).
+///
+/// `KeyMissing` is not an error — the daemon is up and healthy — but no tab is
+/// assembled for it, because a tab whose every poll is refused with 401 shows
+/// nothing but that. The caller raises [`Dialog::SquadKeyMissing`] instead, and
+/// accepting it builds the tab through the ordinary
+/// [`App::poll_squad_startup`] path once a usable key exists.
+pub enum SquadTabStart {
+    Ready(Box<SquadTabBuild>),
+    KeyMissing,
+}
+
+/// A live squad gateway plus what this process can authenticate to it with,
+/// as Layer 2 reports it.
+pub use crate::command::commands::squad::supervisor::{
+    SquadKeySetup, SquadStartError, SquadStartup,
+};
+
 /// Everything [`App::build_squad_tab`] produces. `key_setup` is `Some` only on
 /// the run that minted the squad bearer key, and carries the shell snippet the
 /// caller must show before it is lost — the plaintext key exists nowhere else.
 pub struct SquadTabBuild {
     pub tab: Tab,
     pub gateway: Arc<dyn crate::command::commands::squad::gateway::TaskGateway>,
-    pub key_setup: Option<String>,
+    pub key_setup: Option<SquadKeySetup>,
 }
 
 /// Central TUI state. Contains NO business logic — only UI state.
@@ -67,7 +85,7 @@ pub struct App {
     pub focus: Focus,
     pub catalogue: &'static CommandCatalogue,
     pub engines: Engines,
-    pub session_manager: Arc<RwLock<SessionManager>>,
+    pub session_manager: Arc<SessionManager>,
     pub command_input: TextEdit,
     pub suggestion_row: Vec<String>,
     pub input_error: Option<String>,
@@ -77,10 +95,17 @@ pub struct App {
     pub command_dialog_active: bool,
     pub runtime_handle: tokio::runtime::Handle,
     /// Gateway for the singleton squad tab, obtained from
-    /// `SquadSupervisor::ensure_running()` when the tab is opened. Injected into
+    /// `SquadGatewayResolver::ensure_running()` when the tab is opened. Injected into
     /// `Dispatch` for `squad` in-tab actions so they reach the daemon. `None`
     /// until the squad tab exists.
     pub squad_gateway: Option<Arc<dyn crate::command::commands::squad::gateway::TaskGateway>>,
+    /// A squad daemon start that is running on the tokio runtime, waiting for
+    /// the daemon to publish its endpoint. `Some` only between the user
+    /// accepting the daemon-start confirmation and
+    /// [`App::poll_squad_startup`] draining the result, which is also what
+    /// keeps a second `y` from spawning a second daemon.
+    #[allow(clippy::type_complexity)]
+    pub squad_startup_rx: Option<std::sync::mpsc::Receiver<Result<SquadStartup, SquadStartError>>>,
     /// Receiver for asynchronous container stats results. The middle element
     /// is the step name of the slot the sample was polled for (empty for the
     /// single/backbone slot of a plain containerized command).
@@ -107,17 +132,33 @@ pub struct App {
     /// another query onto the same slot until the runtime CLI is swamped and
     /// no slot's numbers stay current.
     pub in_flight_stats: Arc<std::sync::Mutex<std::collections::HashSet<(usize, String)>>>,
+    /// The active tab index as of the previous tick (WI 0112). Lets the tick
+    /// notice a switch *away* from the squad tab and hand focus back to the
+    /// command box, without every tab-switching path having to know.
+    pub last_active_tab: usize,
+    /// Squad daemon health for the bottom-row indicator (WI 0112). Written by
+    /// the app-level `SquadIndicatorPoller` started in `tui::run`; read by
+    /// the renderer. Starts `Unknown` and stays so in unit tests, which never
+    /// start the poller.
+    pub squad_indicator: crate::frontend::tui::squad_indicator::SharedSquadIndicator,
 }
 
 impl App {
     pub fn new(
         catalogue: &'static CommandCatalogue,
         engines: Engines,
-        session_manager: Arc<RwLock<SessionManager>>,
+        session_manager: Arc<SessionManager>,
         initial_tab: Tab,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
+        // `App` accepts a pre-built tab for rendering, but the manager owns
+        // the Session object. This also covers the synthetic squad tab.
+        if session_manager.get(&initial_tab.session_id).is_none() {
+            session_manager
+                .create(initial_tab.session.clone())
+                .expect("initial tab session id must be unique");
+        }
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
@@ -135,11 +176,43 @@ impl App {
             command_dialog_active: false,
             runtime_handle,
             squad_gateway: None,
+            squad_startup_rx: None,
             stats_rx: Some(stats_rx),
             stats_tx,
             last_stats_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
             in_flight_stats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_active_tab: 0,
+            squad_indicator: Arc::new(std::sync::Mutex::new(
+                crate::frontend::tui::squad_indicator::SquadIndicator::Unknown,
+            )),
         }
+    }
+
+    /// Whether the active tab is the squad tab showing its card grid — the
+    /// state in which the command box is permanently inactive and the grid
+    /// always holds focus (WI 0112). False while an attach session owns the
+    /// tab's slots: the tab then behaves as an ordinary container tab.
+    pub fn squad_grid_active(&self) -> bool {
+        let tab = self.active_tab();
+        tab.is_squad && tab.container_slots.is_empty()
+    }
+
+    /// Keep `focus` consistent with the active tab (WI 0112), once per tick:
+    /// on the squad grid, focus is always the grid; leaving the squad tab for
+    /// a normal tab restores the command box. A normal-to-normal switch leaves
+    /// focus alone, exactly as before.
+    fn normalize_focus_for_active_tab(&mut self) {
+        if self.squad_grid_active() {
+            self.focus = Focus::ExecutionWindow;
+        } else if self.active_tab != self.last_active_tab
+            && self
+                .tabs
+                .get(self.last_active_tab)
+                .is_some_and(|tab| tab.is_squad)
+        {
+            self.focus = Focus::CommandBox;
+        }
+        self.last_active_tab = self.active_tab;
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -175,50 +248,191 @@ impl App {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+        // The removed index must not survive as `last_active_tab`, or a tab
+        // that later lands on it could be mistaken for the one that closed.
+        self.last_active_tab = self.last_active_tab.min(self.tabs.len().saturating_sub(1));
     }
 
-    /// Focus the existing squad tab, or create the singleton one.
+    /// Focus the existing squad tab, or create the singleton one — asking
+    /// first when that would also start a daemon.
     ///
     /// On failure nothing is created: the error text — which already names
     /// `awman api` (daemon conflict) or the sandbox runtime — is surfaced
     /// verbatim in the status bar, never a generic "could not connect".
     /// Idempotent: a second call focuses the tab created by the first.
+    ///
+    /// WI 0110: opening the tab starts a long-lived background process when no
+    /// squad daemon is running, so that case raises
+    /// [`Dialog::SquadStartConfirm`] and builds nothing until the user answers
+    /// `y` ([`App::build_and_install_squad_tab`]). With a daemon already
+    /// running there is nothing to consent to and no dialog is raised.
     pub fn open_or_focus_squad_tab(&mut self) {
-        let wrap_startup_error = |message: String| {
-            if message.starts_with("failed to start the squad daemon:")
-                || message.starts_with("failed to open squad tab:")
-                || message.starts_with("awman api")
-                || message.starts_with("squad ")
-            {
-                message
-            } else {
-                format!("failed to start the squad daemon: {message}")
-            }
-        };
         if let Some(idx) = self.tabs.iter().position(|t| t.is_squad) {
             self.active_tab = idx;
             self.needs_redraw = true;
             return;
         }
-        match Self::build_squad_tab(&self.engines, &self.runtime_handle) {
+        // The runtime refusal comes first: a sandbox-class runtime cannot back
+        // squad at all, so asking whether to start a daemon would be asking a
+        // question whose "yes" could not be honoured.
+        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+            self.status_bar.text = error.to_string();
+            return;
+        }
+        match Self::squad_daemon_is_running() {
+            Ok(true) => self.build_and_install_squad_tab(),
+            Ok(false) => {
+                self.active_dialog = Some(Dialog::SquadStartConfirm);
+                self.needs_redraw = true;
+            }
+            // Whether a daemon is running could not be determined (an
+            // unreadable squad root, say). Fall through to the ordinary build,
+            // whose error text is the specific one worth showing.
+            Err(_) => self.build_and_install_squad_tab(),
+        }
+    }
+
+    /// Whether a squad daemon is already running for this squad root. Starts
+    /// nothing and writes nothing — see [`SquadGatewayResolver::daemon_is_running`].
+    ///
+    /// [`SquadGatewayResolver::daemon_is_running`]: crate::command::commands::squad::supervisor::SquadGatewayResolver::daemon_is_running
+    fn squad_daemon_is_running() -> Result<bool, crate::command::error::CommandError> {
+        SquadGatewayResolver::from_env(&Env::from_process())?.daemon_is_running()
+    }
+
+    /// Start the squad tab and install it as the active tab, starting the
+    /// daemon if it is not already running. The second half of
+    /// [`App::open_or_focus_squad_tab`], separated so the daemon-start
+    /// confirmation can call it on `y`.
+    ///
+    /// Starting a daemon means spawning a process and then waiting — up to ten
+    /// seconds — for it to publish its endpoint. Doing that inline froze the
+    /// event loop for the whole wait: the terminal could not redraw, so the
+    /// confirmation the user had just answered stayed painted on screen until
+    /// the wait ended, and a failure surfaced only as a status-bar line under
+    /// a modal that had appeared to hang. The wait now runs on the tokio
+    /// runtime, this returns immediately with a "Starting…" modal on screen,
+    /// and [`App::poll_squad_startup`] installs the tab (or reports the
+    /// failure in a modal of its own) when the daemon answers.
+    pub fn build_and_install_squad_tab(&mut self) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.is_squad) {
+            self.active_tab = idx;
+            self.needs_redraw = true;
+            return;
+        }
+        // A second `y` while the first start is still in flight must not spawn
+        // a second daemon.
+        if self.squad_startup_rx.is_some() {
+            return;
+        }
+        // The runtime refusal is synchronous and immediate — there is nothing
+        // to wait for — so it is reported without ever showing a "Starting…"
+        // modal the user would watch fail.
+        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+            self.status_bar.text = error.to_string();
+            self.needs_redraw = true;
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let engines = self.engines.clone();
+        self.runtime_handle.spawn(async move {
+            let _ = tx.send(Self::ensure_squad_gateway(engines).await);
+        });
+        self.squad_startup_rx = Some(rx);
+        self.active_dialog = Some(Dialog::Loading {
+            title: "Starting squad daemon".to_string(),
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Mint a new squad bearer key and restart the daemon onto it, then open
+    /// the tab. The `y` answer to [`Dialog::SquadKeyMissing`].
+    ///
+    /// Shares `squad_startup_rx` and [`App::poll_squad_startup`] with an
+    /// ordinary start: a refresh ends in the same place a first run does — a
+    /// live gateway and a a minted key to display — so there is
+    /// one drain, one progress modal, and one error path rather than two.
+    pub fn start_squad_key_refresh(&mut self) {
+        if self.squad_startup_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime_handle.spawn(async move {
+            let _ = tx.send(Self::refresh_squad_key().await);
+        });
+        self.squad_startup_rx = Some(rx);
+        self.active_dialog = Some(Dialog::Loading {
+            title: "Refreshing the squad key".to_string(),
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Drain a completed daemon startup, if one has finished since the last
+    /// tick. Called from [`App::tick_all_tabs`]; a no-op when no start is in
+    /// flight or the daemon has not answered yet.
+    ///
+    /// A failure is raised as a modal rather than written to the status bar:
+    /// the user explicitly asked for a daemon, so "it did not start, and here
+    /// is why" is the answer to a question they asked, not an aside they may
+    /// or may not notice before the next command overwrites it.
+    pub(crate) fn poll_squad_startup(&mut self) {
+        let Some(rx) = self.squad_startup_rx.as_ref() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(SquadStartError::Other(
+                "squad daemon startup was interrupted".to_string(),
+            )),
+        };
+        self.squad_startup_rx = None;
+        // Only this dialog is dismissed: an error or notice raised while the
+        // start was running belongs to the user, not to us.
+        if matches!(self.active_dialog, Some(Dialog::Loading { .. })) {
+            self.active_dialog = None;
+        }
+        self.needs_redraw = true;
+
+        match result.and_then(|startup| Self::assemble_squad_tab(startup, &self.runtime_handle)) {
             Ok(build) => {
                 self.squad_gateway = Some(build.gateway);
                 self.tabs.push(build.tab);
                 self.active_tab = self.tabs.len() - 1;
-                if let Some(body) = build.key_setup {
+                if let Some(key_setup) = build.key_setup {
                     self.active_dialog = Some(Dialog::Notice {
                         title: "squad authentication".to_string(),
-                        body,
+                        body: key_setup.body,
+                        copy_key: Some(key_setup.key),
+                        copy_zshrc_snippet: Some(key_setup.zshrc_snippet),
                     });
                 }
-                self.needs_redraw = true;
             }
-            Err(message) => {
-                // Preserve known conflict/runtime guidance, while attributing
-                // any unexpected startup failure before showing it.
-                self.status_bar.text = wrap_startup_error(message);
+            // A daemon this process cannot authenticate to is not worth a tab:
+            // every poll would 401 and the grid would show nothing but that.
+            // Offer the one recovery there is instead, and build nothing until
+            // it is taken — see `Dialog::SquadKeyMissing`.
+            Err(SquadStartError::KeyMissing) => {
+                self.active_dialog = Some(Dialog::SquadKeyMissing);
             }
+            Err(error) => self.report_squad_start_failure(&error),
         }
+    }
+
+    /// Raise a squad start failure as a modal, and leave its text in the
+    /// status bar behind it. Every variant but `KeyMissing` lands here: each
+    /// already carries text that names the problem, so there is nothing to
+    /// classify — see [`SquadStartError`].
+    fn report_squad_start_failure(&mut self, error: &SquadStartError) {
+        let message = error.to_string();
+        self.status_bar.text = message.clone();
+        self.active_dialog = Some(Dialog::Notice {
+            title: "squad daemon did not start".to_string(),
+            body: message,
+            copy_key: None,
+            copy_zshrc_snippet: None,
+        });
     }
 
     /// Build the singleton squad tab: ensure the daemon is running, obtain a
@@ -229,58 +443,72 @@ impl App {
     pub(crate) fn build_squad_tab(
         engines: &crate::command::dispatch::Engines,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<SquadTabBuild, String> {
-        use crate::command::commands::squad::daemon::SquadSupervisor;
-        use crate::command::commands::squad::gateway::TaskGateway;
-        use crate::command::commands::squad::runtime_guard::require_container_tier;
-        use crate::data::config::env::Env;
-
-        let wrap_startup_error = |message: String| {
-            if message.starts_with("failed to start the squad daemon:")
-                || message.starts_with("failed to open squad tab:")
-                || message.starts_with("awman api")
-                || message.starts_with("squad ")
-            {
-                message
-            } else {
-                format!("failed to start the squad daemon: {message}")
-            }
-        };
-
+    ) -> Result<SquadTabStart, SquadStartError> {
         // A sandbox-class runtime cannot back squad: report the runtime error,
         // never a generic connection failure.
-        require_container_tier(engines).map_err(|e| wrap_startup_error(e.to_string()))?;
+        SquadGatewayResolver::admit_runtime(engines)?;
 
-        let env = Env::from_process();
-        let supervisor = Arc::new(
-            SquadSupervisor::from_env(&env).map_err(|e| wrap_startup_error(e.to_string()))?,
-        );
-
-        // `ensure_running` is async, but the caller may be on a tokio worker
-        // thread where `Handle::block_on` would panic. Drive it on the runtime
-        // and block on the result channel instead
+        // `ensure_squad_gateway` is async, but the caller may be on a tokio
+        // worker thread where `Handle::block_on` would panic. Drive it on the
+        // runtime and block on the result channel instead
         // (see /awman/context/workflow/deviations.md, D-tui-3).
+        //
+        // Blocking here is only tolerable because this path runs *before* the
+        // event loop exists (bare `awman squad`). Once the TUI is up, the
+        // daemon-start confirmation uses `build_and_install_squad_tab`, which
+        // waits on the runtime instead of freezing the screen.
         let (tx, rx) = std::sync::mpsc::channel();
-        {
-            let supervisor = supervisor.clone();
-            runtime_handle.spawn(async move {
-                let _ = tx.send(supervisor.ensure_running().await);
-            });
-        }
-        let gateway = match rx.recv() {
-            Ok(Ok(gateway)) => gateway,
-            Ok(Err(error)) => return Err(wrap_startup_error(error.to_string())),
-            Err(_) => return Err("squad daemon startup was interrupted".to_string()),
+        let owned_engines = engines.clone();
+        runtime_handle.spawn(async move {
+            let _ = tx.send(Self::ensure_squad_gateway(owned_engines).await);
+        });
+        let startup = match rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(SquadStartError::Other(
+                "squad daemon startup was interrupted".to_string(),
+            )),
         };
-        // A first run mints the bearer key here. It has to be shown, or the
-        // user is left with a daemon they cannot authenticate to from any
-        // later process; the caller raises it as a dismissable modal.
-        let key_setup = supervisor.take_generated_key_setup();
+        match startup {
+            Ok(startup) => Self::assemble_squad_tab(startup, runtime_handle)
+                .map(|build| SquadTabStart::Ready(Box::new(build))),
+            Err(SquadStartError::KeyMissing) => Ok(SquadTabStart::KeyMissing),
+            Err(error) => Err(error),
+        }
+    }
 
-        let session = Self::squad_synthetic_session()
-            .map_err(|error| format!("failed to open squad tab: {error}"))?;
+    /// Ensure a squad daemon is running and return a gateway to it, together
+    /// with what this process can authenticate to it with.
+    ///
+    /// This is the whole waiting half of opening the squad tab, and the only
+    /// half that is async. The caller decides how to wait for it: on the
+    /// runtime (the TUI's daemon-start confirmation) or by blocking
+    /// (`build_squad_tab`, before there is an event loop to freeze).
+    pub(crate) async fn ensure_squad_gateway(
+        engines: crate::command::dispatch::Engines,
+    ) -> Result<SquadStartup, SquadStartError> {
+        SquadGatewayResolver::open_from_env(&Env::from_process(), &engines).await
+    }
 
-        let gateway: Arc<dyn TaskGateway> = Arc::new(gateway);
+    /// Mint a new bearer key, restart the daemon onto it, and return the same
+    /// startup an ordinary open does — so the caller drains both through one
+    /// path. The key is always `Minted` here, which is the point: the recovery
+    /// ends by showing the user the key they were missing.
+    pub(crate) async fn refresh_squad_key() -> Result<SquadStartup, SquadStartError> {
+        SquadGatewayResolver::refresh_key_from_env(&Env::from_process()).await
+    }
+
+    /// Turn a live startup into the squad tab: the squad-root session, the tab
+    /// itself, and its task-list poller. Pure local work — nothing here waits
+    /// on the daemon, so it is safe to run on the event-loop thread.
+    fn assemble_squad_tab(
+        startup: SquadStartup,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<SquadTabBuild, SquadStartError> {
+        let session = Session::open_squad_root(&Env::from_process()).map_err(|error| {
+            SquadStartError::Other(format!("failed to open squad tab: {error}"))
+        })?;
+
+        let gateway = startup.gateway;
 
         let mut tab = Tab::new_squad(session);
         {
@@ -306,43 +534,18 @@ impl App {
         Ok(SquadTabBuild {
             tab,
             gateway,
-            key_setup,
+            key_setup: startup.key_setup,
         })
-    }
-
-    /// Build the squad tab's synthetic session, rooted at the squad storage root.
-    /// It exists solely to satisfy the `Tab` API; nothing rendered in the squad
-    /// tab derives from it.
-    fn squad_synthetic_session() -> Result<Session, crate::data::error::DataError> {
-        use crate::data::config::env::Env;
-        use crate::data::fs::squad_paths::SquadPaths;
-        use crate::data::session::SessionOpenOptions;
-
-        let root = SquadPaths::from_process_env()?.root().to_path_buf();
-        std::fs::create_dir_all(&root).ok();
-        Session::open_at_git_root(
-            root.clone(),
-            root,
-            SessionOpenOptions {
-                env: Some(Env::from_process()),
-                ..Default::default()
-            },
-        )
     }
 
     /// Spawn a parsed command as an async tokio task, wiring up all channels
     /// between the event loop and the command thread.
     pub fn spawn_command(&mut self, _command_text: &str, parsed: ParsedCommandBoxInput) {
-        // WI 0102: `squad attach` has no Layer-2 command; intercept it before
-        // the ordinary Dispatch spawn, mirroring `cli::run`'s carve-out.
-        if parsed.path.as_slice() == ["squad", "attach"] {
-            let name = match parsed.arguments.get("name") {
-                Some(crate::command::dispatch::parsed_input::ArgValue::Single(name)) => {
-                    name.clone()
-                }
-                _ => String::new(),
-            };
-            crate::frontend::tui::squad_attach::start_squad_attach(self, &name);
+        let path_refs: Vec<&str> = parsed.path.iter().map(String::as_str).collect();
+        if let Err(error) =
+            Dispatch::<TuiCommandFrontend>::validate_runtime_admission(&self.engines, &path_refs)
+        {
+            self.status_bar.text = error.to_string();
             return;
         }
 
@@ -422,6 +625,10 @@ impl App {
         tab.stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let attach_context = tab
+            .squad
+            .as_ref()
+            .map(|state| (state.attach_session.clone(), state.daemon_reachable.clone()));
         let frontend = TuiCommandFrontend::new(
             parsed.clone(),
             tab.status_log.clone(),
@@ -442,6 +649,10 @@ impl App {
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
             tab.container_slot_events.clone(),
+        )
+        .with_squad_attach_context(
+            attach_context.as_ref().map(|(session, _)| session.clone()),
+            attach_context.map(|(_, reachable)| reachable),
         );
 
         tab.command_result_rx = Some(result_rx);
@@ -539,8 +750,21 @@ impl App {
 
         // Build the dispatch and spawn the command using the tab's session
         // so commands execute in the correct working directory.
-        let tab_session = self.active_tab().session.clone();
-        let session = Arc::new(RwLock::new(tab_session));
+        let session_id = self.active_tab().session_id;
+        let session = match self.session_manager.get(&session_id) {
+            Some(session) => session,
+            None => {
+                // Test and extension callers may install a prebuilt Tab
+                // directly. Normalize that legacy construction at the
+                // ownership boundary before dispatching against it.
+                self.session_manager
+                    .create(self.active_tab().session.clone())
+                    .expect("tab session id must be unique");
+                self.session_manager
+                    .get(&session_id)
+                    .expect("registered tab session must be retrievable")
+            }
+        };
         let engines = self.engines.clone();
         let path_owned: Vec<String> = parsed.path.clone();
         // WI 0102: in-tab `squad` actions reach the daemon through the same
@@ -562,17 +786,34 @@ impl App {
         });
     }
 
-    /// Add a new tab backed by the given session. Returns the index of the
-    /// new tab.
-    pub fn add_tab(&mut self, session: Session) -> usize {
-        let tab = Tab::new(session);
+    /// Open and register a directory session, then create its tab view.
+    pub fn add_tab(
+        &mut self,
+        dir: std::path::PathBuf,
+        opts: crate::data::session::SessionOpenOptions,
+    ) -> Result<usize, crate::data::error::DataError> {
+        let session_id = self.session_manager.open_or_create(dir, opts)?;
+        let session = self
+            .session_manager
+            .get(&session_id)
+            .expect("newly-created session must be registered")
+            .try_read()
+            .expect("newly-created session must not be locked")
+            .clone();
+        let tab = Tab::new_with_git_engine(session, self.engines.git_engine.clone());
         self.tabs.push(tab);
-        self.tabs.len() - 1
+        Ok(self.tabs.len() - 1)
     }
 
     /// Tick all tabs: drain container output, poll for command completion,
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
+        // A squad daemon start runs on the runtime, so the tick is where its
+        // result lands — before the tab loop, so a tab installed by this call
+        // is polled on the very same tick it appears.
+        self.poll_squad_startup();
+        self.normalize_focus_for_active_tab();
+
         let active = self.active_tab;
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
             // WI 0102: drive the squad tab's poll loop — it fetches only while
@@ -862,7 +1103,7 @@ impl App {
         // unreachable, surface the frozen-overview indicator (the attached
         // container slots keep streaming from their direct runtime connections).
         if let Some(state) = self.tabs[active].squad.as_ref() {
-            if state.attached_task.is_some()
+            if state.attached_task().is_some()
                 && !state
                     .daemon_reachable
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -903,10 +1144,20 @@ impl App {
                         editor,
                     }
                 }
-                DialogRequest::MultilineInput { title, prompt } => Dialog::MultilineInput {
+                DialogRequest::MultilineInput {
                     title,
                     prompt,
-                    editor: TextEdit::new(true),
+                    default_text,
+                } => Dialog::MultilineInput {
+                    title,
+                    prompt,
+                    editor: {
+                        let mut editor = TextEdit::new(true);
+                        if let Some(text) = default_text {
+                            editor.set_text(&text);
+                        }
+                        editor
+                    },
                 },
                 DialogRequest::ListPicker { title, items } => Dialog::ListPicker {
                     title,
@@ -917,7 +1168,6 @@ impl App {
                     Dialog::KindSelect { title, options }
                 }
                 DialogRequest::WorkflowControlBoard(state) => Dialog::WorkflowControlBoard(state),
-                DialogRequest::WorkflowStepError(state) => Dialog::WorkflowStepError(state),
                 DialogRequest::WorkflowYoloCountdown(state) => Dialog::WorkflowYoloCountdown(state),
                 DialogRequest::WorkflowStepConfirm(state) => Dialog::WorkflowStepConfirm(state),
                 DialogRequest::AgentSetup(state) => Dialog::AgentSetup(state),
@@ -969,6 +1219,17 @@ impl App {
                 }
                 DialogRequest::Loading { title } => Dialog::Loading { title },
                 DialogRequest::Custom { title, body, keys } => Dialog::Custom { title, body, keys },
+                DialogRequest::KeySetupNotice {
+                    title,
+                    body,
+                    copy_key,
+                    copy_zshrc_snippet,
+                } => Dialog::Notice {
+                    title,
+                    body,
+                    copy_key: Some(copy_key),
+                    copy_zshrc_snippet: Some(copy_zshrc_snippet),
+                },
             };
             self.active_dialog = Some(dialog);
             self.command_dialog_active = true;
@@ -1041,13 +1302,11 @@ pub(crate) fn stats_poll_targets(tab: &Tab) -> Vec<(String, StatsPollTarget)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
     use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
     use crate::data::session_manager::SessionManager;
     use crate::frontend::tui::tabs::Tab;
+    use std::sync::Arc;
 
     fn make_test_session() -> Session {
         let tmp = tempfile::tempdir().unwrap();
@@ -1061,44 +1320,25 @@ mod tests {
     }
 
     fn make_engines() -> crate::command::dispatch::Engines {
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-                "/tmp",
-            )),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store = {
-            let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                tmp.path(),
-            ))
-        };
-        crate::command::dispatch::Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
-        }
+        crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"))
+    }
+
+    /// Shared across every test in this module for the same reason as
+    /// `tui::tests::test_runtime_handle`: leaking a fresh multi-threaded
+    /// `Runtime` per call exhausts the OS thread budget once enough tests
+    /// have run in the same process.
+    fn test_runtime_handle() -> tokio::runtime::Handle {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+            .handle()
+            .clone()
     }
 
     fn make_app() -> App {
-        let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
         let catalogue = CommandCatalogue::get();
         let engines = make_engines();
-        let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+        let session_manager = Arc::new(SessionManager::in_memory());
         let session = make_test_session();
         let tab = Tab::new(session);
         App::new(
@@ -1106,7 +1346,7 @@ mod tests {
             engines,
             session_manager,
             tab,
-            rt.handle().clone(),
+            test_runtime_handle(),
         )
     }
 

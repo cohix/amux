@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use awman::command::commands::remote_client::{RemoteWorkflowPoller, WorkflowStateSource};
+use awman::command::commands::squad::attach::{SlotAction, SquadSlotDriver};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
@@ -20,24 +22,18 @@ use awman::data::workflow_definition::WorkflowStep;
 use awman::data::workflow_state::{StepState, WorkflowState};
 use awman::data::EngineWorkflowStateStore;
 use awman::engine::agent::AgentEngine;
-use awman::engine::agent_runtime::AgentRuntimeEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::tui::app::App;
-use awman::frontend::tui::squad_attach::{SlotAction, SquadSlotDriver};
 use awman::frontend::tui::tabs::{
-    ContainerSlotEvent, SharedContainerSlotEvents, SharedWorkflowViewState, Tab,
-    WorkflowOverviewState, WorkflowViewState,
+    ContainerSlotEvent, SharedWorkflowViewState, Tab, WorkflowOverviewState, WorkflowViewState,
 };
-use awman::frontend::tui::user_message::SharedStatusLog;
 use awman::frontend::tui::workflow_view::{render_workflow_overview, workflow_state_to_view_state};
-use awman::frontend::tui::{RemoteWorkflowPoller, WorkflowStateSource};
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 /// One step of a scripted workflow: name, dependencies, state, agent, model.
@@ -70,10 +66,7 @@ fn workflow_state(steps: &[StepSpec]) -> WorkflowState {
 }
 
 fn driver() -> SquadSlotDriver {
-    let runtime: Arc<dyn AgentRuntimeEngine> = Arc::new(ContainerRuntime::docker());
-    let events: SharedContainerSlotEvents = Arc::new(Mutex::new(VecDeque::new()));
-    let log: SharedStatusLog = Arc::new(Mutex::new(Vec::new()));
-    SquadSlotDriver::new(runtime, events, log)
+    SquadSlotDriver::new()
 }
 
 #[test]
@@ -154,6 +147,12 @@ impl WorkflowStateSource for ScriptedRoute {
     }
 }
 
+fn publish_to_view(view: SharedWorkflowViewState) -> Box<dyn FnMut(&WorkflowState) + Send> {
+    Box::new(move |state| {
+        *view.lock().unwrap() = Some(workflow_state_to_view_state(state));
+    })
+}
+
 async fn wait_for_view(view: &SharedWorkflowViewState) -> WorkflowViewState {
     for _ in 0..50 {
         if let Some(value) = view.lock().unwrap().clone() {
@@ -217,12 +216,12 @@ async fn squad_and_api_workflow_routes_publish_the_same_view_state() {
     let squad_cancel = CancellationToken::new();
     let api_task = RemoteWorkflowPoller::new(
         Arc::new(ScriptedRoute::new(vec![Ok(Some(state.clone()))])),
-        api_view.clone(),
+        publish_to_view(api_view.clone()),
     )
     .start(api_cancel.clone());
     let squad_task = RemoteWorkflowPoller::new(
         Arc::new(ScriptedRoute::new(vec![Ok(Some(state))])),
-        squad_view.clone(),
+        publish_to_view(squad_view.clone()),
     )
     .start(squad_cancel.clone());
 
@@ -245,8 +244,19 @@ fn session() -> Session {
     .unwrap()
 }
 
+/// Shared by every test in this file rather than leaking a fresh `Runtime`
+/// (and its worker-thread pool) per call, which exhausts the OS thread
+/// budget in a resource-constrained CI container well before the file's
+/// tests finish.
+fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+        .handle()
+        .clone()
+}
+
 fn squad_app() -> App {
-    let runtime_handle = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
     let runtime = Arc::new(ContainerRuntime::docker());
     let overlay = Arc::new(OverlayEngine::with_auth_resolver(
         AuthPathResolver::at_home(std::path::PathBuf::from("/tmp")),
@@ -269,9 +279,9 @@ fn squad_app() -> App {
     App::new(
         CommandCatalogue::get(),
         engines,
-        Arc::new(RwLock::new(SessionManager::in_memory())),
+        Arc::new(SessionManager::in_memory()),
         Tab::new_squad(session()),
-        runtime_handle.handle().clone(),
+        test_runtime_handle(),
     )
 }
 
@@ -430,7 +440,7 @@ async fn poller_driven_overview_uses_existing_grouping_and_shows_every_sibling()
     let cancel = CancellationToken::new();
     let task = RemoteWorkflowPoller::new(
         Arc::new(ScriptedRoute::new(vec![Ok(Some(state))])),
-        view.clone(),
+        publish_to_view(view.clone()),
     )
     .start(cancel.clone());
     let published = wait_for_view(&view).await;
@@ -494,18 +504,25 @@ async fn daemon_failure_freezes_poller_overview_and_preserves_live_slots() {
             Ok(Some(initial.clone())),
             Err(CommandError::RemoteTransport("daemon disappeared".into())),
         ])),
-        view.clone(),
+        Box::new({
+            let view = view.clone();
+            move |state| {
+                *view.lock().unwrap() = Some(workflow_state_to_view_state(state));
+                callback_seen.store(true, Ordering::Relaxed);
+            }
+        }),
     )
     .with_reachable(reachable.clone())
-    .with_on_state(Arc::new(move |_| {
-        callback_seen.store(true, Ordering::Relaxed)
-    }))
     .start(cancel.clone());
     let frozen = wait_for_view(&view).await;
 
     push_launch(app.active_tab(), "live", "claude", "awman-live");
     app.active_tab_mut().drain_container_slot_events();
-    app.active_tab_mut().squad.as_mut().unwrap().attached_task = Some("task-a".into());
+    app.active_tab_mut()
+        .squad
+        .as_ref()
+        .unwrap()
+        .begin_attach("task-a");
     tokio::time::sleep(Duration::from_millis(650)).await;
 
     assert!(callback_count.load(Ordering::Relaxed));
@@ -596,7 +613,7 @@ fn neither_attach_frontend_names_a_concrete_runtime_backend() {
     for source in [
         include_str!("../src/frontend/tui/squad_attach.rs"),
         include_str!("../src/frontend/cli/per_command/squad_attach.rs"),
-        include_str!("../src/frontend/attach.rs"),
+        include_str!("../src/command/commands/squad/attach.rs"),
     ] {
         assert!(
             !source.contains("\"apple-containers\""),

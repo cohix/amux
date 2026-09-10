@@ -11,7 +11,7 @@ use crate::command::commands::{
     collect_all_overlay_specs, parse_overlay_list, report_session_end, resolve_agent,
     resolve_context_overlays, warn_legacy_config,
 };
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
@@ -75,6 +75,28 @@ impl ChatCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10).
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            ChatCommandFlags {
+                non_interactive: ctx.flags.bool("non-interactive"),
+                plan: ctx.flags.bool("plan"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+                yolo: ctx.flags.bool("yolo"),
+                auto: ctx.flags.bool("auto"),
+                agent: ctx.flags.string("agent"),
+                model: ctx.flags.string("model"),
+                launch_mode: crate::command::dispatch::parse_launch_mode(
+                    ctx.flags.string("launch-mode"),
+                    &ctx.path(),
+                )?,
+                overlay: ctx.flags.strs("overlay").to_vec(),
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        ))
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {

@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use awman::command::commands::squad::commands::{SquadCommandFrontend, SquadServeConfig};
+use awman::command::commands::squad::commands::SquadCommandFrontend;
 use awman::command::commands::squad::daemon::{
     SquadDaemonCommand, SquadDaemonSubcommand, SquadStartFlags,
 };
@@ -56,7 +56,18 @@ impl UserMessageSink for RecordingFrontend {
 
 #[async_trait::async_trait]
 impl SquadCommandFrontend for RecordingFrontend {
-    async fn serve_squad_daemon(&mut self, _config: SquadServeConfig) -> Result<(), CommandError> {
+    // WI 0113 F-02: the daemon host supplies the unattended frontends its
+    // evaluator drives agents with; Layer 2 builds the evaluator from them.
+    fn squad_run_frontends(
+        &self,
+    ) -> Option<Arc<dyn awman::command::commands::squad::evaluation::SquadRunFrontends>> {
+        Some(awman::frontend::squad::unattended::UnattendedFrontends::shared())
+    }
+
+    async fn serve_squad_daemon(
+        &mut self,
+        _handles: awman::command::commands::squad::daemon_runtime::SquadDaemonHandles,
+    ) -> Result<(), CommandError> {
         // Stand in for a served-then-shut-down daemon: `run_start` continues
         // through its cleanup path exactly as it would after Ctrl-C.
         Ok(())
@@ -124,6 +135,26 @@ async fn run_start(home: &Path, flags: SquadStartFlags) -> (RecordingFrontend, S
         .await
         .expect("squad start must succeed on a clean fixture");
     (frontend, SquadPaths::from_root(&squad_root))
+}
+
+/// The missing-key answer's wording, pinned character for character.
+///
+/// It moved from a free function in the CLI to `CommandError::SquadKeyMissing`
+/// (WI 0113 F-04) so the TUI and any later frontend say the same thing. Every
+/// clause is load-bearing: the variable to export, the fact that the key
+/// cannot be read back, the command that mints a new one, and the warning that
+/// minting invalidates the old one.
+#[test]
+fn the_missing_key_answer_names_the_variable_the_command_and_the_consequence() {
+    let expected = format!(
+        "squad requires a bearer key and none is set in this shell.\n\n\
+         The key is shown only once, when it is minted, and only its hash is \
+         stored — so it cannot be read back. Set {AWMAN_SQUAD_KEY} if you saved it, or mint a \
+         new one with:\n    awman squad start --refresh-key\n\
+         which invalidates the previous key, so any shell still exporting it \
+         must be updated too.",
+    );
+    assert_eq!(CommandError::SquadKeyMissing.to_string(), expected);
 }
 
 /// The first start mints a key AND tells the user how to spend it. Printing the

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::data::fs::task_store::{Run, Task};
+use crate::frontend::tui::squad_attach::SquadAttachSession;
 
 /// Snapshot the poller publishes; the renderer only ever reads this.
 #[derive(Debug, Clone, Default)]
@@ -66,8 +67,16 @@ pub struct SquadTabState {
     pub cancel: CancellationToken,
     /// Handle to the poll task, aborted on `Drop`.
     poll_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Set while an `squad attach` session owns this tab's slots and strip.
-    pub attached_task: Option<String>,
+    /// Cancels *only* the current attach session — its local
+    /// attach clients and its workflow poller. A child of [`cancel`], so
+    /// closing the tab still stops it, but detaching (WI 0110) stops the
+    /// attach session without also stopping the task-list poller that shares
+    /// the tab.
+    ///
+    /// [`cancel`]: Self::cancel
+    /// Shared with the command frontend so Dispatch can own the attach loop
+    /// while the tab retains presentation-level detach/close control.
+    pub attach_session: Arc<SquadAttachSession>,
     /// Written by the attach driver; drives the "daemon not reachable"
     /// indicator without tearing down live slots.
     pub daemon_reachable: Arc<AtomicBool>,
@@ -78,14 +87,15 @@ pub struct SquadTabState {
 
 impl SquadTabState {
     pub fn new() -> Self {
+        let cancel = CancellationToken::new();
         Self {
             selected: 0,
             grid_columns: 1,
             snapshot: Arc::new(Mutex::new(SquadSnapshot::default())),
             focused: Arc::new(AtomicBool::new(false)),
-            cancel: CancellationToken::new(),
+            cancel: cancel.clone(),
             poll_handle: None,
-            attached_task: None,
+            attach_session: Arc::new(SquadAttachSession::new(cancel.clone())),
             daemon_reachable: Arc::new(AtomicBool::new(true)),
             poll_selected: Arc::new(Mutex::new(None)),
         }
@@ -94,6 +104,27 @@ impl SquadTabState {
     /// Store the poll task handle so `Drop` can abort it.
     pub fn set_poll_handle(&mut self, handle: tokio::task::JoinHandle<()>) {
         self.poll_handle = Some(handle);
+    }
+
+    /// Open an attach session: mint its cancellation token (a child of the
+    /// tab's) and record the task it is attached to. Any previous session's
+    /// token is cancelled first, so two attaches can never share slots.
+    pub fn begin_attach(&self, task: &str) -> CancellationToken {
+        self.attach_session.begin(task)
+    }
+
+    /// End the current attach session, if any, and report whether there was
+    /// one. Cancels only the attach-scoped token — the local attach clients
+    /// and the workflow poller — so the containers themselves and the tab's
+    /// task-list poller are untouched. Returns the task that was attached.
+    pub fn end_attach(&self) -> Option<String> {
+        self.daemon_reachable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.attach_session.end()
+    }
+
+    pub fn attached_task(&self) -> Option<String> {
+        self.attach_session.task()
     }
 
     /// Name of the currently selected task, if the list is non-empty.
@@ -205,6 +236,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         }
     }

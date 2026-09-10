@@ -13,6 +13,7 @@ use subtle::ConstantTimeEq;
 use crate::data::config::repo::AgentAuthMode;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::auth_paths::AuthPathResolver;
+use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
@@ -176,6 +177,45 @@ impl ApiKeyHash {
 pub enum AuthOutcome {
     Authorized,
     Unauthorized,
+}
+
+/// Whether a daemon's HTTP surface demands a bearer key, and the hash it
+/// compares against when it does.
+///
+/// Lives at Layer 1 because it is an *auth* decision, not a transport one:
+/// both the API server and the squad daemon resolve it during bootstrap,
+/// before any router exists. Layer 3 only compares a presented key against it.
+#[derive(Clone, Debug)]
+pub enum AuthMode {
+    Enabled { key_hash: String },
+    Disabled,
+}
+
+impl AuthMode {
+    /// Resolve the mode for a daemon from its key-hash file plus a
+    /// `--dangerously-skip-auth` flag.
+    ///
+    /// `skip` short-circuits to [`AuthMode::Disabled`]; otherwise a missing
+    /// hash is fatal and names the command that mints one, because a daemon
+    /// that served with no hash would accept every request.
+    pub fn resolve_for_daemon(
+        paths: &DaemonPaths,
+        skip: bool,
+        refresh_hint: &str,
+    ) -> Result<AuthMode, EngineError> {
+        if skip {
+            return Ok(AuthMode::Disabled);
+        }
+        let hash = paths
+            .read_key_hash()
+            .map_err(EngineError::Data)?
+            .ok_or_else(|| {
+                EngineError::Auth(format!(
+                    "No API key hash on disk. Run `{refresh_hint}` to generate one."
+                ))
+            })?;
+        Ok(AuthMode::Enabled { key_hash: hash })
+    }
 }
 
 /// PEM-encoded TLS material.

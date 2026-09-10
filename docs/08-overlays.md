@@ -298,7 +298,7 @@ This source has the highest priority among global/repo/env/flag sources, but per
 `awman squad add` also accepts repeatable `--overlay` flags, and the squad
 interview offers the same overlay step. These task overlays are saved with
 the task and applied to its evaluation and workflow containers, together with
-the other overlay sources. See [Squad: Defining a task](12-squad.md#defining-a-task)
+the other overlay sources. See [Squad: Giving your squad a task](12-squad.md#giving-your-squad-a-task)
 for the task-creation flow; this page remains the authoritative reference for
 overlay syntax and merge behavior.
 

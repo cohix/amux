@@ -35,8 +35,8 @@ pub use data_paths::DataPaths;
 pub use kit_paths::SandboxKitPaths;
 pub use log_dirs::WorkflowLogPaths;
 pub use overlay_paths::OverlayPathResolver;
-pub use skill_dirs::SkillDirs;
-pub use squad_paths::SquadPaths;
+pub use skill_dirs::{SkillDirs, SKILL_INTERVIEW_CONTAINER_DIR};
+pub use squad_paths::{SharedSquadRunLog, SquadPaths, SquadRunLog, SquadRunLogError, SquadRunLogs};
 pub use task_store::{
     MountScope, Run, RunDetail, RunId, RunStatus, Task, TaskStatus, TaskStore, TaskWorkspace,
 };

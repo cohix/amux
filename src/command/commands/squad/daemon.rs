@@ -1,24 +1,26 @@
-//! Daemon lifecycle and the shared daemon-discovery supervisor for squad.
+//! Daemon lifecycle for `awman squad start|stop|status|logs`.
+//!
+//! Daemon *supervision* (discovery, key provisioning, start-on-demand) moved
+//! to Layer 1 in WI 0113 F-02; see `engine::squad::supervisor` and the Layer 2
+//! adapter `command::commands::squad::supervisor::SquadGatewayResolver`.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::http_core::HttpCore;
 use crate::command::commands::squad::commands::{SquadCommandFrontend, SquadServeConfig};
-use crate::command::commands::squad::gateway::{DaemonStatus, RemoteTaskGateway};
+use crate::command::commands::squad::daemon_runtime::SquadDaemonHandles;
+use crate::command::commands::squad::gateway::DaemonStatus;
 use crate::command::commands::squad::key_setup;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::fs::daemon_process::{SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
+use crate::data::config::env::Env;
 use crate::data::fs::{
-    AcquireError, DaemonGuard, DaemonKind, DaemonProcess, SquadPaths, Termination,
+    AcquireError, DaemonGuard, DaemonKind, DaemonProcess, DataPaths, SquadPaths, Termination,
 };
 use crate::data::message::{MessageLevel, UserMessage};
-use crate::engine::auth::ApiKey;
 
 #[derive(Debug, Clone)]
 pub struct SquadStartFlags {
@@ -106,174 +108,17 @@ impl Command for SquadDaemonCommand {
     }
 }
 
-pub struct SquadSupervisor {
-    process: DaemonProcess,
-    guard: DaemonGuard,
-    paths: SquadPaths,
-    env: EnvSnapshot,
-    /// A bearer key minted by this process because none existed yet. It is
-    /// deliberately never printed from here — see `provision_key`. Callers that
-    /// own a terminal drain it via [`SquadSupervisor::take_generated_key_setup`].
-    generated_key: std::sync::Mutex<Option<ApiKey>>,
-    /// Set once the minted key has been handed to a frontend for display.
-    key_disclosed: std::sync::atomic::AtomicBool,
-}
+/// The squad daemon's process identity. Re-exported from Layer 1 so this
+/// module keeps naming the daemon it drives (WI 0113 F-02).
+pub use crate::engine::squad::supervisor::squad_process;
 
-impl SquadSupervisor {
-    pub fn from_env(env: &EnvSnapshot) -> Result<Self, CommandError> {
-        let paths = SquadPaths::from_env(env)?;
-        Ok(Self {
-            process: squad_process(&paths),
-            guard: DaemonGuard::for_daemon(DaemonKind::Squad, env)?,
-            paths,
-            env: env.clone(),
-            generated_key: std::sync::Mutex::new(None),
-            key_disclosed: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    /// The key this supervisor minted during `ensure_running`, if any. A caller
-    /// that owns a terminal (the CLI, the TUI) displays it; nothing else may.
-    pub fn generated_key(&self) -> Option<ApiKey> {
-        self.generated_key
-            .lock()
-            .expect("squad generated-key mutex poisoned")
-            .clone()
-    }
-
-    /// Take the setup snippet for a key this supervisor minted, if it minted
-    /// one and has not handed it out yet. `None` on every later call, so a
-    /// caller may print the result unconditionally.
-    ///
-    /// The key itself stays in place — this supervisor still needs it to
-    /// authenticate — but the *disclosure* happens exactly once, so two
-    /// frontends sharing a supervisor cannot both print the same secret.
-    pub fn take_generated_key_setup(&self) -> Option<String> {
-        let key = self.generated_key()?;
-        if self
-            .key_disclosed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return None;
-        }
-        Some(key_setup::render_key_setup(
-            key.as_str(),
-            key_setup::ShellFlavor::from_env(&self.env),
-        ))
-    }
-
-    /// Resolve the bearer key this process will authenticate with.
-    ///
-    /// On a first run there is no `squad_key.hash` yet. The key MUST be minted
-    /// here, in the process that is about to spawn the daemon — never inside
-    /// the detached child, whose stdout is redirected to `~/.awman/squad/awman.log`
-    /// (launchd) or the journal (systemd-run) and would persist the plaintext
-    /// key in a file `awman squad logs` prints verbatim.
-    fn provision_key(&self) -> Result<Option<ApiKey>, CommandError> {
-        if let Some(key) = self.env.squad_key() {
-            return Ok(Some(ApiKey::from_string(key.to_string())));
-        }
-        if let Some(key) = self.generated_key() {
-            return Ok(Some(key));
-        }
-        // A daemon started with `--dangerously-skip-auth` checks no bearer
-        // token, so minting one here would write an `squad_key.hash` whose
-        // plaintext nobody holds — and the next auth-enabled start would then
-        // demand a key the user was never shown.
-        if self.daemon_auth_disabled()? {
-            return Ok(None);
-        }
-        if self.process.paths().read_key_hash()?.is_some() {
-            // A hash exists but this process was given no key; the request will
-            // be refused by the daemon with the standard auth error.
-            return Ok(None);
-        }
-        let auth_engine = crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::AuthPathResolver::from_process_env()?,
-            crate::data::fs::ApiPaths::from_process_env()?,
-        );
-        let key = auth_engine.generate_api_key()?;
-        let hash = auth_engine.hash_api_key(&key);
-        self.process.paths().write_key_hash(hash.as_str())?;
-        *self
-            .generated_key
-            .lock()
-            .expect("squad generated-key mutex poisoned") = Some(key.clone());
-        tracing::info!("squad daemon key minted for automatic daemon startup");
-        Ok(Some(key))
-    }
-
-    /// Whether the daemon that is currently running published a sidecar saying
-    /// it serves unauthenticated. `false` when no daemon is running, when it
-    /// published no sidecar, or when the sidecar predates the flag — every one
-    /// of which means "assume auth is required".
-    fn daemon_auth_disabled(&self) -> Result<bool, CommandError> {
-        if self.process.running_pid()?.is_none() {
-            return Ok(false);
-        }
-        Ok(self
-            .process
-            .read_meta()?
-            .is_some_and(|meta| meta.auth_disabled))
-    }
-
-    /// Discover the existing daemon endpoint, if its metadata sidecar is present.
-    pub fn gateway_from_meta(&self) -> Result<Option<RemoteTaskGateway>, CommandError> {
-        let key = self.provision_key()?;
-        self.gateway_from_meta_with(key.as_ref())
-    }
-
-    fn gateway_from_meta_with(
-        &self,
-        key: Option<&ApiKey>,
-    ) -> Result<Option<RemoteTaskGateway>, CommandError> {
-        let Some(meta) = self.process.read_meta()? else {
-            return Ok(None);
-        };
-        let address = format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port);
-        Ok(Some(RemoteTaskGateway::new(HttpCore::new(
-            &address, "v1", key,
-        )?)))
-    }
-
-    /// Return a remote gateway, starting the daemon only when needed. The
-    /// cross-daemon guard is intentionally first, before a PID check or spawn.
-    pub async fn ensure_running(&self) -> Result<RemoteTaskGateway, CommandError> {
-        tracing::info!("squad supervisor ensure-running requested");
-        self.guard.check()?;
-        // Mint the key here, before any spawn, so the detached child always
-        // finds a hash already on disk and never emits a key to its log.
-        let key = self.provision_key()?;
-        if self.process.running_pid()?.is_some() {
-            tracing::info!("squad supervisor found an already-running daemon");
-            return self.gateway_from_meta_with(key.as_ref())?.ok_or_else(|| {
-                CommandError::Other(format!(
-                    "squad daemon is running but has not published its endpoint; check {}",
-                    self.paths.daemon().log_file().display()
-                ))
-            });
-        }
-        let binary = std::env::current_exe()
-            .map_err(|e| CommandError::Other(format!("cannot determine awman binary: {e}")))?;
-        self.process
-            .spawn_detached(&binary, &["squad".into(), "start".into()])?;
-        tracing::info!("squad supervisor spawned daemon process");
-        for _ in 0..100 {
-            if let Some(gateway) = self.gateway_from_meta_with(key.as_ref())? {
-                return Ok(gateway);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Err(CommandError::Other(format!(
-            "squad daemon did not become ready within 10 seconds; check {}",
-            self.paths.daemon().log_file().display()
-        )))
-    }
-}
-
-fn squad_process(paths: &SquadPaths) -> DaemonProcess {
-    DaemonProcess::new(paths.daemon(), SQUAD_UNIT_NAME, SQUAD_PLIST_LABEL)
-}
+/// Daemon supervision moved to Layer 1 (`engine::squad::supervisor`) in WI
+/// 0113 F-02. `SquadKeyState` is re-exported here because the CLI and TUI
+/// already name it through this path; [`SquadGatewayResolver`] is the Layer 2
+/// adapter that turns the supervisor's endpoint into a `RemoteTaskGateway`.
+///
+/// [`SquadGatewayResolver`]: crate::command::commands::squad::supervisor::SquadGatewayResolver
+pub use crate::engine::squad::SquadKeyState;
 
 async fn run_start(
     flags: SquadStartFlags,
@@ -369,12 +214,31 @@ async fn run_start(
             other => CommandError::Data(other.into_data_error()),
         })?;
     tracing::info!(port = flags.port, "squad daemon starting in foreground");
-    let result = frontend
-        .serve_squad_daemon(SquadServeConfig {
+    // Layer 2 owns the bootstrap: admission, daemon engines, evaluator, then
+    // `SquadDaemonEngine::bootstrap`. The frontend only supplies the run
+    // frontends the evaluator drives agents with, and then serves.
+    let run_frontends =
+        frontend
+            .squad_run_frontends()
+            .ok_or_else(|| CommandError::NotAvailableForFrontend {
+                command: "squad start".into(),
+                frontend: "this".into(),
+            })?;
+    let data_paths = DataPaths::from_env(&Env::from_process())?;
+    let daemon_engines = Engines::for_daemon(DaemonKind::Squad, &data_paths)?;
+    let bootstrap = SquadDaemonHandles::bootstrap_with_frontends(
+        SquadServeConfig {
             port: flags.port,
             dangerously_skip_auth: flags.dangerously_skip_auth,
-        })
-        .await;
+        },
+        daemon_engines,
+        run_frontends,
+    )
+    .await;
+    let result = match bootstrap {
+        Ok(handles) => frontend.serve_squad_daemon(handles).await,
+        Err(error) => Err(error),
+    };
     let _ = process.clear_meta();
     let _ = guard.release();
     result?;

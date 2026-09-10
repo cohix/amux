@@ -60,7 +60,7 @@ impl ContainerRuntime {
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
-            backend: Arc::new(DockerBackend::new()),
+            backend: Arc::new(DockerBackend),
         }
     }
 
@@ -69,7 +69,7 @@ impl ContainerRuntime {
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
         Self {
-            backend: Arc::new(AppleBackend::new()),
+            backend: Arc::new(AppleBackend),
         }
     }
 

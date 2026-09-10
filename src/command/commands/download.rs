@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
@@ -60,17 +59,12 @@ pub trait DownloadCommandFrontend: UserMessageSink + Send + Sync {}
 
 pub struct DownloadCommand {
     asset: String,
-    engines: Engines,
     session: crate::data::session::Session,
 }
 
 impl DownloadCommand {
-    pub fn new(asset: String, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self {
-            asset,
-            engines,
-            session,
-        }
+    pub fn new(asset: String, session: crate::data::session::Session) -> Self {
+        Self { asset, session }
     }
 }
 

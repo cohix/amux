@@ -139,15 +139,14 @@ fn api_startup_log_message_contains_awman_and_api_mode() {
     // while preserving the assertion against the actual source.
     let src = include_str!("../../src/frontend/api/mod.rs");
 
-    // Collect every `tracing::info!` literal that mentions "starting",
-    // "listening", or "stopped" — those are the lifecycle log lines.
+    // Collect every string literal that mentions "starting", "listening", or
+    // "stopped" — those are the lifecycle log lines. Scanned as quoted
+    // segments per line (not "the whole trimmed line must be one literal")
+    // so a `tracing::info!(field = value, "message")` call with keyed fields
+    // ahead of the message literal is still caught.
     let lifecycle_msgs: Vec<&str> = src
         .lines()
-        .filter_map(|l| {
-            l.trim()
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix("\""))
-        })
+        .flat_map(|l| l.split('"').skip(1).step_by(2))
         .filter(|l| {
             let lower = l.to_lowercase();
             lower.contains("starting") || lower.contains("listening") || lower.contains("stopped")
@@ -235,7 +234,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });

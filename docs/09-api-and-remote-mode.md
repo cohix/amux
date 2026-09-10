@@ -19,10 +19,10 @@ API metadata, credentials, and output logs are recorded durably under
 `~/.awman/api/` for auditability. The shared SQLite database is stored at
 `~/.awman/data/awman.db`.
 
-API mode is for request-driven sessions and commands. For recurring,
-scheduled automation, use the separate [squad daemon](12-squad.md),
-which manages scheduled tasks and their unattended agent runs. The API server
-and squad daemon share the database and are mutually exclusive on one machine.
+API mode is for request-driven sessions and commands. To hand recurring work to
+a group of agents that pick it up on their own, build a [squad](12-squad.md)
+instead. The API server and the squad daemon behind your squad share the
+database and are mutually exclusive on one machine.
 
 ---
 
@@ -923,7 +923,7 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -d '{"subcommand":"chat"}'
 ```
 
-Dispatches a subcommand to the session identified by the `x-awman-session` header. Valid values for `subcommand`: `chat`, `ready`, `exec`, `remote`.
+Dispatches a subcommand to the session identified by the `x-awman-session` header. The API accepts commands enabled for API use, including squad task and daemon-management commands. `squad attach` is intentionally excluded: attaching owns an interactive PTY and must be run from the CLI or TUI.
 
 For `exec`, the `args` array starts with the exec action (`prompt` or `workflow`/`wf`), followed by any further arguments:
 
@@ -1006,6 +1006,11 @@ Returns the current status and metadata for a command:
 | `done` | Completed with exit code 0 |
 | `error` | Completed with a non-zero exit code |
 | `cancelled` | Cancelled before execution (e.g. session kill) |
+
+For `new skill --pull-all`, awman attempts every reachable library even when
+one pull fails. If any library fails, the command is reported with
+`status: "error"` and `exit_code: 1`; successful library pulls are still
+processed and reported in the command log.
 
 **Queue-related response fields** (present when `status = 'queued'`):
 

@@ -20,7 +20,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 09 | [API & Remote Mode](09-api-and-remote-mode.md) | HTTP server, headless operation, CI/automation, and the `awman remote` client |
 | 10 | [GitHub Integration](10-github-integration.md) | `--issue` flag, fetching issues, authentication |
 | 11 | [Runtimes](11-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
-| 12 | [squad](12-squad.md) | Scheduled tasks, durable workspaces, the squad daemon, TUI tab, attach, guardrails |
+| 12 | [squad](12-squad.md) | Your squad of agents: tasks, durable workspaces, the squad tab, attach, guardrails |
 | 13 | [Cleaning Up](13-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 

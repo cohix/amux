@@ -1,7 +1,11 @@
 # Example awman workflow file.
-# This file is provided to the leader agent as a reference showing the full
-# structure and available features. Not every workflow needs every section —
-# start simple and add what you need.
+# Provided to the leader agent as a reference showing the full structure and
+# available features. Not every workflow needs every section — start simple and
+# add what you need.
+#
+# Placeholders written as <like this> are NOT valid values. Replace every one:
+# agent and model names must come from the Available Agents listing in your
+# prompt, and shell commands must come from the project's own build files.
 
 title = "Implement Feature and Create PR"
 
@@ -9,9 +13,9 @@ title = "Implement Feature and Create PR"
 teardown_on_failure = false
 
 # Workflow-level default agent and model. Steps inherit these unless they
-# specify their own. Omit to use the repo's configured default agent.
-agent = "claude"
-model = "claude-sonnet-4-6"
+# specify their own. Omit either to use the repo's configured default.
+# agent = "<agent from the Available Agents listing>"
+# model = "<model listed for that agent>"
 
 # Workflow-level overlays applied to every agent step.
 # overlays = ["skill(*)", "env(MY_TOKEN)"]
@@ -22,7 +26,7 @@ model = "claude-sonnet-4-6"
 
 [[setup]]
 type = "run_shell"
-command = "cargo fetch --locked"
+command = "<the project's dependency-fetch command>"
 
 # [[setup]]
 # type = "checkout_create_branch"
@@ -50,8 +54,9 @@ command = "cargo fetch --locked"
 
 [[step]]
 name = "implement"
-# Override model for this step only.
-model = "claude-opus-4-8"
+# Override the agent or model for this step only.
+# agent = "<agent from the Available Agents listing>"
+# model = "<model listed for that agent>"
 prompt = """
 Implement work item {{work_item_number}}, following the implementation plan
 in the work item spec closely. Iterate until the build succeeds and all
@@ -77,12 +82,12 @@ for cross-component flows described in the work item.
 [[step]]
 name = "docs"
 depends_on = ["implement"]
-# Use a lighter model for documentation.
-model = "claude-haiku-4-5"
+# A lighter model is often enough for documentation.
+# model = "<a lighter model listed for this step's agent>"
 prompt = """
-Update user-facing documentation in docs/ for work item {{work_item_number}}.
-Follow the project's documentation standards in CLAUDE.md. Do not create
-work-item-specific docs; update or create user guides only.
+Update the user-facing documentation for work item {{work_item_number}}.
+Follow the documentation conventions already established in this repository.
+Do not create work-item-specific documents; update or create user guides only.
 """
 # Step-level overlays (merged with workflow-level overlays above).
 # overlays = ["skill(lint)"]
@@ -90,7 +95,8 @@ work-item-specific docs; update or create user guides only.
 [[step]]
 name = "review"
 depends_on = ["tests", "docs"]
-model = "claude-opus-4-8"
+# Prefer a different agent here than the one that did the building.
+# agent = "<a different agent from the Available Agents listing>"
 # When true, the entire workflow aborts if this step fails.
 abort_on_failure = true
 prompt = """
@@ -112,15 +118,15 @@ Provide a short manual test plan when done.
 
 [[teardown]]
 type = "run_shell"
-command = "make test"
+command = "<the project's test command>"
 abort_on_failure = true
 
 # Retry a shell step with an agent if it fails.
 # [teardown.on_failure]
 # prompt = "The tests failed. Fix the failures and make the test suite green."
-# agent = "claude"           # optional; defaults to workflow/repo agent
-# model = "claude-opus-4-8"  # optional
-# max_attempts = 2           # required when on_failure is present; must be >= 1
+# agent = "<agent name>"   # optional; defaults to workflow/repo agent
+# model = "<model name>"   # optional
+# max_attempts = 2         # required when on_failure is present; must be >= 1
 
 [[teardown]]
 type = "commit_changes"

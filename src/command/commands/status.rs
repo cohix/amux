@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
@@ -179,6 +179,17 @@ pub struct StatusCommand {
 impl StatusCommand {
     pub fn new(flags: StatusCommandFlags, engines: Engines) -> Self {
         Self { flags, engines }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). `status`
+    /// reports on the runtime rather than the repo, so it holds no session.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            StatusCommandFlags {
+                watch: ctx.flags.bool("watch"),
+            },
+            ctx.engines.clone(),
+        ))
     }
 
     pub fn flags(&self) -> &StatusCommandFlags {

@@ -22,11 +22,11 @@ use tokio::sync::broadcast;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::{AgentExitInfo, StuckEvent};
+use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -34,7 +34,9 @@ use crate::engine::workflow::EngineRequest;
 
 use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend};
 use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
@@ -401,14 +403,20 @@ impl ExecWorkflowCommandFrontend for CliParallelFrontend {
         self.inner.report_workflow_summary(summary);
     }
 
-    fn ask_workflow_resume_or_fresh(
+    fn ask_workflow_resume(
         &mut self,
-        workflow_name: &str,
-        completed_steps: usize,
-        total_steps: usize,
-    ) -> Result<bool, CommandError> {
+        prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        self.inner.ask_workflow_resume(prompt)
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
         self.inner
-            .ask_workflow_resume_or_fresh(workflow_name, completed_steps, total_steps)
+            .notify_dynamic_workflow_resume_unavailable(work_item, reason)
     }
 }
 
@@ -433,8 +441,8 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.inner.yolo_countdown_tick(step_name, remaining, total)
     }
 
-    fn yolo_countdown_started(&mut self, step_name: &str) {
-        self.inner.yolo_countdown_started(step_name);
+    fn yolo_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.inner.yolo_countdown_started(step_name, kind);
     }
 
     fn yolo_countdown_finished(&mut self, step_name: &str) {
@@ -476,12 +484,8 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.inner.confirm_resume(mismatch)
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        step: &WorkflowStep,
-        exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        self.inner.user_choose_after_step_failure(step, exit)
+    fn supports_interactive_recovery(&self) -> bool {
+        self.inner.supports_interactive_recovery()
     }
 
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
@@ -605,7 +609,8 @@ impl WorkflowFrontend for CliParallelFrontend {
 
     fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
         if !self.chrome_active || self.is_focused(step_name) {
-            self.inner.yolo_countdown_started(step_name);
+            self.inner
+                .yolo_countdown_started(step_name, CountdownKind::StuckStep);
         }
     }
 

@@ -2,6 +2,7 @@
 //! green-corner indicator, and the status-bar +/- summary.
 
 use super::*;
+use ratatui::style::Color;
 
 // ─── Git sidebar ──────────────────────────────────────────────────────────
 
@@ -33,11 +34,11 @@ fn has_green_sidebar_corner(buf: &ratatui::buffer::Buffer) -> Option<u16> {
 }
 
 fn set_summary(app: &App, additions: u32, deletions: u32) {
-    use crate::frontend::tui::git_sidebar::GitDiffSummary;
+    use crate::engine::git::GitDiffSummary;
     *app.active_tab().git_diff_summary.lock().unwrap() = Some(GitDiffSummary {
         files: Vec::new(),
-        total_additions: additions,
-        total_deletions: deletions,
+        added: additions,
+        removed: deletions,
         branch: None,
     });
 }
@@ -206,8 +207,43 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         created_at: now,
         updated_at: now,
         last_run_at: None,
+        trigger_requested_at: None,
         last_run_status: None,
     }
+}
+
+/// WI 0112 Part 1: the New Tab dialog advertises `Ctrl+S` in its key-hint
+/// row, beside Enter/Esc, and no longer in the prompt body.
+#[test]
+fn the_new_tab_dialog_hint_row_advertises_ctrl_s_to_open_squad() {
+    let mut app = make_app();
+    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        text.contains("[Enter] submit   [Esc] cancel   [Ctrl+S] open squad"),
+        "the hint row must carry the squad shortcut: {text}"
+    );
+    assert!(
+        !text.contains("Press Ctrl-S"),
+        "the prompt body must not repeat the hint: {text}"
+    );
+}
+
+/// Every other text-input dialog keeps the plain two-key hint.
+#[test]
+fn a_command_text_input_dialog_keeps_the_plain_hint_row() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::TextInput {
+        title: "Task name".to_string(),
+        prompt: "Name:".to_string(),
+        editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(text.contains("[Enter] submit   [Esc] cancel"), "{text}");
+    assert!(
+        !text.contains("[Ctrl+S] open squad"),
+        "only the New Tab dialog advertises the squad shortcut: {text}"
+    );
 }
 
 #[test]
@@ -224,6 +260,36 @@ fn render_frame_squad_tab_no_slots_draws_squad_body_not_execution_window() {
     assert!(
         !text.contains("awman"),
         "the ordinary execution window's idle title must not render for the squad tab: {text}"
+    );
+}
+
+/// WI 0110: the squad tab's body is the card grid, so the tab's status log —
+/// where a failed command's error normally lands — is never on screen. Without
+/// this line a failed `squad remove` looked exactly like a key that did nothing,
+/// which is how the delete bug stayed invisible.
+#[test]
+fn a_failed_squad_action_renders_above_the_task_grid() {
+    use crate::frontend::tui::tabs::ExecutionPhase;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.active_tab_mut().execution_phase = ExecutionPhase::Error {
+        command: "squad remove task-a".into(),
+        message: "remote returned status 400".into(),
+    };
+
+    let text = buffer_text(&render_app(&mut app, 100, 24));
+
+    assert!(
+        text.contains("squad remove task-a failed"),
+        "the failed action must name itself above the grid: {text}"
+    );
+    assert!(
+        text.contains("remote returned status 400"),
+        "and carry the daemon's reason: {text}"
+    );
+    assert!(
+        text.contains("enter detail"),
+        "the grid and its hints stay on screen underneath: {text}"
     );
 }
 
@@ -246,6 +312,34 @@ fn render_frame_squad_tab_with_slots_draws_normal_execution_rendering() {
     assert!(
         text.contains("running: squad attach task-a"),
         "the ordinary execution window must render instead: {text}"
+    );
+}
+
+/// WI 0110: `ctrl-\ detach` must be advertised in the hint bar whenever a
+/// squad attach session has the container view on screen — not just for an
+/// ordinary command's maximized container. Before this test's fix,
+/// `render_status_bar` returned its squad-grid hint for every squad tab
+/// regardless of `container_slots`, so the detach hint never appeared during
+/// attach even though keys were already going to the PTY.
+#[test]
+fn squad_attach_session_shows_the_detach_hint_in_the_status_bar() {
+    use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.focus = Focus::ExecutionWindow;
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "squad attach task-a".into(),
+        };
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 24));
+    assert!(
+        text.contains("ctrl-\\ detach"),
+        "the detach hint must render during a squad attach session: {text}"
     );
 }
 
@@ -458,7 +552,7 @@ fn acp_permission_request_modal_renders_through_the_dialog_framework() {
 
 /// Publish a parallel workflow of `n` sibling steps into the active tab.
 fn set_parallel_workflow(app: &App, n: usize) {
-    use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
     *app.active_tab().workflow_state.lock().unwrap() = Some(WorkflowViewState {
         steps: (0..n)
             .map(|i| WorkflowStepView {
@@ -467,6 +561,7 @@ fn set_parallel_workflow(app: &App, n: usize) {
                 agent: None,
                 model: None,
                 depends_on: vec![],
+                kind: WorkflowStepKind::Agent,
             })
             .collect(),
         current_step: None,
@@ -767,4 +862,658 @@ fn the_squad_detail_modal_shows_the_task_scoped_action_tooltip() {
             "the modal's action tooltip must offer {key:?}: {text}"
         );
     }
+}
+
+// ─── every task-interview modal shows its key bindings ──────────────────────
+
+/// The dialogs the squad task interview raises must each render the row that
+/// says which keys do what.
+///
+/// Two of them did not. `TextInput` reserved no row for its hint at all, so
+/// `[Enter] submit / [Esc] cancel` was laid out one row past the bottom of the
+/// dialog and never drawn — and `TextInput` is what collects the interval, the
+/// leader agent, the leader model and every overlay. `YesNo` and `KindSelect`
+/// sized themselves one and two rows short respectively, which was invisible
+/// for a one-line body and clipped the hint the moment the body was longer —
+/// which every squad confirmation's body is.
+///
+/// The dialogs are driven directly rather than through the interview, because
+/// the interview blocks on a frontend thread; what is under test is the
+/// rendering, and these are the exact shapes `per_command/squad.rs` builds.
+#[test]
+fn every_modal_in_the_squad_task_interview_renders_its_key_bindings() {
+    use crate::frontend::tui::text_edit::TextEdit;
+
+    let mut editor = TextEdit::new(false);
+    editor.set_text("6h");
+    let mut multiline = TextEdit::new(true);
+    multiline.set_text("watch the issue tracker");
+
+    let cases: Vec<(&str, Dialog, Vec<&str>)> = vec![
+        (
+            "the interval / agent / model / overlay prompt",
+            Dialog::TextInput {
+                title: "Evaluation interval".into(),
+                prompt: "How often to evaluate (e.g. 6h, 1d):".into(),
+                editor,
+            },
+            vec!["[Enter] submit", "[Esc] cancel"],
+        ),
+        (
+            "the description editor",
+            Dialog::MultilineInput {
+                title: "Edit squad task description".into(),
+                prompt: "Describe when this task fires and what squad should do.\n\
+                         (Ctrl+Enter to submit)"
+                    .into(),
+                editor: multiline,
+            },
+            vec!["submit", "[Enter] newline", "[Esc] cancel"],
+        ),
+        (
+            // The real body: three lines once the question is included, which
+            // is exactly the case the old height clipped.
+            "the replace-overlays / agent-pool confirmation",
+            Dialog::YesNo {
+                title: "Agents and models".into(),
+                body: "A global squad configuration exists.\n\n\
+                       Use those settings for this task? \
+                       (No = give this task its own agents and models)"
+                    .into(),
+            },
+            vec!["[y] Yes", "[n] No", "[Esc] Cancel"],
+        ),
+        (
+            "the workspace-choice picker",
+            Dialog::KindSelect {
+                title: "Task Workspace".into(),
+                options: vec![
+                    ("1".into(), "Default Task Workspace".into()),
+                    ("2".into(), "Custom Folder / Repo".into()),
+                ],
+            },
+            vec!["[1-9] select", "[Esc] cancel"],
+        ),
+    ];
+
+    for (label, dialog, expected) in cases {
+        let mut app = make_app();
+        app.active_dialog = Some(dialog);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        for hint in expected {
+            assert!(
+                text.contains(hint),
+                "{label} must show its {hint:?} key binding:\n{text}"
+            );
+        }
+    }
+}
+
+/// The squad key-setup notice must offer a way to copy the key or the
+/// zshrc snippet — the body text itself cannot be selected/copied by mouse
+/// in a terminal UI, so a keybinding is the only way to get the key out.
+/// A notice unrelated to a key (e.g. "daemon did not start") must not show
+/// copy hints that would do nothing.
+#[test]
+fn the_squad_key_notice_shows_copy_hints_only_when_it_has_something_to_copy() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "squad authentication".into(),
+        body: "╔══╗\n║ deadbeef ║\n╚══╝".into(),
+        copy_key: Some("deadbeef".into()),
+        copy_zshrc_snippet: Some("export AWMAN_SQUAD_KEY=deadbeef".into()),
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(text.contains("[c] copy key"), "{text}");
+    assert!(text.contains("[z] copy .zshrc snippet"), "{text}");
+    assert!(text.contains("[Enter] dismiss"), "{text}");
+
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "squad daemon did not start".into(),
+        body: "failed to start the squad daemon: did not become ready".into(),
+        copy_key: None,
+        copy_zshrc_snippet: None,
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        !text.contains("[c] copy key") && !text.contains("[z] copy .zshrc snippet"),
+        "a notice with nothing to copy must not offer copy hints: {text}"
+    );
+}
+
+// ─── card labels, the pending trigger, and where failures are reported ──────
+
+/// Every value on a card is introduced by a grey label. The description's
+/// label sits on its own row so the text still gets the card's full width;
+/// the last-run *timestamp* — previously an unlabelled indented continuation
+/// of the outcome line — now says what it is.
+#[test]
+fn squad_task_cards_label_the_description_and_the_last_run_timestamp() {
+    use crate::data::fs::task_store::RunStatus;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        let mut task = fake_task("issue-triage");
+        task.description = "watch the issue tracker".into();
+        task.last_run_at = Some(chrono::Utc::now());
+        task.last_run_status = Some(RunStatus::WorkflowExecuted);
+        snap.tasks = vec![task];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+
+    assert!(
+        text.contains("Description"),
+        "the description must carry a label: {text}"
+    );
+    assert!(
+        text.contains("watch the issue tracker"),
+        "labelling the description must not cost it the width it needs: {text}"
+    );
+    let last_run = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    assert!(
+        text.contains(&format!("Last run: {last_run}")),
+        "the last-run timestamp must be labelled, not left as a bare date: {text}"
+    );
+    assert!(
+        text.contains("Outcome: workflow executed"),
+        "the outcome keeps a label of its own: {text}"
+    );
+}
+
+/// A triggered task must look triggered. Leaving the card showing its ordinary
+/// next-evaluation time would make `t` read as a key that did nothing.
+#[test]
+fn a_task_with_a_pending_trigger_says_so_instead_of_its_scheduled_time() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        let mut task = fake_task("issue-triage");
+        task.last_run_at = Some(chrono::Utc::now());
+        task.trigger_requested_at = Some(chrono::Utc::now());
+        snap.tasks = vec![task];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        text.contains("triggered"),
+        "a pending trigger must be visible on the card: {text}"
+    );
+}
+
+/// A failed squad action is reported in the hint bar above the command box —
+/// the row that is on screen for every tab — and not as a header above the
+/// card grid, which pushed every card down a row.
+#[test]
+fn a_failed_squad_action_is_reported_in_the_hint_bar_not_above_the_card_grid() {
+    use crate::frontend::tui::tabs::ExecutionPhase;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task("issue-triage")];
+        snap.loaded = true;
+    }
+    app.active_tab_mut().execution_phase = ExecutionPhase::Error {
+        command: "squad remove issue-triage".to_string(),
+        message: "task \"issue-triage\" was not found".to_string(),
+    };
+
+    let buf = render_app(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("squad remove issue-triage failed"),
+        "the failure must be reported somewhere: {text}"
+    );
+    assert!(
+        text.contains("was not found"),
+        "the reason travels with it: {text}"
+    );
+    // The hint bar is the row directly above the command box's top border.
+    let rows: Vec<String> = text.lines().map(str::to_string).collect();
+    let hint_row = rows
+        .iter()
+        .position(|row| row.contains("squad remove issue-triage failed"))
+        .expect("the failure renders");
+    assert!(
+        rows[hint_row + 1].contains("command"),
+        "the failure belongs in the hint bar above the command box, not in the \
+         grid header:\n{text}"
+    );
+    assert!(
+        !text.contains("Exit code"),
+        "a squad tab has no execution window, so its exit-code hint is noise: {text}"
+    );
+}
+
+/// The missing-key recovery has to explain three things a 401 does not: that
+/// the key is unrecoverable, what accepting will do, and what it costs.
+#[test]
+fn the_missing_key_dialog_explains_the_recovery_and_its_key_bindings() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::SquadKeyMissing);
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+
+    assert!(
+        text.contains("AWMAN_SQUAD_KEY"),
+        "the variable to set must be named: {text}"
+    );
+    assert!(
+        text.contains("only once"),
+        "why the key cannot simply be looked up must be stated: {text}"
+    );
+    assert!(
+        text.contains("[y]") && text.contains("[n / Esc]"),
+        "both answers must be offered: {text}"
+    );
+    assert!(
+        text.contains("old key will stop working"),
+        "the cost of refreshing must be stated before it is accepted: {text}"
+    );
+}
+
+// ─── WI 0112: squad indicator, card colours, inactive command box ──────────
+
+/// Render and also report whether the terminal cursor was left visible.
+fn render_app_with_cursor(
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, bool) {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::frontend::tui::render::render_frame(app, frame))
+        .unwrap();
+    let visible = terminal.backend().cursor_visible();
+    (terminal.backend().buffer().clone(), visible)
+}
+
+/// The last row of the buffer, trimmed of trailing spaces.
+fn bottom_row(buf: &ratatui::buffer::Buffer) -> String {
+    let area = *buf.area();
+    let y = area.height - 1;
+    (0..area.width)
+        .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// Colour of the cell holding the first occurrence of `symbol` on row `y`.
+fn fg_of_symbol_on_row(buf: &ratatui::buffer::Buffer, y: u16, symbol: &str) -> Option<Color> {
+    let area = *buf.area();
+    (0..area.width)
+        .map(|x| buf.cell((x, y)).unwrap())
+        .find(|c| c.symbol() == symbol)
+        .map(|c| c.fg)
+}
+
+fn set_indicator(app: &App, state: crate::frontend::tui::squad_indicator::SquadIndicator) {
+    *app.squad_indicator.lock().unwrap() = state;
+}
+
+#[test]
+fn the_squad_indicator_is_pinned_to_the_right_of_the_bottom_row_in_every_state() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    for (state, colour) in [
+        (SquadIndicator::Unknown, Color::DarkGray),
+        (SquadIndicator::NotRunning, Color::DarkGray),
+        (SquadIndicator::Unreachable, Color::Yellow),
+        (SquadIndicator::Failed, Color::Red),
+        (SquadIndicator::Running, Color::Blue),
+        (SquadIndicator::Healthy, Color::Green),
+    ] {
+        let mut app = make_app();
+        set_indicator(&app, state);
+        let buf = render_app(&mut app, 80, 24);
+        let row = bottom_row(&buf);
+        assert!(
+            row.ends_with("squad \u{25cf}"),
+            "{state:?}: the indicator must be the last thing on the bottom row: {row:?}"
+        );
+        assert_eq!(
+            fg_of_symbol_on_row(&buf, 23, "\u{25cf}"),
+            Some(colour),
+            "{state:?}: circle colour"
+        );
+        assert!(
+            row.contains("CWD:"),
+            "{state:?}: the CWD context still renders to the left: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn the_squad_indicator_renders_on_the_squad_tab_too() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_indicator(&app, SquadIndicator::Failed);
+    let buf = render_app(&mut app, 80, 24);
+    assert!(bottom_row(&buf).ends_with("squad \u{25cf}"));
+    assert_eq!(fg_of_symbol_on_row(&buf, 23, "\u{25cf}"), Some(Color::Red));
+}
+
+#[test]
+fn the_squad_indicator_stays_right_aligned_when_suggestions_are_showing() {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    let mut app = make_app();
+    set_indicator(&app, SquadIndicator::Healthy);
+    for c in "cha".chars() {
+        press_char(&mut app, c);
+    }
+    app.update_suggestions();
+    assert!(!app.suggestion_row.is_empty(), "test needs suggestions");
+    let buf = render_app(&mut app, 60, 24);
+    let row = bottom_row(&buf);
+    assert!(row.contains("chat"), "suggestions render: {row:?}");
+    assert!(
+        row.ends_with("squad \u{25cf}"),
+        "the indicator still owns the right edge: {row:?}"
+    );
+}
+
+#[test]
+fn a_long_cwd_is_truncated_so_the_squad_indicator_fits() {
+    let mut app = make_app();
+    let buf = render_app(&mut app, 30, 24);
+    let row = bottom_row(&buf);
+    assert!(row.ends_with("squad \u{25cf}"), "{row:?}");
+    assert!(row.chars().count() <= 30);
+}
+
+#[test]
+fn a_row_too_narrow_for_the_word_draws_only_the_circle() {
+    let mut app = make_app();
+    let buf = render_app(&mut app, 6, 24);
+    let row = bottom_row(&buf);
+    assert!(row.ends_with('\u{25cf}'), "{row:?}");
+    assert!(!row.contains("squad"), "{row:?}");
+}
+
+/// Cells of the card whose title contains `name`: the top border row `y`
+/// and the x-range of the card, found from the rounded corners around the
+/// title.
+fn card_frame(buf: &ratatui::buffer::Buffer, name: &str) -> (u16, u16, u16) {
+    let area = *buf.area();
+    for y in 0..area.height {
+        let row: String = (0..area.width)
+            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect();
+        if let Some(pos) = row.find(name) {
+            let chars: Vec<&str> = (0..area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect();
+            let title_x = row[..pos].chars().count();
+            let left = (0..title_x)
+                .rev()
+                .find(|&x| chars[x] == "\u{256d}")
+                .expect("card has a top-left corner");
+            let right = (title_x..chars.len())
+                .find(|&x| chars[x] == "\u{256e}")
+                .expect("card has a top-right corner");
+            return (y, left as u16, right as u16);
+        }
+    }
+    panic!("no card titled {name}");
+}
+
+fn squad_app_with(tasks: Vec<crate::data::fs::task_store::Task>, selected: usize) -> App {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab_mut().squad.as_mut().unwrap();
+        state.selected = selected;
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = tasks;
+        snap.loaded = true;
+    }
+    app
+}
+
+/// WI 0112 Part 3: unselected cards are dashed, the selected card is solid
+/// and carries the `➡` marker; neither axis expresses the other.
+#[test]
+fn the_selected_card_is_solid_with_an_arrow_and_the_others_are_dashed() {
+    let mut app = squad_app_with(vec![fake_task("alpha"), fake_task("beta")], 1);
+    let buf = render_app(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("\u{27a1} beta"),
+        "selected title carries the arrow: {text}"
+    );
+    assert!(
+        !text.contains("\u{27a1} alpha"),
+        "unselected title does not: {text}"
+    );
+
+    let (y_a, left_a, right_a) = card_frame(&buf, "alpha");
+    let (y_b, left_b, right_b) = card_frame(&buf, "beta");
+    // Top edge just left of the top-right corner (the title occupies the
+    // cells after the top-left one), and the side edge one row down.
+    assert_eq!(
+        buf.cell((right_a - 1, y_a)).unwrap().symbol(),
+        "\u{254c}",
+        "dashed top"
+    );
+    assert_eq!(
+        buf.cell((left_a, y_a + 1)).unwrap().symbol(),
+        "\u{2506}",
+        "dashed side"
+    );
+    assert_eq!(
+        buf.cell((right_b - 1, y_b)).unwrap().symbol(),
+        "\u{2500}",
+        "solid top"
+    );
+    assert_eq!(
+        buf.cell((left_b, y_b + 1)).unwrap().symbol(),
+        "\u{2502}",
+        "solid side"
+    );
+}
+
+#[test]
+fn card_border_colour_follows_task_state_for_selected_and_unselected_cards() {
+    use crate::data::fs::task_store::{RunStatus, TaskStatus};
+    let now = chrono::Utc::now();
+    let mut paused = fake_task("paused-one");
+    paused.status = TaskStatus::Paused;
+    let mut running = fake_task("running-one");
+    running.last_run_at = Some(now);
+    running.last_run_status = Some(RunStatus::Running);
+    let mut triggered = fake_task("trig-one");
+    triggered.last_run_at = Some(now);
+    triggered.last_run_status = Some(RunStatus::WorkflowExecuted);
+    triggered.trigger_requested_at = Some(now);
+    let mut failed = fake_task("failed-one");
+    failed.last_run_at = Some(now);
+    failed.last_run_status = Some(RunStatus::Failed);
+    let never = fake_task("never-one");
+    let mut active = fake_task("active-one");
+    active.last_run_at = Some(now);
+    active.last_run_status = Some(RunStatus::WorkflowExecuted);
+
+    let expected = [
+        ("paused-one", Color::DarkGray),
+        ("running-one", Color::Blue),
+        ("trig-one", Color::Magenta),
+        ("failed-one", Color::Red),
+        ("never-one", Color::Yellow),
+        ("active-one", Color::Green),
+    ];
+    for selected in [0usize, 3] {
+        let mut app = squad_app_with(
+            vec![
+                paused.clone(),
+                running.clone(),
+                triggered.clone(),
+                failed.clone(),
+                never.clone(),
+                active.clone(),
+            ],
+            selected,
+        );
+        let buf = render_app(&mut app, 120, 40);
+        for (name, colour) in expected {
+            let (y, left, _) = card_frame(&buf, name);
+            assert_eq!(
+                buf.cell((left, y)).unwrap().fg,
+                colour,
+                "{name} border colour (selected index {selected})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_paused_card_is_dashed_when_unselected_and_solid_when_selected_in_grey_both_times() {
+    use crate::data::fs::task_store::TaskStatus;
+    let mut paused = fake_task("paused-one");
+    paused.status = TaskStatus::Paused;
+    let other = fake_task("other-one");
+
+    let mut app = squad_app_with(vec![paused.clone(), other.clone()], 1);
+    let buf = render_app(&mut app, 100, 30);
+    let (y, left, right) = card_frame(&buf, "paused-one");
+    assert_eq!(buf.cell((right - 1, y)).unwrap().symbol(), "\u{254c}");
+    assert_eq!(buf.cell((left, y)).unwrap().fg, Color::DarkGray);
+
+    let mut app = squad_app_with(vec![paused, other], 0);
+    let buf = render_app(&mut app, 100, 30);
+    let (y, left, right) = card_frame(&buf, "paused-one");
+    assert_eq!(buf.cell((right - 1, y)).unwrap().symbol(), "\u{2500}");
+    assert_eq!(buf.cell((left, y)).unwrap().fg, Color::DarkGray);
+}
+
+/// WI 0112 Part 4: the command box is inactive on the squad grid, explains
+/// the keys, and never places the cursor.
+#[test]
+fn the_command_box_is_inactive_and_cursorless_on_the_squad_tab() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.tick_all_tabs();
+    let (buf, cursor_visible) = render_app_with_cursor(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(text.contains("command (inactive)"), "{text}");
+    assert!(
+        text.contains(
+            "Use \u{2191} \u{2193} \u{2190} \u{2192} and Enter to navigate the squad tab"
+        ),
+        "{text}"
+    );
+    assert!(!cursor_visible, "no cursor on the squad grid");
+
+    // A normal tab is unchanged: focused box, cursor placed.
+    app.active_tab = 0;
+    app.tick_all_tabs();
+    let (buf, cursor_visible) = render_app_with_cursor(&mut app, 100, 30);
+    let text = buffer_text(&buf);
+    assert!(text.contains(" command "), "{text}");
+    assert!(!text.contains("navigate the squad tab"), "{text}");
+    assert!(cursor_visible, "the ordinary command box shows its cursor");
+}
+
+#[test]
+fn the_command_box_is_ordinary_during_a_squad_attach_session() {
+    use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-squad-task-a".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "squad attach task-a".into(),
+        };
+    }
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        !text.contains("navigate the squad tab"),
+        "attach sessions use the ordinary command box: {text}"
+    );
+}
+
+// ─── WI-0115 §1: the step-failure control board ──────────────────────────
+
+/// A `WorkflowControlBoardState` with no failure and everything switched off.
+fn plain_control_board() -> crate::frontend::tui::dialogs::WorkflowControlBoardState {
+    crate::frontend::tui::dialogs::WorkflowControlBoardState {
+        step_name: "implement".into(),
+        focused_step_name: "implement".into(),
+        can_launch_next: true,
+        can_continue_current: false,
+        can_restart: true,
+        can_go_back: true,
+        can_finish: false,
+        continue_unavailable_reason: None,
+        cancel_to_previous_unavailable_reason: None,
+        finish_workflow_unavailable_reason: None,
+        restart_unavailable_reason: None,
+        can_dismiss: false,
+        launch_next_label: None,
+        parallel_peer_count: 0,
+        parallel_peers_running: 0,
+        failure_lines: Vec::new(),
+    }
+}
+
+#[test]
+fn failure_control_board_names_the_failed_step_and_shows_the_error() {
+    let mut app = make_app();
+    let mut state = plain_control_board();
+    state.failure_lines = vec!["Exit code: 1".into(), "Ran for 214s".into()];
+    state.launch_next_label = Some("Skip to 'review' (new container)".into());
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(state));
+
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("step failed"), "title must say so: {text}");
+    assert!(
+        text.contains("Failed step: implement"),
+        "the failed step must be named: {text}"
+    );
+    assert!(text.contains("Exit code: 1"), "error detail: {text}");
+    assert!(
+        text.contains("Restart failed step"),
+        "restart must be offered: {text}"
+    );
+    assert!(
+        text.contains("Cancel to prev"),
+        "back must be offered: {text}"
+    );
+    assert!(
+        text.contains("Skip to 'review'"),
+        "the next step must be named: {text}"
+    );
+    assert!(
+        text.contains("[^C] Cancel workflow"),
+        "Ctrl-C is the way out of a failure board: {text}"
+    );
+    assert!(
+        !text.contains("Finish workflow"),
+        "a failure board must never offer Finish: {text}"
+    );
+}
+
+#[test]
+fn control_board_without_a_failure_keeps_its_ordinary_title() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(plain_control_board()));
+
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("Workflow Control"), "{text}");
+    assert!(!text.contains("step failed"), "{text}");
+    assert!(text.contains("Restart current step"), "{text}");
 }

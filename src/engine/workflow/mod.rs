@@ -29,11 +29,9 @@ use crate::engine::agent_runtime::execution::{
 use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
-use crate::engine::git::GitEngine;
-use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome, WorkflowOutcome,
-    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepFailureContext, StepOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -98,10 +96,16 @@ type StuckFanIn = tokio::sync::mpsc::UnboundedSender<(String, StuckEvent)>;
 
 /// Result of `run_parallel_group`.
 enum GroupOutcome {
-    /// The whole group reached a terminal state. `failed` carries a non-abort
-    /// step failure (name + exit code) for the outer loop to handle via the
-    /// standard failure prompt; `None` when every member succeeded/cancelled.
-    Drained { failed: Option<(String, i32)> },
+    /// The whole group reached a terminal state. `failed` carries every
+    /// non-abort step failure (name + exit code), in the order the containers
+    /// exited, for the outer loop to walk through the failure recovery path;
+    /// empty when every member succeeded/cancelled.
+    ///
+    /// Every failure is carried, not just the first: a step left `Failed` is
+    /// not in `completed_steps`, so the DAG still reports it ready and the next
+    /// iteration would relaunch it — silently, with no recovery board and no
+    /// retry accounting (WI-0115 §1).
+    Drained { failed: Vec<(String, i32)> },
     /// A workflow-level action ended the run (abort_on_failure, WCB abort/pause).
     Ended(WorkflowOutcome),
 }
@@ -159,9 +163,6 @@ struct ActiveParallelStep {
     /// Standalone kill handle, extracted before the execution is moved into a
     /// wait future. Used by the multi-step path to kill just this container.
     cancel_handle: Option<CancelHandle>,
-    /// This container's stuck broadcast sender (published to the frontend so it
-    /// can subscribe per-slot).
-    stuck_sender: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
     /// The container's name, retained so a failure log can be named after it
     /// once the execution has been consumed by its wait future.
     container_name: String,
@@ -191,8 +192,6 @@ pub struct WorkflowEngine {
     effective_config: EffectiveConfig,
     frontend: Box<dyn WorkflowFrontend>,
     agent_factory: Box<dyn AgentExecutionFactory>,
-    git_engine: Arc<GitEngine>,
-    overlay_engine: Arc<OverlayEngine>,
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
@@ -211,6 +210,10 @@ pub struct WorkflowEngine {
     /// Kept independently of an individual container slot so a relaunch cannot
     /// reset the guard.
     auth_retries_used: HashSet<String>,
+    /// Steps the unattended failure path has already auto-retried once. Kept
+    /// separate from `auth_retries_used` so a credential refresh and a failure
+    /// retry cannot consume each other.
+    auto_retried_steps: HashSet<String>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
 
@@ -322,8 +325,6 @@ impl WorkflowEngine {
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_context_permission =
@@ -354,8 +355,6 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,
@@ -367,6 +366,7 @@ impl WorkflowEngine {
             abort_on_failure_triggered: false,
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
+            auto_retried_steps: HashSet::new(),
             engine_rx: Some(rx),
         })
     }
@@ -426,8 +426,6 @@ impl WorkflowEngine {
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         Self::resume_with_state_root(
             session,
@@ -435,8 +433,6 @@ impl WorkflowEngine {
             work_item_context,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             None,
         )
         .await
@@ -449,15 +445,12 @@ impl WorkflowEngine {
     /// whose session root must stay untouched between runs — a squad task
     /// bound to its durable workspace (WI 0106 §6a) — points this at a
     /// run-scoped directory instead. `None` keeps the session-rooted default.
-    #[allow(clippy::too_many_arguments)]
     pub async fn resume_with_state_root(
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
         state_root: Option<std::path::PathBuf>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
@@ -503,6 +496,25 @@ impl WorkflowEngine {
             ),
         };
 
+        // Drop step entries the workflow no longer defines. A saved state is
+        // matched to the workflow by hash, and the user may have accepted the
+        // drift prompt above against a file that since lost or renamed a step.
+        // Such an entry can never be launched — `next_ready` reads the DAG, not
+        // `step_states` — but `is_complete()` reads `step_states`, so leaving a
+        // non-terminal orphan behind means the run can never finish: it would
+        // end on "no ready steps remaining" instead. Pruning is safe because
+        // the DAG is the only thing that decides what actually runs.
+        let orphans = state.retain_steps_in(&dag);
+        if !orphans.is_empty() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: format!(
+                    "The saved run has steps this workflow no longer defines: {}. Dropping them.",
+                    orphans.join(", "),
+                ),
+            });
+        }
+
         let interrupted = state.interrupted_running_steps();
         if !interrupted.is_empty() {
             frontend.write_message(crate::data::message::UserMessage {
@@ -513,6 +525,29 @@ impl WorkflowEngine {
                 ),
             });
             for name in &interrupted {
+                state.set_status(name, StepState::Pending);
+            }
+        }
+
+        // Steps the saved run left `Failed` or `Cancelled` are reset the same
+        // way, for the same reason: they are terminal but not *done*.
+        //
+        // A run that ended on a failure — or was aborted, which cancels every
+        // remaining step — saves a state in which every step is terminal.
+        // `is_complete()` reads that as finished, so resuming it without this
+        // reset would report instant success and run nothing (WI-0115 §2).
+        // Succeeded and Skipped steps are untouched, so a resume still picks up
+        // where the previous run genuinely got to.
+        let unrecovered = state.unrecovered_steps();
+        if !unrecovered.is_empty() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: format!(
+                    "Previous run left these steps unfinished: {}. Resetting to Pending.",
+                    unrecovered.join(", "),
+                ),
+            });
+            for name in &unrecovered {
                 state.set_status(name, StepState::Pending);
             }
         }
@@ -534,8 +569,6 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,
@@ -547,6 +580,7 @@ impl WorkflowEngine {
             abort_on_failure_triggered: false,
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
+            auto_retried_steps: HashSet::new(),
             engine_rx: Some(rx),
         })
     }
@@ -601,9 +635,12 @@ impl WorkflowEngine {
                 match self.run_parallel_group(ready).await? {
                     GroupOutcome::Ended(wo) => return Ok(wo),
                     GroupOutcome::Drained { failed } => {
-                        if let Some((name, exit_code)) = failed {
-                            match self.handle_group_step_failure(&name, exit_code)? {
-                                IterationOutcome::Continue => continue,
+                        // One board (or one unattended retry) per failed step,
+                        // in exit order. Recovering the first failure must not
+                        // leave its peers to be silently relaunched.
+                        for (name, exit_code) in failed {
+                            match self.handle_group_step_failure(&name, exit_code).await? {
+                                IterationOutcome::Continue => {}
                                 IterationOutcome::Ended(wo) => return Ok(wo),
                             }
                         }
@@ -664,46 +701,9 @@ impl WorkflowEngine {
                 return Ok(IterationOutcome::Ended(aborted));
             }
 
-            let exit_info = self
-                .last_exit_info
-                .clone()
-                .unwrap_or_else(|| AgentExitInfo {
-                    exit_code,
-                    signal: None,
-                    started_at: chrono::Utc::now(),
-                    ended_at: chrono::Utc::now(),
-                });
-            let choice = self
-                .frontend
-                .user_choose_after_step_failure(&step, &exit_info)?;
-            match choice {
-                StepFailureChoice::Retry => {
-                    self.msg_info(format!("Retrying step '{}'", outcome.step_name,));
-                    self.state
-                        .set_status(&outcome.step_name, StepState::Pending);
-                    self.persist()?;
-                    return Ok(IterationOutcome::Continue);
-                }
-                StepFailureChoice::Pause => {
-                    self.msg_info("Workflow paused");
-                    self.persist()?;
-                    let paused = WorkflowOutcome::Paused;
-                    self.frontend.report_workflow_completed(&paused);
-                    return Ok(IterationOutcome::Ended(paused));
-                }
-                StepFailureChoice::Abort => {
-                    self.msg_warning("Workflow aborted");
-                    for s in &self.workflow.steps {
-                        if !self.state.completed_steps.contains(&s.name) {
-                            self.state.set_status(&s.name, StepState::Cancelled);
-                        }
-                    }
-                    self.persist()?;
-                    let aborted = WorkflowOutcome::Aborted;
-                    self.frontend.report_workflow_completed(&aborted);
-                    return Ok(IterationOutcome::Ended(aborted));
-                }
-            }
+            return self
+                .handle_step_failure(&outcome.step_name, exit_code)
+                .await;
         }
 
         // Step succeeded. Decide what to do next.
@@ -807,7 +807,7 @@ impl WorkflowEngine {
         }
 
         let total = timing::YOLO_COUNTDOWN_DURATION;
-        let mut failed: Option<(String, i32)> = None;
+        let mut failed: Vec<(String, i32)> = Vec::new();
 
         while !self.active_steps.is_empty() {
             tokio::select! {
@@ -866,7 +866,9 @@ impl WorkflowEngine {
                         }
                         // Non-abort failure: record it, keep draining the rest
                         // of the group, but do NOT launch further queued steps.
-                        failed.get_or_insert((name.clone(), exit_code));
+                        // Every failure is recorded — each one gets its own
+                        // recovery board once the group drains.
+                        failed.push((name.clone(), exit_code));
                     } else if self.active_steps.len() < slot_cap {
                         if let Some(next) = queue.pop_front() {
                             self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
@@ -1001,7 +1003,6 @@ impl WorkflowEngine {
             step_name: step.name.clone(),
             execution: None,
             cancel_handle,
-            stuck_sender,
             container_name,
             output_tail,
             awman_killed: false,
@@ -1297,42 +1298,294 @@ impl WorkflowEngine {
         }
     }
 
-    /// Present the standard post-failure prompt for a non-abort step failure
-    /// that surfaced after a parallel group drained.
-    fn handle_group_step_failure(
+    /// Compose the failure-scoped [`AvailableActions`] for the Workflow
+    /// Control Board (WI-0115 §1).
+    ///
+    /// The failed step's container is already dead, so "continue in the current
+    /// container" is never offered and Esc means Pause rather than Dismiss.
+    /// `can_finish_workflow` is forced off: there is no "Enter to finish
+    /// workflow" on a failure board — Ctrl-C aborts instead.
+    fn compute_failure_actions(
+        &self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<AvailableActions, EngineError> {
+        // `last_exit_info` tracks the most recent container to exit, which in a
+        // parallel group need not be the one that failed — a later-exiting peer
+        // overwrites it. Only trust it when its code matches this failure.
+        let exit = self
+            .last_exit_info
+            .clone()
+            .filter(|e| e.exit_code == exit_code);
+        let signal = exit.as_ref().and_then(|e| e.signal);
+
+        let mut detail_lines = Vec::new();
+        if let Some(sig) = signal {
+            detail_lines.push(format!("Container terminated by signal {sig}"));
+        }
+        detail_lines.push(format!("Exit code: {exit_code}"));
+        if let Some(e) = &exit {
+            let secs = e
+                .ended_at
+                .signed_duration_since(e.started_at)
+                .num_seconds()
+                .max(0);
+            detail_lines.push(format!("Ran for {secs}s"));
+        }
+
+        // The step LaunchNext will start: the first step that becomes ready
+        // once the failed step is treated as skipped.
+        let mut completed_if_skipped = self.state.completed_steps.clone();
+        completed_if_skipped.insert(step_name.to_string());
+        let next_step = self
+            .dag
+            .ready_steps(&completed_if_skipped)
+            .into_iter()
+            .next();
+        let previous_step = self.previous_step_name();
+
+        Ok(AvailableActions {
+            can_launch_next: next_step.is_some(),
+            can_restart_current_step: true,
+            can_cancel_to_previous_step: previous_step.is_some(),
+            can_pause: true,
+            can_abort: true,
+            can_finish_workflow: false,
+            can_dismiss: false,
+            cancel_to_previous_unavailable_reason: previous_step
+                .is_none()
+                .then(|| "this is the first step".to_string()),
+            continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            finish_workflow_unavailable_reason: Some(
+                "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
+            ),
+            launch_next_label: next_step
+                .as_ref()
+                .map(|n| format!("Skip to '{n}' (new container)")),
+            step_failure: Some(StepFailureContext {
+                step_name: step_name.to_string(),
+                exit_code,
+                signal,
+                detail_lines,
+                previous_step,
+                next_step,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Decide what happens after a non-`abort_on_failure` step failure.
+    ///
+    /// Interactive frontends (CLI on a TTY, TUI) get the Workflow Control Board
+    /// with the failure attached and drive the recovery themselves. Unattended
+    /// frontends (squad daemon, API server, `--non-interactive`) get one yolo
+    /// countdown and one automatic retry; a second failure of the same step
+    /// fails the workflow (WI-0115 §1, §3).
+    async fn handle_step_failure(
         &mut self,
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
-        let step = self.find_step(step_name)?;
-        let exit_info = self
-            .last_exit_info
-            .clone()
-            .unwrap_or_else(|| AgentExitInfo {
+        if self.frontend.supports_interactive_recovery() {
+            self.handle_step_failure_interactive(step_name, exit_code)
+        } else {
+            self.handle_step_failure_unattended(step_name, exit_code)
+                .await
+        }
+    }
+
+    /// Interactive recovery loop. Repeats until the user picks an action that
+    /// either resolves the failure or ends the workflow — a Dismiss (or any
+    /// action that is not meaningful on a failure board) re-presents it, since
+    /// leaving a failed step unanswered has nowhere to go.
+    fn handle_step_failure_interactive(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        self.msg_error(format!(
+            "Step '{step_name}' failed (exit {exit_code}); choose how to recover"
+        ));
+        loop {
+            let available = self.compute_failure_actions(step_name, exit_code)?;
+            // Each arm below narrates its own recovery, so `log_wcb_action`'s
+            // generic between-steps copy would only double up here.
+            let action = self
+                .frontend
+                .show_workflow_control_board(&self.state, &available)?;
+            match action {
+                NextAction::RestartCurrentStep => {
+                    self.msg_info(format!("Restarting failed step '{step_name}'"));
+                    self.state.set_status(step_name, StepState::Pending);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::CancelToPreviousStep => {
+                    let Some(prev) = available
+                        .step_failure
+                        .as_ref()
+                        .and_then(|f| f.previous_step.clone())
+                    else {
+                        continue;
+                    };
+                    self.msg_info(format!(
+                        "Cancelling failed step '{step_name}', returning to '{prev}'"
+                    ));
+                    self.state.set_status(step_name, StepState::Pending);
+                    self.state.set_status(&prev, StepState::Pending);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::LaunchNext => {
+                    let Some(next) = available
+                        .step_failure
+                        .as_ref()
+                        .and_then(|f| f.next_step.clone())
+                    else {
+                        continue;
+                    };
+                    self.msg_warning(format!(
+                        "Skipping failed step '{step_name}'; starting '{next}' in a new container"
+                    ));
+                    self.state.set_status(step_name, StepState::Skipped);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::Abort => return Ok(IterationOutcome::Ended(self.handle_abort()?)),
+                NextAction::Pause => {
+                    self.msg_info("Workflow paused");
+                    self.persist()?;
+                    let paused = WorkflowOutcome::Paused;
+                    self.frontend.report_workflow_completed(&paused);
+                    return Ok(IterationOutcome::Ended(paused));
+                }
+                // Dismiss / Continue-in-container / Finish are all meaningless
+                // on a dead container: re-present the board.
+                _ => continue,
+            }
+        }
+    }
+
+    /// Unattended recovery: a 60s yolo countdown (reported through the same
+    /// frontend hooks a stuck-step countdown uses) followed by exactly one
+    /// automatic retry of the failed step. A second failure of the same step
+    /// ends the workflow as `Failed`.
+    async fn handle_step_failure_unattended(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        if self.auto_retried_steps.contains(step_name) {
+            self.msg_error(format!(
+                "Step '{step_name}' failed again after its automatic retry (exit {exit_code}); \
+                 failing workflow",
+            ));
+            for s in &self.workflow.steps {
+                if !self.state.completed_steps.contains(&s.name) {
+                    self.state.set_status(&s.name, StepState::Cancelled);
+                }
+            }
+            self.state.set_status(
+                step_name,
+                StepState::Failed {
+                    exit_code,
+                    error_message: Some(format!(
+                        "failed twice (exit {exit_code}); automatic retry exhausted"
+                    )),
+                },
+            );
+            self.persist()?;
+            let failed = WorkflowOutcome::Failed {
+                last_step: step_name.to_string(),
                 exit_code,
-                signal: None,
-                started_at: chrono::Utc::now(),
-                ended_at: chrono::Utc::now(),
-            });
-        let choice = self
-            .frontend
-            .user_choose_after_step_failure(&step, &exit_info)?;
-        match choice {
-            StepFailureChoice::Retry => {
-                self.msg_info(format!("Retrying step '{}'", step_name));
+            };
+            self.frontend.report_workflow_completed(&failed);
+            return Ok(IterationOutcome::Ended(failed));
+        }
+
+        self.msg_warning(format!(
+            "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
+            timing::YOLO_COUNTDOWN_DURATION.as_secs(),
+        ));
+        match self.run_failure_retry_countdown(step_name).await? {
+            YoloTickOutcome::Cancel => {
+                self.msg_warning(format!(
+                    "Retry countdown for step '{step_name}' cancelled; failing workflow",
+                ));
+                for s in &self.workflow.steps {
+                    if !self.state.completed_steps.contains(&s.name) {
+                        self.state.set_status(&s.name, StepState::Cancelled);
+                    }
+                }
+                self.state.set_status(
+                    step_name,
+                    StepState::Failed {
+                        exit_code,
+                        error_message: Some("retry countdown cancelled".into()),
+                    },
+                );
+                self.persist()?;
+                let failed = WorkflowOutcome::Failed {
+                    last_step: step_name.to_string(),
+                    exit_code,
+                };
+                self.frontend.report_workflow_completed(&failed);
+                Ok(IterationOutcome::Ended(failed))
+            }
+            _ => {
+                self.auto_retried_steps.insert(step_name.to_string());
+                self.msg_info(format!(
+                    "Retrying failed step '{step_name}' (attempt 2 of 2)"
+                ));
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
                 Ok(IterationOutcome::Continue)
             }
-            StepFailureChoice::Pause => {
-                self.msg_info("Workflow paused");
-                self.persist()?;
-                let paused = WorkflowOutcome::Paused;
-                self.frontend.report_workflow_completed(&paused);
-                Ok(IterationOutcome::Ended(paused))
-            }
-            StepFailureChoice::Abort => Ok(IterationOutcome::Ended(self.handle_abort()?)),
         }
+    }
+
+    /// Tick the retry countdown for a failed step. Unlike the mid-step yolo
+    /// countdown there is no container left to recover, so the only outcomes
+    /// are "expired / advance now" (retry) and "cancelled" (fail).
+    async fn run_failure_retry_countdown(
+        &mut self,
+        step_name: &str,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let start = Instant::now();
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::FailureRetry);
+        let outcome = loop {
+            let elapsed = start.elapsed();
+            let remaining = total.saturating_sub(elapsed);
+            match self
+                .frontend
+                .yolo_countdown_tick(step_name, remaining, total)?
+            {
+                YoloTickOutcome::AdvanceNow => break YoloTickOutcome::AdvanceNow,
+                YoloTickOutcome::Cancel => break YoloTickOutcome::Cancel,
+                YoloTickOutcome::Continue => {}
+            }
+            if remaining.is_zero() {
+                break YoloTickOutcome::Continue;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        self.frontend.yolo_countdown_finished(step_name);
+        Ok(outcome)
+    }
+
+    /// Present the post-failure recovery board for a non-abort step failure
+    /// that surfaced after a parallel group drained.
+    async fn handle_group_step_failure(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        // Scope the board to the failed step: its peers have already exited,
+        // so the previous/next names must be computed relative to it.
+        self.current_step_name = Some(step_name.to_string());
+        self.handle_step_failure(step_name, exit_code).await
     }
 
     /// Advance exactly one step, reporting status through the frontend.
@@ -1400,14 +1653,12 @@ impl WorkflowEngine {
         );
         self.persist()?;
 
-        let stuck_sender = execution.stuck_sender();
         let container_name = execution.handle().name.clone();
         let output_tail = execution.output_tail();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
             cancel_handle: None,
-            stuck_sender,
             container_name,
             output_tail,
             awman_killed: false,
@@ -1824,7 +2075,8 @@ impl WorkflowEngine {
             step_name,
             timing::YOLO_COUNTDOWN_DURATION.as_secs(),
         ));
-        self.frontend.yolo_countdown_started(step_name);
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::StuckStep);
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let start = std::time::Instant::now();
 
@@ -3285,7 +3537,6 @@ mod tests {
     use crate::data::workflow_definition::{Workflow, WorkflowStep};
     use crate::data::workflow_state_store::WorkflowStateStore;
     use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
-    use crate::engine::overlay::OverlayEngine;
 
     // ── Fake implementations ─────────────────────────────────────────────────
 
@@ -3294,7 +3545,17 @@ mod tests {
         step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
         completed: Mutex<Option<WorkflowOutcome>>,
         confirm_resume_response: bool,
-        failure_choice: StepFailureChoice,
+        /// What `supports_interactive_recovery` reports. `true` (the default)
+        /// drives a step failure through the `actions` queue; `false` puts the
+        /// engine on the unattended countdown-and-retry path.
+        interactive: bool,
+        /// What `yolo_countdown_tick` returns. `AdvanceNow` collapses the 60s
+        /// retry countdown to a single tick so unattended tests stay fast;
+        /// `Cancel` (the default) is the pre-existing safe answer.
+        yolo_tick: YoloTickOutcome,
+        /// Every board the engine raised, shared so a test can read them back
+        /// after the engine has taken ownership of the frontend.
+        boards: Arc<Mutex<Vec<AvailableActions>>>,
     }
 
     impl FakeWorkflowFrontend {
@@ -3304,21 +3565,30 @@ mod tests {
                 step_statuses: Mutex::new(Vec::new()),
                 completed: Mutex::new(None),
                 confirm_resume_response: true,
-                failure_choice: StepFailureChoice::Abort,
+                interactive: true,
+                yolo_tick: YoloTickOutcome::Cancel,
+                boards: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Handle on the boards this frontend will be shown.
+        fn boards(&self) -> Arc<Mutex<Vec<AvailableActions>>> {
+            self.boards.clone()
+        }
+
+        fn unattended(mut self) -> Self {
+            self.interactive = false;
+            self
+        }
+
+        fn with_yolo_tick(mut self, tick: YoloTickOutcome) -> Self {
+            self.yolo_tick = tick;
+            self
         }
 
         fn with_confirm_resume(mut self, response: bool) -> Self {
             self.confirm_resume_response = response;
             self
-        }
-
-        fn step_statuses(&self) -> Vec<(String, WorkflowStepStatus)> {
-            self.step_statuses.lock().unwrap().clone()
-        }
-
-        fn completed_outcome(&self) -> Option<WorkflowOutcome> {
-            self.completed.lock().unwrap().clone()
         }
     }
 
@@ -3331,8 +3601,9 @@ mod tests {
         fn show_workflow_control_board(
             &mut self,
             _state: &WorkflowState,
-            _available: &AvailableActions,
+            available: &AvailableActions,
         ) -> Result<NextAction, EngineError> {
+            self.boards.lock().unwrap().push(available.clone());
             let action = self
                 .actions
                 .lock()
@@ -3342,16 +3613,12 @@ mod tests {
             Ok(action)
         }
 
-        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-            Ok(self.confirm_resume_response)
+        fn supports_interactive_recovery(&self) -> bool {
+            self.interactive
         }
 
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(self.failure_choice.clone())
+        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
+            Ok(self.confirm_resume_response)
         }
 
         fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -3367,7 +3634,7 @@ mod tests {
             _remaining: Duration,
             _total: Duration,
         ) -> Result<YoloTickOutcome, EngineError> {
-            Ok(YoloTickOutcome::Cancel)
+            Ok(self.yolo_tick.clone())
         }
 
         fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
@@ -3403,13 +3670,6 @@ mod tests {
 
         fn always_success() -> Self {
             Self::new(std::iter::repeat_n(0, 100))
-        }
-
-        fn with_inject_support(exit_codes: impl IntoIterator<Item = i32>) -> Self {
-            Self {
-                inject_result: Some(()),
-                ..Self::new(exit_codes)
-            }
         }
 
         /// Produce executions whose output tail is pre-filled with `lines` and
@@ -3558,17 +3818,12 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: FakeWorkflowFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -3617,17 +3872,12 @@ mod tests {
         );
         let factory = FakeAgentExecutionFactory::always_success();
         let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -3800,14 +4050,12 @@ mod tests {
         let mut engine = make_engine(&session, workflow, factory, []);
 
         // Simulate a live slot that awman killed, carrying buffered output.
-        let (tx, _rx) = tokio::sync::broadcast::channel(4);
         let tail = OutputTail::with_default_capacity();
         tail.push_bytes(b"some output before the kill\n");
         engine.active_steps.push(ActiveParallelStep {
             step_name: "build".to_string(),
             execution: None,
             cancel_handle: None,
-            stuck_sender: Arc::new(tx),
             container_name: "awman-build-killed".to_string(),
             output_tail: Some(Arc::new(tail)),
             awman_killed: true,
@@ -3826,6 +4074,8 @@ mod tests {
         );
     }
 
+    // ── WI-0115 §1: interactive step-failure recovery board ──────────────
+
     #[tokio::test]
     async fn step_failure_abort_returns_aborted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3836,7 +4086,7 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([2]);
-        let frontend = FakeWorkflowFrontend::new([]);
+        let frontend = FakeWorkflowFrontend::new([NextAction::Abort]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
@@ -3844,7 +4094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_failure_retry_reruns_step() {
+    async fn step_failure_restart_reruns_step() {
         let tmp = tempfile::tempdir().unwrap();
         let session = make_session(&tmp);
         let workflow = make_workflow(
@@ -3853,8 +4103,9 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([1, 0]);
-        let mut frontend = FakeWorkflowFrontend::new([]);
-        frontend.failure_choice = StepFailureChoice::Retry;
+        // Restart the failed step, then finish the (now last, succeeded) step.
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::RestartCurrentStep, NextAction::FinishWorkflow]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
@@ -3871,12 +4122,273 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([1]);
-        let mut frontend = FakeWorkflowFrontend::new([]);
-        frontend.failure_choice = StepFailureChoice::Pause;
+        let frontend = FakeWorkflowFrontend::new([NextAction::Pause]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
         assert!(matches!(result, WorkflowOutcome::Paused));
+    }
+
+    #[tokio::test]
+    async fn step_failure_launch_next_skips_failed_step_and_runs_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-skip"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        // 'a' fails, 'b' succeeds.
+        let factory = FakeAgentExecutionFactory::new([1, 0]);
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::FinishWorkflow]);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(matches!(result, WorkflowOutcome::Completed));
+        assert!(
+            matches!(engine.state().status_of("a"), Some(StepState::Skipped)),
+            "the failed step must be skipped so its dependents become ready"
+        );
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn step_failure_cancel_to_previous_reruns_both_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-back"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        // a ok → b fails → back to a → a ok → b ok.
+        let factory = FakeAgentExecutionFactory::new([0, 1, 0, 0]);
+        let frontend = FakeWorkflowFrontend::new([
+            // After 'a' succeeds the first time.
+            NextAction::LaunchNext,
+            // 'b' failed: go back to 'a'.
+            NextAction::CancelToPreviousStep,
+            // 'a' succeeded again.
+            NextAction::LaunchNext,
+            // 'b' succeeded.
+            NextAction::FinishWorkflow,
+        ]);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(matches!(result, WorkflowOutcome::Completed));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn failure_actions_offer_recovery_and_never_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-actions"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["b"], None),
+            ],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.current_step_name = Some("b".to_string());
+
+        let available = engine.compute_failure_actions("b", 42).unwrap();
+        assert!(available.can_restart_current_step);
+        assert!(available.can_cancel_to_previous_step);
+        assert!(available.can_launch_next);
+        assert!(available.can_abort);
+        assert!(
+            !available.can_finish_workflow,
+            "a failure board must not offer Finish"
+        );
+        assert!(
+            !available.can_dismiss,
+            "the failed step's container is already dead"
+        );
+        let failure = available.step_failure.expect("failure context");
+        assert_eq!(failure.step_name, "b");
+        assert_eq!(failure.exit_code, 42);
+        assert_eq!(failure.previous_step.as_deref(), Some("a"));
+        assert_eq!(failure.next_step.as_deref(), Some("c"));
+        assert!(failure
+            .detail_lines
+            .iter()
+            .any(|l| l.contains("Exit code: 42")));
+    }
+
+    #[test]
+    fn failure_actions_on_the_last_step_offer_no_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-last"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+        engine.current_step_name = Some("a".to_string());
+
+        let available = engine.compute_failure_actions("a", 1).unwrap();
+        assert!(!available.can_launch_next);
+        assert!(!available.can_cancel_to_previous_step);
+        assert!(available.can_restart_current_step);
+    }
+
+    /// WI-0115 §1: a step left `Failed` is not in `completed_steps`, so the DAG
+    /// still reports it ready. Recovering only the first failure of a drained
+    /// parallel group would let its peers be relaunched silently — no board, no
+    /// retry accounting, no way for the user to know a second step even failed.
+    #[tokio::test]
+    async fn every_failure_in_a_parallel_group_gets_its_own_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-two-failures"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+        // Both members of the group fail.
+        let factory = FakeAgentExecutionFactory::new([1, 1]);
+        // One decision per failure; the second ends the run so the test does
+        // not depend on what a re-run of the skipped steps would do.
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::RestartCurrentStep, NextAction::Abort]);
+        let boards = frontend.boards();
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let outcome = engine.run_to_completion().await.unwrap();
+        assert_eq!(outcome, WorkflowOutcome::Aborted);
+
+        let boards = boards.lock().unwrap();
+        let failed_on: Vec<&str> = boards
+            .iter()
+            .filter_map(|b| b.step_failure.as_ref())
+            .map(|f| f.step_name.as_str())
+            .collect();
+        assert_eq!(
+            failed_on.len(),
+            2,
+            "one board per failed step, got boards for {failed_on:?}"
+        );
+        let mut named = failed_on.clone();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec!["a", "b"],
+            "each board must name its own failure, not repeat the first"
+        );
+    }
+
+    // ── WI-0115 §3: unattended countdown-and-retry ───────────────────────
+
+    #[tokio::test]
+    async fn unattended_step_failure_retries_once_then_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-retry"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([1, 0]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn unattended_step_failing_twice_fails_the_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-fail"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([7, 7]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 7,
+            }
+        );
+        assert!(
+            matches!(engine.state().status_of("b"), Some(StepState::Cancelled)),
+            "remaining steps must be cancelled once the workflow fails"
+        );
+    }
+
+    /// `abort_on_failure` is checked before the recovery path is chosen, so an
+    /// unattended run aborts on the first failure rather than spending its one
+    /// automatic retry (WI-0115 §3).
+    #[tokio::test]
+    async fn unattended_abort_on_failure_step_aborts_without_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let mut step = make_step("a", &[], None);
+        step.abort_on_failure = true;
+        let workflow = make_workflow(Some("wf-unattended-abort"), Some("claude"), vec![step]);
+        // A single exit code: a retry would launch a second container and panic
+        // the fake factory, so reaching `Aborted` proves no retry happened.
+        let factory = FakeAgentExecutionFactory::new([9]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Aborted);
+        assert!(engine.abort_on_failure_triggered());
+    }
+
+    #[tokio::test]
+    async fn unattended_cancelled_retry_countdown_fails_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-cancel"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        // Only one exit code: a second launch would panic the fake factory,
+        // proving no retry happened.
+        let factory = FakeAgentExecutionFactory::new([3]);
+        let frontend = FakeWorkflowFrontend::new([]).unattended();
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 3,
+            }
+        );
     }
 
     #[tokio::test]
@@ -3916,23 +4428,135 @@ mod tests {
         }
 
         let factory2 = FakeAgentExecutionFactory::always_success();
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]);
+        let mut engine =
+            WorkflowEngine::resume(&session, wf, None, Box::new(frontend), Box::new(factory2))
+                .await
+                .unwrap();
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// WI-0115 §2: an aborted run saves a state in which *every* step is
+    /// terminal (the failed one plus every step it cancelled). `is_complete()`
+    /// reads that as finished, so without a load-time reset the resumed run
+    /// would report instant success and execute nothing. This is the engine's
+    /// own guard — it holds for dynamic and non-dynamic workflows alike, and
+    /// whether or not the command layer rewound the state first.
+    #[tokio::test]
+    async fn resuming_an_aborted_run_reruns_its_unfinished_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let wf = make_workflow(
+            Some("wf-aborted"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+
+        // First run: 'a' succeeds, 'b' fails, the user aborts.
+        {
+            let factory = FakeAgentExecutionFactory::new([0, 1]);
+            let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::Abort]);
+            let mut engine = make_engine_with_frontend(&session, wf.clone(), factory, frontend);
+            let outcome = engine.run_to_completion().await.unwrap();
+            assert_eq!(outcome, WorkflowOutcome::Aborted);
+        }
+
+        let saved = WorkflowStateStore::at_git_root(tmp.path())
+            .load(None, "wf-aborted")
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved.is_complete(),
+            "precondition: an aborted state has no non-terminal steps left"
+        );
+
+        // Resuming must re-run 'b' rather than declare instant success.
+        let factory2 = FakeAgentExecutionFactory::new([0]);
         let mut engine = WorkflowEngine::resume(
             &session,
             wf,
             None,
-            Box::new(frontend),
+            Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
             Box::new(factory2),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await
         .unwrap();
+        assert!(
+            matches!(engine.state().status_of("b"), Some(StepState::Pending)),
+            "the cancelled step must be reset at load"
+        );
+        assert!(
+            matches!(engine.state().status_of("a"), Some(StepState::Succeeded)),
+            "a step that genuinely succeeded must be left alone"
+        );
+
         let result = engine.run_to_completion().await.unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    /// WI-0115 §2: a saved state outlives edits to its workflow file. A step
+    /// dropped from the file since the state was written can never run — the
+    /// DAG decides what runs — but it still counts towards `is_complete()`,
+    /// which the load-time reset would have just put back to `Pending`. Left
+    /// in, it strands the run on "no ready steps remaining"; pruned, the run
+    /// finishes.
+    #[tokio::test]
+    async fn resuming_a_state_whose_workflow_dropped_a_step_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+
+        // The workflow as it was: a → b → publish, aborted partway.
+        let before = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("publish", &["b"], None),
+            ],
+        );
+        {
+            let factory = FakeAgentExecutionFactory::new([0, 1]);
+            let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::Abort]);
+            let mut engine = make_engine_with_frontend(&session, before, factory, frontend);
+            assert_eq!(
+                engine.run_to_completion().await.unwrap(),
+                WorkflowOutcome::Aborted
+            );
+        }
+
+        // The workflow as it is now: 'publish' has been deleted. Same title,
+        // so the saved state is still found; the hash differs, and the fake
+        // frontend confirms the drift prompt.
+        let after = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let mut engine = WorkflowEngine::resume(
+            &session,
+            after,
+            None,
+            Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
+            Box::new(FakeAgentExecutionFactory::new([0])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.state().status_of("publish"),
+            None,
+            "a step the workflow no longer defines must be dropped, not reset"
+        );
+
+        assert_eq!(
+            engine.run_to_completion().await.unwrap(),
+            WorkflowOutcome::Completed,
+        );
     }
 
     /// WI 0106 §6a: a squad task bound to its durable workspace has no
@@ -3951,17 +4575,12 @@ mod tests {
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
 
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::resume_with_state_root(
             &session,
             wf,
             None,
             Box::new(FakeWorkflowFrontend::new([NextAction::Pause])),
             Box::new(FakeAgentExecutionFactory::always_success()),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
             Some(run_dir.path().to_path_buf()),
         )
         .await
@@ -4002,9 +4621,6 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]).with_confirm_resume(false);
         let result = WorkflowEngine::resume(
             &session,
@@ -4012,8 +4628,6 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(FakeAgentExecutionFactory::always_success()),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await;
 
@@ -4054,17 +4668,12 @@ mod tests {
             }
         }
 
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -4313,14 +4922,6 @@ mod tests {
             Ok(true)
         }
 
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(StepFailureChoice::Abort)
-        }
-
         fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
             self.step_statuses
                 .lock()
@@ -4357,9 +4958,6 @@ mod tests {
         actions: impl IntoIterator<Item = NextAction>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
     ) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>) {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = CapturingFrontend::new(actions, engine_tx);
         let container_exits = frontend.container_exits.clone();
         let engine = WorkflowEngine::new(
@@ -4368,8 +4966,6 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(crate::engine::git::GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         (engine, container_exits)
@@ -4607,7 +5203,7 @@ mod tests {
                 // Cancel immediately to keep the test fast.
                 Ok(YoloTickOutcome::Cancel)
             }
-            fn yolo_countdown_started(&mut self, _: &str) {
+            fn yolo_countdown_started(&mut self, _: &str, _: CountdownKind) {
                 self.yolo_started.store(true, Ordering::Relaxed);
             }
             fn yolo_countdown_finished(&mut self, _: &str) {
@@ -4615,13 +5211,6 @@ mod tests {
             }
             fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
                 Ok(true)
-            }
-            fn user_choose_after_step_failure(
-                &mut self,
-                _: &WorkflowStep,
-                _: &AgentExitInfo,
-            ) -> Result<StepFailureChoice, EngineError> {
-                Ok(StepFailureChoice::Abort)
             }
             fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
             fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
@@ -4642,17 +5231,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -4776,13 +5360,6 @@ mod tests {
             fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
                 Ok(true)
             }
-            fn user_choose_after_step_failure(
-                &mut self,
-                _: &WorkflowStep,
-                _: &AgentExitInfo,
-            ) -> Result<StepFailureChoice, EngineError> {
-                Ok(StepFailureChoice::Abort)
-            }
             fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
                 self.step_statuses
                     .lock()
@@ -4804,17 +5381,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -5003,6 +5575,7 @@ mod tests {
                 url: "https://example.com/repo".into(),
                 branch: None,
                 into: None,
+                conflict_mode: Default::default(),
             },
             SetupStep::PullBranch {
                 remote: None,
@@ -5517,13 +6090,6 @@ mod tests {
         fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
             Ok(true)
         }
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(StepFailureChoice::Abort)
-        }
         fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
         fn report_step_interactive_launch(
             &mut self,
@@ -5553,17 +6119,12 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: MessageCapturingFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -6612,17 +7173,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -6709,17 +7265,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -6812,17 +7363,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -6916,17 +7462,12 @@ mod tests {
             let recording = Arc::new(FakeAgentExecutionFactory::always_success());
             let (step_factory, _step_calls) = StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7011,17 +7552,12 @@ mod tests {
             let (step_factory, step_calls_handle) =
                 StepRecordingFactory::new(Arc::clone(&recording));
             let (frontend, msgs) = MessageCapturingFrontend::new();
-            let overlay = OverlayEngine::with_auth_resolver(
-                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-            );
             let mut engine = WorkflowEngine::new(
                 &session,
                 workflow,
                 None,
                 Box::new(frontend),
                 Box::new(step_factory),
-                Arc::new(GitEngine::new()),
-                Arc::new(overlay),
             )
             .unwrap();
             let invocation_id = engine.state().invocation_id;
@@ -7172,13 +7708,6 @@ mod tests {
         fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
             Ok(true)
         }
-        fn user_choose_after_step_failure(
-            &mut self,
-            _: &WorkflowStep,
-            _: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(StepFailureChoice::Abort)
-        }
         fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
         fn yolo_countdown_tick(
             &mut self,
@@ -7246,17 +7775,12 @@ mod tests {
         factory: BlockingFactory,
         frontend: ParallelTestFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -7580,21 +8104,17 @@ mod tests {
         let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(&session, workflow, factory, []);
 
-        let dummy = |name: &str| {
-            let (tx, _rx) = tokio::sync::broadcast::channel(4);
-            ActiveParallelStep {
-                step_name: name.to_string(),
-                execution: None,
-                cancel_handle: None,
-                stuck_sender: Arc::new(tx),
-                container_name: format!("container-{name}"),
-                output_tail: None,
-                awman_killed: false,
-                stuck: false,
-                yolo_deadline: None,
-                agent: AgentName::new("claude").unwrap(),
-                model: None,
-            }
+        let dummy = |name: &str| ActiveParallelStep {
+            step_name: name.to_string(),
+            execution: None,
+            cancel_handle: None,
+            container_name: format!("container-{name}"),
+            output_tail: None,
+            awman_killed: false,
+            stuck: false,
+            yolo_deadline: None,
+            agent: AgentName::new("claude").unwrap(),
+            model: None,
         };
 
         // Two live slots, "a" focused → one running peer.

@@ -2,13 +2,13 @@
 //!
 //! Gated by `AWMAN_E2E_ISSUES=1` environment variable.
 //! Requires network access to GitHub and a valid GitHub token or gh CLI.
-//! Run with: AWMAN_E2E_ISSUES=1 cargo test --test data_layer issue_e2e
+//! Run with: AWMAN_E2E_ISSUES=1 cargo test --test engine issue_e2e
 
-use awman::data::issue::router::IssueSourceRouter;
+use awman::engine::issue::router::IssueSourceRouter;
 // The trait is needed for `source.title_slug` / `source.format_as_markdown`
 // inside the gated tests; unused when `AWMAN_E2E_ISSUES` is unset.
 #[allow(unused_imports)]
-use awman::data::issue::IssueSource;
+use awman::engine::issue::IssueSource;
 
 // Use a well-known public issue for testing
 const TEST_OWNER: &str = "rust-lang";

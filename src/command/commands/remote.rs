@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::command::commands::remote_client::RemoteClient;
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
@@ -160,6 +160,53 @@ impl RemoteCommand {
             engines,
             session,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The four
+    /// `remote` leaves share one entry point, selected by the caller's
+    /// canonical path; `--type` takes its `"local"` from the catalogue.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let path = ctx.caller.path();
+        let sub = match path.as_slice() {
+            ["remote", "exec", "workflow"] => {
+                RemoteSubcommand::ExecWorkflow(RemoteExecWorkflowFlags {
+                    workflow: std::path::PathBuf::from(ctx.args.require("workflow")?),
+                    work_item: ctx.flags.string("work-item"),
+                    agent: ctx.flags.string("agent"),
+                    remote_addr: ctx.flags.string("remote-addr"),
+                    session: ctx.flags.string("session"),
+                    follow: ctx.flags.bool("follow"),
+                    api_key: ctx.flags.string("api-key"),
+                })
+            }
+            ["remote", "exec", "prompt"] => RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
+                prompt: ctx.args.require("prompt")?,
+                agent: ctx.flags.string("agent"),
+                remote_addr: ctx.flags.string("remote-addr"),
+                session: ctx.flags.string("session"),
+                follow: ctx.flags.bool("follow"),
+                api_key: ctx.flags.string("api-key"),
+            }),
+            ["remote", "session", "start"] => {
+                RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
+                    session_type: ctx.flags.require_str("type")?,
+                    workdir: ctx.flags.string("workdir"),
+                    repo_url: ctx.flags.string("repo-url"),
+                    branch: ctx.flags.string("branch"),
+                    remote_addr: ctx.flags.string("remote-addr"),
+                    api_key: ctx.flags.string("api-key"),
+                })
+            }
+            ["remote", "session", "kill"] => {
+                RemoteSubcommand::SessionKill(RemoteSessionKillFlags {
+                    session_id: ctx.args.get("session_id").map(str::to_string),
+                    remote_addr: ctx.flags.string("remote-addr"),
+                    api_key: ctx.flags.string("api-key"),
+                })
+            }
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &RemoteSubcommand {

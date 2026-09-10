@@ -54,14 +54,28 @@
 ### Layer 1: Engine (`src/engine/`)
 - ContainerRuntime (Docker, Apple containers)
 - WorkflowEngine (multi-step DAG execution)
-- GitEngine (repos, worktrees, merges)
+- GitEngine (repos, worktrees, merges; owns diff summaries)
 - OverlayEngine (container mounts, env vars)
 - AuthEngine (TLS, API keys, credentials)
+- SquadDaemonEngine (squad daemon bootstrap: store open/migrate, orphan-run
+  reconciliation, scheduler spawn)
+- SquadSupervisor (squad daemon lifecycle: ensure running, key state, health)
 - **Real systems (Docker, git, filesystem), no frontends.**
 
 ### Layer 2: Command (`src/command/`)
-- Dispatch (router, command catalogue)
-- Per-command types: InitCommand, ChatCommand, ExecWorkflowCommand, etc.
+- Dispatch (router, command catalogue), `Startup` (Layer 4's one entry point
+  into session + engine construction)
+- `Engines::build` / `Engines::for_daemon` (the one engine-assembly path for
+  the CLI/TUI host and for the API/squad daemons, respectively)
+- `ApiServerRuntime` / `ApiSessionLifecycle` (API server bootstrap, worker
+  pool, session close — not `src/frontend/api/`)
+- `ResolvedFlags` (catalogue-owned flag defaults and `implies` resolution;
+  commands read flags through this, never through hand-written defaults)
+- `GatewayNeed` (catalogue attribute — `None`/`Running`/`IfRunning` — that
+  tells `Dispatch` whether and how hard to resolve a squad daemon gateway
+  before building a command)
+- Per-command types: InitCommand, ChatCommand, ExecWorkflowCommand,
+  SquadAttachCommand, etc.
 - All business logic (agent selection, defaults, error handling)
 - Calls Layer 1 engines, reads/writes Layer 0
 - Receives frontend traits to delegate user input
@@ -70,7 +84,9 @@
 ### Layer 3: Frontend (`src/frontend/`)
 - CLI: clap-based CLI wrapper
 - TUI: Ratatui-based interactive terminal UI
-- API: HTTP API server
+- API: HTTP router/bind/TLS only — bootstrap lives in `ApiServerRuntime` (L2)
+- Squad daemon: Axum router/bind only — bootstrap lives in
+  `SquadDaemonEngine` (L1) via L2's `SquadDaemonHandles`
 - **No business logic. Implement frontend traits. Call Dispatch.**
 
 ---
@@ -128,6 +144,13 @@ pub async fn run_command(
 
 ❌ **Frontend implements business logic**  
 → Move to `src/command/`
+
+❌ **A daemon frontend (API, squad) bootstraps itself: opens its own store,
+resolves its own engines, owns its own session map**  
+→ That bootstrap is Layer 2/1's job (`Startup`, `Engines::build`/`for_daemon`,
+`ApiServerRuntime`, `SquadDaemonEngine`, `SessionManager`). The frontend
+constructs the router/listener and hands it an already-bootstrapped runtime —
+see WI 0113 F-02/F-03/F-05.
 
 ❌ **Layer 1 calls Layer 2 or 3**  
 → Use trait delegation (Layer 2/3 passes trait to Layer 1)
@@ -206,11 +229,11 @@ All three frontends now support `foo` identically — because the logic is in La
 
 ## Documentation
 
-- **User guide**: `docs/10-architecture-overview.md`
+- **User guide**: `docs/architecture.md`
 - **Full spec**: `aspec/architecture/2026-grand-architecture.md`
 - **Design**: `aspec/architecture/design.md`
 - **Security**: `aspec/architecture/security.md`
 
 ---
 
-**Last Updated**: May 8, 2026 (WI 0073)
+**Last Updated**: September 5, 2026 (WI 0113)

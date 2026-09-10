@@ -56,6 +56,7 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::Download(o) => render_download(o),
         CommandOutcome::Clean(o) => render_clean(o),
         CommandOutcome::Squad(o) => super::squad::render_squad(o, json),
+        CommandOutcome::SquadAttach(_) => None,
     }
 }
 

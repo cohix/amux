@@ -23,7 +23,6 @@ const API_SOURCE_FILES: &[&str] = &[
     "command_frontend.rs",
     "event_bus.rs",
     "mod.rs",
-    "queue_worker.rs",
     "routes.rs",
     "session_setup.rs",
 ];
@@ -37,7 +36,6 @@ fn read_runtime_source(file: &str) -> String {
         "command_frontend.rs" => include_str!("../../src/frontend/api/command_frontend.rs"),
         "event_bus.rs" => include_str!("../../src/frontend/api/event_bus.rs"),
         "mod.rs" => include_str!("../../src/frontend/api/mod.rs"),
-        "queue_worker.rs" => include_str!("../../src/frontend/api/queue_worker.rs"),
         "routes.rs" => include_str!("../../src/frontend/api/routes.rs"),
         "session_setup.rs" => include_str!("../../src/frontend/api/session_setup.rs"),
         _ => unreachable!("API_SOURCE_FILES contains only known API frontend files"),

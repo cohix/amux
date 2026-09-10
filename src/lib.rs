@@ -10,9 +10,6 @@
 //! - [`frontend`] (Layer 3) — CLI / TUI / API presentations of Layer 2.
 
 #![forbid(unsafe_code)]
-// Suppress dead-code warnings until oldsrc/ is deleted and the only
-// binary entry point is src/main.rs.
-#![allow(dead_code)]
 
 pub mod command;
 pub mod data;

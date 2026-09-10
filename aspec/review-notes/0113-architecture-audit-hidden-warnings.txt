@@ -1,0 +1,29 @@
+unused import: `crate::data::fs::data_paths::DataPaths`	  @ src/data/fs/daemon_guard.rs:19:5
+field `engines` is never read	  @ src/command/commands/auth.rs:46:5
+field `engines` is never read	  @ src/command/commands/download.rs:63:5
+method `path` is never used	  @ src/command/commands/exec_workflow.rs:3381:8
+function `next_work_item_number` is never used	  @ src/command/commands/new.rs:825:4
+method `send_command` is never used	  @ src/command/commands/remote_client.rs:341:25
+function `image_exists_locally` is never used	  @ src/engine/agent/mod.rs:908:15
+associated function `finished` is never used	  @ src/engine/agent_runtime/execution.rs:158:19
+constant `AWMAN_LABEL` is never used	  @ src/engine/container/apple.rs:18:7
+field `attach_socket` is never read	  @ src/engine/container/apple.rs:840:5
+function `parse_memory_mb` is never used	  @ src/engine/container/apple.rs:936:4
+associated function `is_available` is never used	  @ src/engine/container/docker.rs:39:19
+struct `SandboxId` is never constructed	  @ src/engine/sandbox/backend.rs:19:12
+associated items `new` and `as_str` are never used	  @ src/engine/sandbox/backend.rs:22:12
+methods `start_sandbox`, `restart_sandbox`, `exec_in_sandbox`, and `remove` are never used	  @ src/engine/sandbox/backend.rs:36:8
+function `shell_quote` is never used	  @ src/engine/sandbox/dsbx/backend.rs:142:4
+method `run_checked` is never used	  @ src/engine/sandbox/dsbx/spawn.rs:123:12
+field `stuck_sender` is never read	  @ src/engine/workflow/mod.rs:164:5
+fields `git_engine` and `overlay_engine` are never read	  @ src/engine/workflow/mod.rs:194:5
+fields `line_buffer_stdout` and `line_buffer_stderr` are never read	  @ src/frontend/api/command_frontend.rs:456:5
+fields `line_buffer_stdout` and `line_buffer_stderr` are never read	  @ src/frontend/api/session_setup.rs:313:5
+function `stderr_is_tty` is never used	  @ src/frontend/cli/output.rs:11:8
+function `stdout_is_tty` is never used	  @ src/frontend/cli/output.rs:23:8
+function `color_enabled` is never used	  @ src/frontend/cli/output.rs:29:8
+function `terminal_width` is never used	  @ src/frontend/cli/output.rs:38:8
+function `hyperlink` is never used	  @ src/frontend/cli/output.rs:48:8
+function `step_status_glyph` is never used	  @ src/frontend/cli/per_command/helpers.rs:90:8
+method `pty_active` is never used	  @ src/frontend/cli/user_message.rs:31:12
+associated functions `new` and `with_mount_scope` are never used	  @ src/frontend/squad/unattended.rs:175:8

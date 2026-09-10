@@ -9,13 +9,12 @@ use ratatui::layout::Rect;
 
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
-use crate::data::session::Session;
+use crate::data::session::{Session, SessionId};
 use crate::engine::acp::{PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
+use crate::engine::git::{GitDiffSummary, GitEngine};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
-use crate::frontend::tui::git_sidebar::{
-    start_git_diff_poll_task, GitSidebarState, SharedGitDiffSummary,
-};
+use crate::frontend::tui::git_sidebar::{start_git_diff_poll_task, GitSidebarState};
 use crate::frontend::tui::user_message::SharedStatusLog;
 
 mod container_slots;
@@ -27,6 +26,8 @@ pub mod squad_state;
 mod tests;
 
 use squad_state::SquadTabState;
+
+pub type SharedGitDiffSummary = Arc<Mutex<Option<GitDiffSummary>>>;
 
 /// Per-tab execution lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,21 @@ pub struct WorkflowStepView {
     /// renderer (steps with the same sorted `depends_on` set sit in the
     /// same topological column).
     pub depends_on: Vec<String>,
+    /// Which phase this step belongs to. `Setup`/`Teardown` steps get their
+    /// own dedicated first/last column in the overview rather than being
+    /// grouped by `depends_on` topology alongside `Agent` steps.
+    pub kind: WorkflowStepKind,
+}
+
+/// The phase a [`WorkflowStepView`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStepKind {
+    /// A `setup:` step, run once before the main workflow steps.
+    Setup,
+    /// An ordinary workflow step, grouped into columns by `depends_on`.
+    Agent,
+    /// A `teardown:` step, run once after the main workflow steps.
+    Teardown,
 }
 
 /// Cross-thread shared workflow view state.
@@ -482,7 +498,12 @@ pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<Contai
 
 /// Tab state — one per open tab.
 pub struct Tab {
+    /// Identity of the manager-owned session backing this tab. The session
+    /// snapshot below remains the pre-F-22 view data; WI 0114 moves that view
+    /// state out of Tab without changing ownership again.
+    pub session_id: SessionId,
     pub session: Session,
+    pub(crate) git_engine: Arc<GitEngine>,
     pub execution_phase: ExecutionPhase,
     pub container_window_state: ContainerWindowState,
     /// How many lines from the bottom to skip in the focused slot's vt100
@@ -640,8 +661,12 @@ impl Drop for Tab {
 
 impl Tab {
     pub fn new(session: Session) -> Self {
+        Self::new_with_git_engine(session, Arc::new(GitEngine::new()))
+    }
+
+    pub fn new_with_git_engine(session: Session, git_engine: Arc<GitEngine>) -> Self {
         let git_root = session.git_root().to_path_buf();
-        let mut tab = Self::new_inner(session);
+        let mut tab = Self::new_inner(session, git_engine);
         // Start polling against the session git root. Once a worktree is
         // created, `refresh_git_poll` (called each tick) restarts the task
         // pointed at the worktree path.
@@ -654,7 +679,7 @@ impl Tab {
     /// which has no meaningful diff. The caller must not auto-spawn a startup
     /// command into this tab.
     pub fn new_squad(session: Session) -> Self {
-        let mut tab = Self::new_inner(session);
+        let mut tab = Self::new_inner(session, Arc::new(GitEngine::new()));
         tab.is_squad = true;
         tab.squad = Some(SquadTabState::new());
         tab
@@ -663,9 +688,11 @@ impl Tab {
     /// Shared field initialisation for [`Tab::new`] and [`Tab::new_squad`].
     /// Starts **no** poll and spawns nothing; the caller decides whether a git
     /// poll runs (normal tab) or not (squad tab).
-    fn new_inner(session: Session) -> Self {
+    fn new_inner(session: Session, git_engine: Arc<GitEngine>) -> Self {
         Self {
+            session_id: session.id(),
             session,
+            git_engine,
             execution_phase: ExecutionPhase::Idle,
             container_window_state: ContainerWindowState::Hidden,
             container_scroll_offset: 0,

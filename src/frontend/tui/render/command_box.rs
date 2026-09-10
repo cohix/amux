@@ -18,6 +18,27 @@ use super::*;
 /// - Cursor sits at `area.x + 1 (border) + 2 ("> " prefix) + cursor_col` and
 ///   is suppressed if it would overlap the right border
 pub(super) fn render_command_box(app: &App, area: Rect, frame: &mut Frame) {
+    // WI 0112: on the squad tab's card grid the box is permanently inactive —
+    // nothing typed there does anything — so it says how to drive the tab
+    // instead, and never places the cursor.
+    if app.squad_grid_active() {
+        let block = Block::default()
+            .title(" command (inactive) ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                SQUAD_INACTIVE_COMMAND_BOX_TEXT,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+        return;
+    }
+
     let is_running = matches!(
         app.active_tab().execution_phase,
         tabs::ExecutionPhase::Running { .. }
@@ -104,6 +125,10 @@ pub(super) fn render_command_box(app: &App, area: Rect, frame: &mut Frame) {
     }
 }
 
+/// What the inactive command box says on the squad tab (WI 0112).
+pub(crate) const SQUAD_INACTIVE_COMMAND_BOX_TEXT: &str =
+    "  Use \u{2191} \u{2193} \u{2190} \u{2192} and Enter to navigate the squad tab";
+
 /// How many leading characters of the command-box input to hide so the
 /// cursor stays visible (E.1 horizontal scroll). With a zero-width box
 /// (degenerate terminal) everything scrolls off and the cursor pins to
@@ -121,6 +146,34 @@ pub(super) fn command_box_scroll_offset(cursor_col: usize, visible_width: usize)
 /// - Otherwise: fall back to a `"  CWD: {path}"` line (or `"  Using
 ///   Worktree: {path}"` when the active tab is bound to a worktree).
 pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // WI 0112: the squad indicator is pinned to the far right of this row on
+    // every tab, in both of the row's modes. Whatever else the row shows is
+    // fitted into what the indicator leaves, never the other way round.
+    let indicator = squad_indicator_spans(app, area.width);
+    let indicator_w: u16 = indicator
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16)
+        .sum();
+    let content_area = Rect {
+        width: area.width.saturating_sub(indicator_w),
+        ..area
+    };
+    if indicator_w > 0 {
+        let indicator_area = Rect {
+            x: area.x + area.width - indicator_w,
+            width: indicator_w,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(Line::from(indicator)), indicator_area);
+    }
+    let area = content_area;
+    if area.width == 0 {
+        return;
+    }
+
     let show_suggestions = app.focus == Focus::CommandBox && !app.suggestion_row.is_empty();
 
     if show_suggestions {
@@ -198,6 +251,51 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
         ]))
     };
     frame.render_widget(para, area);
+}
+
+/// The bottom-row squad indicator (WI 0112): `squad ●` with the word in grey
+/// and the circle in the state colour, plus a one-cell right margin. Below
+/// the full width only the circle (and margin) is drawn; below two cells,
+/// nothing.
+fn squad_indicator_spans(app: &App, available: u16) -> Vec<Span<'static>> {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+
+    let state = app
+        .squad_indicator
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(SquadIndicator::Unknown);
+    let colour = squad_indicator_color(state);
+    let circle = Span::styled("\u{25cf}", Style::default().fg(colour));
+    let margin = Span::raw(" ");
+    // "squad " + "●" + " "
+    const FULL_WIDTH: u16 = 8;
+    if available >= FULL_WIDTH {
+        vec![
+            Span::styled("squad ", Style::default().fg(Color::DarkGray)),
+            circle,
+            margin,
+        ]
+    } else if available >= 2 {
+        vec![circle, margin]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The indicator colour for each daemon-health state (WI 0112). `Unknown`
+/// renders exactly like `NotRunning`.
+pub(crate) fn squad_indicator_color(
+    state: crate::frontend::tui::squad_indicator::SquadIndicator,
+) -> Color {
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    match state {
+        SquadIndicator::Unknown | SquadIndicator::NotRunning => Color::DarkGray,
+        SquadIndicator::Unreachable => Color::Yellow,
+        SquadIndicator::Failed => Color::Red,
+        SquadIndicator::Running => Color::Blue,
+        SquadIndicator::Healthy => Color::Green,
+    }
 }
 
 /// Truncate a string to at most `max` characters, replacing the middle with an

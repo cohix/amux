@@ -14,12 +14,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
+use crate::command::commands::api_server::event_bus::EventBus;
+pub use crate::command::commands::api_server::AuthMode;
+use crate::command::commands::api_server::{ApiSessionLifecycle, CloseOutcome, SetupReadiness};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
-use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::command::session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest,
@@ -31,23 +32,16 @@ use crate::data::fs::api_paths::ApiPaths;
 use crate::data::message::UserMessageSink;
 use crate::data::ready_summary::ReadySummary;
 use crate::data::session::Session;
+use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupStatus, SetupEventPayload};
 use crate::engine::ready::frontend::ReadyFrontend;
-use crate::frontend::api::event_bus::EventBus;
 use crate::frontend::api::session_setup::{
     log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
 };
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub enum AuthMode {
-    Enabled { key_hash: String },
-    Disabled,
-}
-
 // ─── Shared state ────────────────────────────────────────────────────────────
-
 pub struct AppState {
     pub store: Arc<SqliteSessionStore>,
     pub paths: ApiPaths,
@@ -55,17 +49,21 @@ pub struct AppState {
     pub started_at: Instant,
     pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub auth_mode: AuthMode,
-    pub engines: Engines,
-    /// Maps HTTP session IDs → their Layer 0 Session. Opened once when the
-    /// session is created via the API, reused for every command dispatch
-    /// within that session, removed when the session is closed.
-    pub sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<RwLock<Session>>>>>,
-    /// Per-command EventBus handles, keyed by command_id. Retained during
-    /// execution plus a short grace period for late-connecting SSE clients.
+    pub engines: crate::command::dispatch::Engines,
+    pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
-    /// Per-session setup bus handles, keyed by session_id. Retained during
-    /// setup plus 60 seconds after reaching a terminal state.
     pub setup_buses: tokio::sync::Mutex<HashMap<String, Arc<SessionSetupBus>>>,
+}
+
+impl AppState {
+    fn lifecycle(&self) -> ApiSessionLifecycle {
+        ApiSessionLifecycle::new(
+            Arc::clone(&self.store),
+            self.engines.clone(),
+            Arc::clone(&self.sessions),
+            self.paths.clone(),
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -354,7 +352,12 @@ async fn run_session_setup(
     plan: SessionCreatePlan,
     setup_bus: Arc<SessionSetupBus>,
 ) {
-    let setup = SessionSetup::new(session_id.clone(), plan, state.engines.clone());
+    let setup = SessionSetup::new(
+        session_id.clone(),
+        plan,
+        state.engines.clone(),
+        Arc::clone(&state.sessions),
+    );
     let mut observer = ApiSessionSetupObserver {
         bus_sender: setup_bus.sender(),
         setup_bus,
@@ -422,12 +425,10 @@ impl SessionSetupObserver for ApiSessionSetupObserver {
         log_session_setup(&self.session_id, line);
     }
 
-    async fn register_session(&mut self, session: Arc<RwLock<Session>>) {
-        self.state
-            .sessions
-            .lock()
-            .await
-            .insert(self.session_id.clone(), session);
+    async fn register_session(&mut self, _session: Arc<tokio::sync::RwLock<Session>>) {
+        if self.state.sessions.get_by_key(&self.session_id).is_none() {
+            tracing::error!(session_id = %self.session_id, "SessionSetup did not register its session");
+        }
     }
 
     fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
@@ -535,138 +536,33 @@ async fn handle_close_session(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let session_record = match state.store.get_session(&id) {
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Session '{}' not found", id)),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get session");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to close session"),
-            )
-                .into_response();
-        }
-        Ok(Some(s)) if s.status == "closed" => {
-            return Json(SessionResponse {
-                id: s.id,
-                workdir: s.workdir,
-                created_at: s.created_at,
-                status: s.status,
-                closed_at: s.closed_at,
-            })
-            .into_response();
-        }
-        Ok(Some(s)) if s.status == "closing" => {
-            // Already closing — return current state.
-            let running_cmd = state.store.running_command_for_session(&id).ok().flatten();
-            return Json(SessionClosingResponse {
-                session_id: id,
-                status: "closing".to_string(),
-                running_command_id: running_cmd.map(|c| c.id),
-                cancelled_count: 0,
-                message:
-                    "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor."
-                        .to_string(),
-            })
-            .into_response();
-        }
-        Ok(Some(s)) => s,
-    };
-
-    // Step 1: Mark session as 'closing' FIRST so the POST /v1/commands guard
-    // begins rejecting new enqueues immediately. If we cancel queued commands
-    // first, a concurrent POST could observe `status = 'active'`, enqueue a
-    // new command, and have it claimed by a worker before we close the gate.
-    let _ = state.store.update_session_status(&id, "closing");
-
-    // Step 2: Cancel all queued commands. Any racing POST that slipped in
-    // before step 1 took effect will have its queued row cancelled here.
-    let cancelled_ids = state
-        .store
-        .cancel_queued_for_session(&id)
-        .unwrap_or_default();
-    let cancelled_count = cancelled_ids.len();
-
-    // Step 3: Check for a running command.
-    let running_cmd = state.store.running_command_for_session(&id).ok().flatten();
-
-    if let Some(running) = running_cmd {
-        // Running command exists — return 202 and let the worker handle
-        // final cleanup when the command finishes.
-        tracing::info!(
-            session_id = %id,
-            running_command_id = %running.id,
-            cancelled_count = cancelled_count,
-            "Session entering drain-and-kill (waiting for running command)"
-        );
-        return (
+    match state.lifecycle().close(&id).await {
+        Ok(CloseOutcome::NotFound) => (StatusCode::NOT_FOUND, error_json(format!("Session '{id}' not found"))).into_response(),
+        Ok(CloseOutcome::Draining { running_command_id, cancelled }) => (
             StatusCode::ACCEPTED,
             Json(SessionClosingResponse {
                 session_id: id,
                 status: "closing".to_string(),
-                running_command_id: Some(running.id),
-                cancelled_count,
+                running_command_id: Some(running_command_id),
+                cancelled_count: cancelled.len(),
                 message: "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
             }),
-        )
-            .into_response();
-    }
-
-    // No running command — close immediately.
-    // For remote sessions, delete the cloned directory.
-    if session_record.session_type == "remote" {
-        if let Some(ref cloned_path) = session_record.cloned_path {
-            let path = std::path::PathBuf::from(cloned_path);
-            let git = Arc::clone(&state.engines.git_engine);
-            let delete_result =
-                tokio::task::spawn_blocking(move || git.delete_directory(&path)).await;
-            match delete_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(session_id = %id, error = %e, "Failed to delete remote clone");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error_json("Failed to clean up remote session directory"),
-                    )
-                        .into_response();
-                }
-                Err(e) => {
-                    tracing::error!(session_id = %id, error = %e, "Delete task panicked");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error_json("Failed to clean up remote session directory"),
-                    )
-                        .into_response();
-                }
-            }
+        ).into_response(),
+        Ok(CloseOutcome::AlreadyClosing) => Json(SessionClosingResponse {
+            session_id: id.clone(),
+            status: "closing".to_string(),
+            running_command_id: state.store.running_command_for_session(&id).ok().flatten().map(|command| command.id),
+            cancelled_count: 0,
+            message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
+        }).into_response(),
+        Ok(CloseOutcome::Closed) => match state.store.get_session(&id) {
+            Ok(Some(session)) => Json(SessionResponse { id: session.id, workdir: session.workdir, created_at: session.created_at, status: session.status, closed_at: session.closed_at }).into_response(),
+            _ => StatusCode::NO_CONTENT.into_response(),
+        },
+        Err(error) => {
+            tracing::error!(%error, session_id = %id, "Failed to close session");
+            (StatusCode::INTERNAL_SERVER_ERROR, error_json("Failed to clean up remote session directory")).into_response()
         }
-    }
-
-    let closed_at = chrono::Utc::now().to_rfc3339();
-    let _ = state.store.close_session_force(&id, &closed_at);
-    state.sessions.lock().await.remove(&id);
-
-    tracing::info!(
-        session_id = %id,
-        cancelled_count = cancelled_count,
-        "Session closed immediately (no running commands)"
-    );
-
-    match state.store.get_session(&id) {
-        Ok(Some(s)) => Json(SessionResponse {
-            id: s.id,
-            workdir: s.workdir,
-            created_at: s.created_at,
-            status: s.status,
-            closed_at: s.closed_at,
-        })
-        .into_response(),
-        _ => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
@@ -729,42 +625,8 @@ async fn handle_get_session_status(
 /// Reads the in-memory bus first, then setup_state.json on disk, then the sqlite
 /// session row. Used by the job-submission guard and other places that need to
 /// reason about session readiness.
-async fn resolve_setup_status(
-    state: &AppState,
-    session_id: &str,
-) -> (bool, String, Option<serde_json::Value>) {
-    if let Some(bus) = state.setup_buses.lock().await.get(session_id).cloned() {
-        let s = bus.snapshot();
-        let is_ready = matches!(s.status, SessionSetupStatus::Ready);
-        let status_str = s.status.as_str().to_string();
-        let err_payload = s.error.as_ref().map(|e| {
-            serde_json::json!({
-                "stage": e.stage,
-                "message": e.message,
-            })
-        });
-        return (is_ready, status_str, err_payload);
-    }
-    // No bus. Try setup_state.json (Layer 0).
-    if let Some(ss) = state.paths.read_setup_state(session_id) {
-        let is_ready = matches!(ss.status, SessionSetupStatus::Ready);
-        let status_str = ss.status.as_str().to_string();
-        let err_payload = ss.error.as_ref().map(|e| {
-            serde_json::json!({
-                "stage": e.stage,
-                "message": e.message,
-            })
-        });
-        return (is_ready, status_str, err_payload);
-    }
-    // Last resort: sqlite session row.
-    match state.store.get_session(session_id) {
-        Ok(Some(s)) => {
-            let is_ready = s.setup_status == "ready";
-            (is_ready, s.setup_status, None)
-        }
-        _ => (true, "ready".to_string(), None), // truly unknown — assume ready
-    }
+async fn resolve_setup_status(state: &AppState, session_id: &str) -> SetupReadiness {
+    state.lifecycle().setup_readiness(session_id).await
 }
 
 /// Last-resort fallback when neither the in-memory bus nor the on-disk
@@ -892,15 +754,21 @@ async fn handle_create_command(
 
     // Job submission guard: reject if session setup is not ready.
     {
-        let (setup_ready, status_str, error_payload) =
-            resolve_setup_status(&state, &session_id).await;
-        if !setup_ready {
+        let readiness = resolve_setup_status(&state, &session_id).await;
+        if !readiness.is_ready() {
+            if matches!(readiness, SetupReadiness::NotFound) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    error_json(format!("Session '{session_id}' not found")),
+                )
+                    .into_response();
+            }
             let mut body = serde_json::json!({
                 "error": "session is not ready",
-                "setup_status": status_str,
+                "setup_status": readiness.status(),
                 "hint": "Poll GET /v1/sessions/{id}/status to check setup progress"
             });
-            if let Some(err) = error_payload {
+            if let Some(err) = readiness.error().cloned() {
                 body["setup_error"] = err;
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert(
@@ -1511,7 +1379,7 @@ mod tests {
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             auth_mode: AuthMode::Disabled,
             engines,
-            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            sessions: Arc::new(SessionManager::in_memory()),
             event_buses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })

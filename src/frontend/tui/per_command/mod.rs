@@ -20,7 +20,7 @@ mod init;
 mod mount_scope;
 mod new;
 mod ready;
-pub(crate) mod remote;
+mod remote_frontend;
 mod specs;
 mod squad;
 mod status;

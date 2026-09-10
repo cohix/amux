@@ -33,15 +33,17 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         // actively running.  Once the command finishes the overlay is closed, but
         // guard here too so a race can't leave the user unable to type.
         FocusContext::ContainerMaximized
-    } else if app.active_tab().is_squad
-        && app.active_tab().container_slots.is_empty()
-        && app.focus == Focus::ExecutionWindow
-    {
+    } else if app.active_tab().is_squad && app.active_tab().container_slots.is_empty() {
         // WI 0102: the squad task list holds focus. While an attach session
         // owns the tab's slots (`container_slots` non-empty) this falls through
         // to the ordinary ContainerMaximized/ExecutionWindow handling, so
         // Ctrl-S slot cycling and PTY passthrough behave exactly as in a normal
         // workflow run.
+        //
+        // WI 0112: the grid holds focus *regardless* of `app.focus`. The
+        // command box is permanently inactive on this tab, so there is no
+        // state in which a key should reach it; `App::tick_all_tabs` also
+        // normalises `focus` onto the grid, this is the belt to its braces.
         FocusContext::SquadList
     } else {
         match app.focus {
@@ -147,7 +149,10 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     // mapping for this — the binding is scoped to this one dialog.
     if key.code == KeyCode::Char('s')
         && key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(&app.active_dialog, Some(Dialog::TextInput { title, .. }) if title == "New Tab")
+        && matches!(
+            &app.active_dialog,
+            Some(Dialog::TextInput { title, .. }) if title == dialogs::NEW_TAB_DIALOG_TITLE
+        )
     {
         app.active_dialog = None;
         app.command_dialog_active = false;
@@ -172,9 +177,11 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .working_dir()
                 .to_string_lossy()
                 .to_string();
+            // The squad shortcut is advertised in the dialog's key-hint row
+            // (`render/dialog.rs`), next to Enter/Esc, not in the prompt.
             app.active_dialog = Some(Dialog::TextInput {
-                title: "New Tab".to_string(),
-                prompt: "Working directory:\nPress Ctrl-S to open squad".to_string(),
+                title: dialogs::NEW_TAB_DIALOG_TITLE.to_string(),
+                prompt: "Working directory:".to_string(),
                 editor: {
                     let mut ed = text_edit::TextEdit::new(false);
                     ed.set_text(&cwd);
@@ -545,6 +552,27 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
+        // WI 0110: Ctrl-\ leaves the container view without signalling any
+        // container. A squad attach session ends outright (its local attach
+        // clients are killed, the daemon's containers keep running); an
+        // ordinary command's maximized container is merely minimized, so it
+        // keeps streaming into its status bar and Ctrl-M brings it back. In
+        // neither case does a byte reach the agent's PTY — that is the whole
+        // difference from Ctrl-C.
+        Action::DetachContainers => {
+            if crate::frontend::tui::squad_attach::detach_squad_attach(app) {
+                return;
+            }
+            if app.active_tab().container_overlay_active() {
+                app.active_tab_mut().container_window_state = tabs::ContainerWindowState::Minimized;
+                app.focus = Focus::CommandBox;
+                app.status_bar.text =
+                    "Detached from the container. It is still running — ctrl-m to return."
+                        .to_string();
+                app.needs_redraw = true;
+            }
+        }
+
         // ── squad list actions (WI 0102) ───────────────────────────────
         // Each either opens a dialog or dispatches through `spawn_command`
         // into Layer 2. None calls a gateway method directly — the keys are a
@@ -595,6 +623,19 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 },
             );
         }
+        // WI 0110: `e` is `n`'s counterpart for an existing task — the same
+        // Layer-2 interview, reached through the same `spawn_command` path,
+        // with the task name as its argument.
+        Action::SquadEdit => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                squad_edit_by_name(app, &name);
+            }
+        }
         Action::SquadPause => {
             let name = app
                 .active_tab()
@@ -613,6 +654,16 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .and_then(|state| state.selected_name());
             if let Some(name) = name {
                 squad_dispatch_by_name(app, "resume", &name);
+            }
+        }
+        Action::SquadTrigger => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                squad_dispatch_by_name(app, "trigger", &name);
             }
         }
         Action::SquadDelete => {
@@ -782,6 +833,34 @@ fn copy_selection_to_clipboard(app: &mut App) {
     }
 }
 
+/// Copy `text` to the clipboard for a dialog's `[c]`/`[z]` copy action (WI
+/// 0111) and report the outcome via `status_log`. Unlike a mouse-selection
+/// copy, a dialog has no selection state to clear on success, so this needs
+/// its own success feedback: `label` (e.g. "squad key") names what was
+/// copied.
+pub(super) fn copy_dialog_text_to_clipboard(app: &mut App, label: &str, text: &str) {
+    let (level, message) = match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        Ok(()) => (
+            crate::data::message::MessageLevel::Info,
+            format!("{label} copied to clipboard"),
+        ),
+        Err(e) => (
+            crate::data::message::MessageLevel::Error,
+            format!("clipboard unavailable: {e}"),
+        ),
+    };
+    app.active_tab_mut()
+        .status_log
+        .lock()
+        .map(|mut log| {
+            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                level,
+                text: message,
+            })
+        })
+        .ok();
+}
+
 // ─── Command submission ──────────────────────────────────────────────────────
 
 /// Handle command submission from the command box.
@@ -829,25 +908,63 @@ pub(super) fn squad_dispatch_by_name(app: &mut App, subcommand: &str, name: &str
     );
 }
 
+/// Dispatch `squad edit <name> --interview` through the ordinary Layer-2 path
+/// (WI 0110). `pub(super)` so the detail modal can edit the task it is showing.
+pub(super) fn squad_edit_by_name(app: &mut App, name: &str) {
+    let mut arguments = std::collections::BTreeMap::new();
+    arguments.insert(
+        "name".to_string(),
+        crate::command::dispatch::parsed_input::ArgValue::Single(name.to_string()),
+    );
+    let mut flags = std::collections::BTreeMap::new();
+    flags.insert(
+        "interview".to_string(),
+        crate::command::dispatch::parsed_input::FlagValue::Bool(true),
+    );
+    app.spawn_command(
+        &format!("squad edit {name} --interview"),
+        crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
+            path: vec!["squad".into(), "edit".into()],
+            flags,
+            arguments,
+        },
+    );
+}
+
 // ─── WorkflowControlBoard special handler ────────────────────────────────────
 
 /// Handle arrow keys, Ctrl+Enter, and `[d]` for the WorkflowControlBoard dialog.
 ///
 /// Returns `true` if the key was consumed; `false` to let it fall through to
 /// the generic dialog handler (for char keys like 'a', Esc, etc.).
+///
+/// Each arrow is gated on the engine's matching `can_*` flag: the board already
+/// renders an unavailable action greyed out with its reason, and sending the
+/// action anyway just makes the engine re-present the same board — a keystroke
+/// that looks broken. An unavailable arrow is swallowed instead, leaving the
+/// board up (WI-0115 §1).
 fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    let can_finish = matches!(
-        &app.active_dialog,
-        Some(Dialog::WorkflowControlBoard(state)) if state.can_finish
+    let Some(Dialog::WorkflowControlBoard(state)) = &app.active_dialog else {
+        return false;
+    };
+    let (can_finish, can_launch_next, can_restart, can_go_back, can_continue) = (
+        state.can_finish,
+        state.can_launch_next,
+        state.can_restart,
+        state.can_go_back,
+        state.can_continue_current,
     );
 
     let response = match key.code {
-        KeyCode::Right => DialogResponse::Char('>'),
-        KeyCode::Down => DialogResponse::Char('v'),
-        KeyCode::Up => DialogResponse::Char('^'),
-        KeyCode::Left => DialogResponse::Char('<'),
+        KeyCode::Right if can_launch_next => DialogResponse::Char('>'),
+        KeyCode::Down if can_continue => DialogResponse::Char('v'),
+        KeyCode::Up if can_restart => DialogResponse::Char('^'),
+        KeyCode::Left if can_go_back => DialogResponse::Char('<'),
+        // An arrow for an action this board does not offer: consume it so it
+        // cannot fall through to the generic handler, and leave the board up.
+        KeyCode::Right | KeyCode::Down | KeyCode::Up | KeyCode::Left => return true,
         // Many terminals cannot distinguish Ctrl+Enter from bare Enter
         // without the kitty keyboard protocol, so accept plain Enter too.
         KeyCode::Enter if can_finish => DialogResponse::Char('f'),
@@ -878,33 +995,14 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
         return;
     }
 
-    let session = {
-        let resolver = crate::data::session::StaticGitRootResolver::new(&dir);
-        match crate::data::session::Session::open(
-            dir.clone(),
-            &resolver,
-            crate::data::session::SessionOpenOptions::default(),
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                // Fallback for non-git directories: use dir as git root.
-                match crate::data::session::Session::open_at_git_root(
-                    dir.clone(),
-                    dir.clone(),
-                    crate::data::session::SessionOpenOptions::default(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        app.status_bar.text = format!("Failed to open session: {e}");
-                        return;
-                    }
-                }
-            }
+    let idx = match app.add_tab(dir, crate::data::session::SessionOpenOptions::default()) {
+        Ok(idx) => idx,
+        Err(error) => {
+            app.status_bar.text = format!("Failed to open session: {error}");
+            return;
         }
     };
-
-    let is_git = session.git_root().join(".git").exists();
-    let idx = app.add_tab(session);
+    let is_git = app.tabs[idx].session.git_root().join(".git").exists();
     app.active_tab = idx;
 
     if is_git {

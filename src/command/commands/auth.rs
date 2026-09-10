@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
 
@@ -43,21 +42,12 @@ pub enum AuthConsentChoice {
 
 pub struct AuthCommand {
     flags: AuthCommandFlags,
-    engines: Engines,
     session: crate::data::session::Session,
 }
 
 impl AuthCommand {
-    pub fn new(
-        flags: AuthCommandFlags,
-        engines: Engines,
-        session: crate::data::session::Session,
-    ) -> Self {
-        Self {
-            flags,
-            engines,
-            session,
-        }
+    pub fn new(flags: AuthCommandFlags, session: crate::data::session::Session) -> Self {
+        Self { flags, session }
     }
 
     pub fn flags(&self) -> &AuthCommandFlags {

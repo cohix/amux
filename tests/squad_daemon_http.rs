@@ -1,12 +1,12 @@
-//! WI 0101 — the squad daemon's HTTP surface (`frontend::squad::serve_with`).
+//! WI 0101 — the squad daemon's HTTP surface.
 //!
-//! Boots the real daemon via the injectable `serve_with` bootstrap (the same
-//! seam `command-layer`'s eventual `LocalTaskEvaluator` will use) on an
+//! Boots the real daemon via the injectable Layer 2 bootstrap
+//! (`SquadDaemonHandles::bootstrap`) plus `frontend::squad::serve`, on an
 //! ephemeral loopback port, drives it with `reqwest`, and tears down by
 //! aborting the task — mirroring `tests/api_parity/live_server.rs`'s
 //! established pattern for this codebase's other HTTP daemon.
 //!
-//! `serve_with` reads `AWMAN_CONFIG_HOME` (and friends) from the real process
+//! The bootstrap reads `AWMAN_CONFIG_HOME` (and friends) from the real process
 //! environment (`Env::from_process()` is hardcoded inside it), so every test
 //! here scopes that env var for its duration under a shared lock — the same
 //! technique `tests/data_layer/rename_0077.rs` and
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
+use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::dispatch::Engines;
 use awman::data::fs::daemon_process::{DaemonProcess, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
@@ -82,8 +83,13 @@ async fn start_daemon_with(
     let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
     std::env::set_var("AWMAN_CONFIG_HOME", root);
 
+    // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
+    // the same seam `serve_with` was, split across the layer boundary.
     let handle = tokio::spawn(async move {
-        let _ = awman::frontend::squad::serve_with(config, engines, evaluator).await;
+        let handles = SquadDaemonHandles::bootstrap(config, engines, evaluator)
+            .await
+            .expect("squad daemon bootstrap");
+        let _ = awman::frontend::squad::serve(handles).await;
     });
 
     let daemon = DaemonProcess::new(
@@ -353,6 +359,7 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
             created_at: now,
             updated_at: now,
             last_run_at: None,
+            trigger_requested_at: None,
             last_run_status: None,
         })
         .unwrap();

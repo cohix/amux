@@ -25,8 +25,12 @@ impl Tab {
         }
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle =
-            start_git_diff_poll_task(root.clone(), self.git_diff_summary.clone(), cancel.clone());
+        let handle = start_git_diff_poll_task(
+            root.clone(),
+            self.git_engine.clone(),
+            self.git_diff_summary.clone(),
+            cancel.clone(),
+        );
         self.git_poll_cancel = Some(cancel);
         self.git_poll_handle = Some(handle);
         self.git_poll_root = Some(root);

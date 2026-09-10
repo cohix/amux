@@ -115,32 +115,6 @@ impl SbxCommand {
         Ok(out)
     }
 
-    /// Like [`run_quiet`](Self::run_quiet), but a non-zero exit is an error
-    /// carrying everything sbx printed (stderr, then stdout). For launch-path
-    /// callers that have no frontend sink (`start_sandbox`,
-    /// `restart_sandbox`) — the caller surfaces the error text, so sbx's own
-    /// diagnostics must travel inside it.
-    pub fn run_checked(&self) -> Result<SbxOutput, EngineError> {
-        let out = self.run_quiet()?;
-        if !out.success() {
-            let mut detail = out.stderr.trim().to_string();
-            let stdout = out.stdout.trim();
-            if !stdout.is_empty() {
-                if !detail.is_empty() {
-                    detail.push_str("; stdout: ");
-                }
-                detail.push_str(stdout);
-            }
-            return Err(EngineError::Sandbox(format!(
-                "`{}` exited with code {}: {}",
-                self.display_line(),
-                out.exit_code,
-                redact(&detail, &self.redactions),
-            )));
-        }
-        Ok(out)
-    }
-
     /// Run the command without sink reporting — for the trait methods
     /// (`list_running`, `stats`) that have no frontend to report through, and
     /// for availability probing.
@@ -389,39 +363,6 @@ mod tests {
                     }
                     other => panic!("expected Sandbox error, got: {other:?}"),
                 }
-            });
-        }
-
-        // ─── run_checked ───────────────────────────────────────────────────
-
-        #[test]
-        fn run_checked_error_carries_stderr_and_stdout() {
-            with_fake_sbx(
-                "#!/bin/sh\necho 'out detail'\necho 'ERROR: failed to create sandbox: boom' >&2\nexit 1\n",
-                || {
-                    let err = SbxCommand::new(["create"]).run_checked().unwrap_err();
-                    match err {
-                        EngineError::Sandbox(msg) => {
-                            assert!(msg.contains("sbx create"), "must name the argv: {msg}");
-                            assert!(msg.contains("code 1"), "must name the exit code: {msg}");
-                            assert!(
-                                msg.contains("failed to create sandbox: boom"),
-                                "must carry sbx's stderr: {msg}"
-                            );
-                            assert!(msg.contains("out detail"), "must carry sbx's stdout: {msg}");
-                        }
-                        other => panic!("expected Sandbox error, got: {other:?}"),
-                    }
-                },
-            );
-        }
-
-        #[test]
-        fn run_checked_passes_through_success() {
-            with_fake_sbx("#!/bin/sh\necho ok\n", || {
-                let out = SbxCommand::new(["create"]).run_checked().unwrap();
-                assert_eq!(out.exit_code, 0);
-                assert_eq!(out.stdout.trim(), "ok");
             });
         }
 

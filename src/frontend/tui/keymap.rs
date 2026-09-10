@@ -36,6 +36,10 @@ pub enum Action {
     ScrollToBottom,
     CopySelection,
     ToggleStatusLog,
+    /// Ctrl-\ — leave the container view without signalling any container
+    /// (WI 0110). Ends a squad attach session, or minimizes an ordinary
+    /// command's maximized container. Never kills or interrupts an agent.
+    DetachContainers,
 
     // ── Dialog ──────────────────────────────────────────────────────────
     DismissDialog,
@@ -49,10 +53,15 @@ pub enum Action {
     SquadAttach,
     /// n — create a task (drives the Layer-2 interview dialog chain).
     SquadNew,
+    /// e — edit the selected task (WI 0110), through the same interview
+    /// dialog chain, prefilled with the task as it stands.
+    SquadEdit,
     /// p — pause the selected task.
     SquadPause,
     /// r — resume the selected task.
     SquadResume,
+    /// t — evaluate the selected task now, ignoring its schedule.
+    SquadTrigger,
     /// d — remove the selected task (opens a confirmation first).
     SquadDelete,
     /// Left — move the card grid selection one column left.
@@ -108,19 +117,31 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
             KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
             KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
             KeyCode::Char('m') if ctx != FocusContext::Dialog => {
-                return Action::CycleContainerWindow
+                return Action::CycleContainerWindow;
             }
             // Ctrl-O (SI, 0x0f) is intercepted in every context — including
             // ContainerMaximized, before the ForwardToPty path below — so the
             // workflow overview is always one keystroke away.
             KeyCode::Char('o') if ctx != FocusContext::Dialog => {
-                return Action::ToggleWorkflowOverview
+                return Action::ToggleWorkflowOverview;
             }
             KeyCode::Char('w') => return Action::WorkflowControl,
             // Ctrl-G (BEL, 0x07) is rarely used by terminal programs, so we
             // intercept it here — before the ContainerMaximized ForwardToPty
             // path below — in every focus context so it never reaches the PTY.
             KeyCode::Char('g') => return Action::ToggleGitSidebar,
+            // Ctrl-\ (FS, 0x1c) detaches from whatever container view is on
+            // screen, leaving every container running (WI 0110). It is
+            // intercepted in every context — like Ctrl-O and Ctrl-G — so it
+            // never reaches the PTY: the whole point is a way out that does
+            // *not* signal the agent the way Ctrl-C does.
+            //
+            // A terminal without the kitty keyboard protocol enhancement
+            // reports the raw FS byte, and crossterm's legacy decoder maps
+            // 0x1C..=0x1F to Ctrl+'4'..'7' (not the literal key), so Ctrl-\
+            // arrives here as Ctrl+'4'. Match both encodings, or Ctrl-\ only
+            // works on the minority of terminals that support kitty.
+            KeyCode::Char('\\') | KeyCode::Char('4') => return Action::DetachContainers,
             _ => {}
         }
     }
@@ -159,7 +180,10 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
 /// `Ctrl-,` keep their global meaning here.
 fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
     match key.code {
-        KeyCode::Esc => Action::FocusCommandBox,
+        // WI 0112: the command box is permanently inactive on the squad tab,
+        // so there is nothing for Esc to hand focus to. It is deliberately
+        // unmapped rather than `FocusCommandBox`.
+        KeyCode::Esc => Action::None,
         KeyCode::Up => Action::ScrollUp,
         KeyCode::Down => Action::ScrollDown,
         KeyCode::Left if !ctrl => Action::SquadMoveLeft,
@@ -169,8 +193,10 @@ fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
         KeyCode::Enter => Action::SquadShowDetail,
         KeyCode::Char('a') if !ctrl => Action::SquadAttach,
         KeyCode::Char('n') if !ctrl => Action::SquadNew,
+        KeyCode::Char('e') if !ctrl => Action::SquadEdit,
         KeyCode::Char('p') if !ctrl => Action::SquadPause,
         KeyCode::Char('r') if !ctrl => Action::SquadResume,
+        KeyCode::Char('t') if !ctrl => Action::SquadTrigger,
         KeyCode::Char('d') if !ctrl => Action::SquadDelete,
         KeyCode::Char('y') if ctrl => Action::CopySelection,
         _ => Action::None,
@@ -245,6 +271,21 @@ fn map_dialog_key(key: KeyEvent, ctrl: bool) -> Action {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    /// WI 0112 Part 4: the squad grid has no command box to hand focus to.
+    #[test]
+    fn esc_on_the_squad_list_is_unmapped() {
+        let action = map_key(
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            FocusContext::SquadList,
+        );
+        assert_eq!(action, Action::None);
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent {

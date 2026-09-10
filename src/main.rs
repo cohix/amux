@@ -3,37 +3,28 @@
 //!
 //! Per `aspec/architecture/2026-grand-architecture.md`, `main.rs`
 //! contains no business logic: it builds clap from `CommandCatalogue`,
-//! parses argv, constructs the engines + session, and dispatches to either
-//! the CLI frontend (when a subcommand is present) or the TUI frontend
-//! (bare invocation).
+//! parses argv, delegates startup to Layer 2, and selects the CLI frontend
+//! (when a subcommand is present) or TUI frontend (bare invocation).
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
 use awman::command::dispatch::catalogue::CommandCatalogue;
-use awman::command::dispatch::Engines;
+use awman::command::startup::Startup;
 use awman::data::config::env::Env;
-use awman::data::config::global::GlobalConfig;
-use awman::data::error::DataError;
-use awman::data::migration;
-use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
-use awman::engine::agent::AgentEngine;
-use awman::engine::auth::AuthEngine;
-use awman::engine::container::ContainerRuntime;
-use awman::engine::git::GitEngine;
-use awman::engine::overlay::OverlayEngine;
+use awman::engine::error::EngineError;
 use awman::frontend::cli::{self, RuntimeContext};
 use awman::frontend::tui;
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
+    let removed_flag_startup = Startup::new(Vec::new());
     // Retired flags (e.g. `--mount-ssh`) are intercepted before clap renders
     // its generic "unexpected argument" message, so the user sees a migration
     // hint instead. The removed-flag list and matching live in the catalogue;
     // adding a future removal needs no `main.rs` change.
-    if let Some(hint) = CommandCatalogue::get().removed_flag_hint(std::env::args()) {
+    if let Some(hint) = removed_flag_startup.removed_flag_hint(std::env::args()) {
         eprintln!("error: {hint}");
         return Ok(ExitCode::from(2));
     }
@@ -43,106 +34,76 @@ async fn main() -> Result<ExitCode> {
 
     init_tracing();
 
-    // One-time migration from legacy amux paths and env vars.
-    if let Some(msg) = migration::migrate_global_dir() {
-        eprintln!("{msg}");
-    }
-    for warning in migration::check_deprecated_env_vars() {
-        eprintln!("{warning}");
-    }
-
-    let global_config = GlobalConfig::load().unwrap_or_default();
-    // Runtime detection + the CLI/TUI fallback policy live on the Layer 2
-    // `Engines` type. `fatal_runtime_error` is `Some` only when the configured
-    // `runtime:` is invalid and the TUI is about to start: the TUI boots just
-    // far enough to present a fatal modal with this message and quits on Enter.
     let path = cli::command_path_from_matches(&matches);
-    let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
-    let (detected, fatal_runtime_error) =
-        match Engines::detect(CommandCatalogue::get(), &global_config, &path_refs) {
-            Ok(pair) => pair,
-            Err(e @ awman::engine::error::EngineError::UnknownRuntime { .. }) => {
-                eprintln!("awman: {e}");
-                return Ok(ExitCode::from(2));
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context("failed to detect agent runtime"));
-            }
-        };
-    let runtime = detected.engine();
-    let container_runtime = detected.container_runtime();
-    let sandbox_runtime = detected.sandbox_runtime();
-    let git_engine = Arc::new(GitEngine::new());
-
+    let launch = LaunchMode::from_matches(&matches);
+    // The bare-squad TUI launch (`awman squad` from a TTY, no --json/
+    // --non-interactive) has a non-empty command path but still lands in the
+    // TUI, not the CLI. `Engines::detect`'s unknown-runtime policy branches
+    // on "is this path empty" as its CLI/TUI proxy (a fatal exit for CLI, a
+    // startup-modal message for TUI) — an unrelated launch-mode decision
+    // must not defeat that proxy, so the path used for detection reflects
+    // the launch mode this invocation actually resolves to, not the raw
+    // parsed subcommand path.
+    let detect_path: Vec<String> = if launch.is_tui() { Vec::new() } else { path };
     let working_dir = std::env::current_dir().context("could not read current directory")?;
-
-    // Resolve git root first so we can migrate the repo-local `.amux/` → `.awman/`
-    // BEFORE `Session::open` reads `RepoConfig` from disk. If we deferred this,
-    // a user's first post-rename run would silently fall back to default repo
-    // config because the load would miss the legacy `.amux/config.json`.
-    let git_root = match git_engine.resolve(&working_dir) {
-        Ok(root) => root,
-        Err(DataError::GitRootNotFound { .. }) => working_dir.clone(),
-        Err(other) => return Err(anyhow::Error::new(other).context("failed to resolve git root")),
+    let startup = Startup::new(detect_path);
+    let outcome = match startup.run(working_dir, Env::from_process()) {
+        Ok(outcome) => outcome,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<EngineError>(),
+                Some(EngineError::UnknownRuntime { .. })
+            ) =>
+        {
+            eprintln!("awman: {error}");
+            return Ok(ExitCode::from(2));
+        }
+        Err(error) => return Err(error),
     };
-    if let Some(msg) = migration::migrate_repo_dir(&git_root) {
-        eprintln!("{msg}");
+    for message in outcome.messages() {
+        eprintln!("{message}");
     }
 
-    let session = Session::open_at_git_root(
-        working_dir.clone(),
-        git_root,
-        SessionOpenOptions {
-            env: Some(Env::from_process()),
-            ..Default::default()
-        },
-    )
-    .context("failed to open session")?;
+    let fatal_runtime_error = outcome.fatal_runtime_error;
+    let ctx = RuntimeContext::new(outcome.session, outcome.engines);
 
-    let overlay_engine =
-        Arc::new(OverlayEngine::new(&session).context("failed to construct overlay engine")?);
-    let auth_engine =
-        Arc::new(AuthEngine::new(&session).context("failed to construct auth engine")?);
-    // AgentEngine is container-paradigm-specific. Under a sandbox-class
-    // runtime it receives an inert Docker handle that is never exercised:
-    // every container-paradigm flow guards via
-    // `Engines::require_container_runtime()` first (sandbox flows land in
-    // WI 0090).
-    let agent_engine = Arc::new(AgentEngine::new(
-        overlay_engine.clone(),
-        container_runtime
-            .clone()
-            .unwrap_or_else(|| Arc::new(ContainerRuntime::docker())),
-    ));
-    let workflow_state_store = Arc::new(awman::data::EngineWorkflowStateStore::at_git_root(
-        session.git_root().to_path_buf(),
-    ));
-
-    let engines = Engines {
-        runtime,
-        container_runtime,
-        sandbox_runtime,
-        git_engine,
-        overlay_engine,
-        auth_engine,
-        agent_engine,
-        workflow_state_store,
-    };
-
-    let tab_session = session.clone();
-    let ctx = RuntimeContext::new(session, engines);
-
-    let initial_tab = if matches.subcommand_name().is_none() {
-        Some(tui::InitialTab::Normal(tab_session))
-    } else if cli::is_bare_squad_tui_invocation(&matches) {
-        Some(tui::InitialTab::Squad)
-    } else {
-        None
+    let initial_tab = match launch {
+        LaunchMode::Cli => None,
+        LaunchMode::TuiNormal => Some(tui::InitialTab::Normal),
+        LaunchMode::TuiSquad => Some(tui::InitialTab::Squad),
     };
 
     match initial_tab {
         Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab).await),
         None => Ok(cli::run(matches, ctx).await),
+    }
+}
+
+/// Which frontend this invocation resolves to, and — for the TUI arms —
+/// which tab it opens on. This is also the single CLI/TUI classification
+/// `Engines::detect`'s unknown-runtime policy is keyed on: every `TuiSquad`
+/// launch must be treated as TUI for that policy even though its parsed
+/// command path (`["squad"]`) is non-empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Cli,
+    TuiNormal,
+    TuiSquad,
+}
+
+impl LaunchMode {
+    fn from_matches(matches: &clap::ArgMatches) -> Self {
+        if matches.subcommand_name().is_none() {
+            Self::TuiNormal
+        } else if cli::is_bare_squad_tui_invocation(matches) {
+            Self::TuiSquad
+        } else {
+            Self::Cli
+        }
+    }
+
+    fn is_tui(self) -> bool {
+        !matches!(self, Self::Cli)
     }
 }
 
@@ -263,6 +224,42 @@ mod tests {
         assert!(
             path.is_empty(),
             "bare invocation must produce an empty path"
+        );
+    }
+
+    /// Every `LaunchMode` variant reports `is_tui()` correctly — this is the
+    /// mapping `main` uses to decide the path fed to `Engines::detect`, so a
+    /// wrong answer here would defeat the CLI/TUI unknown-runtime proxy for
+    /// whichever variant is wrong.
+    #[test]
+    fn launch_mode_is_tui_matches_each_variant() {
+        assert!(!super::LaunchMode::Cli.is_tui());
+        assert!(super::LaunchMode::TuiNormal.is_tui());
+        assert!(super::LaunchMode::TuiSquad.is_tui());
+    }
+
+    /// Regression for the bug where a bare `awman squad` TUI launch under an
+    /// unknown `runtime:` config lost its fatal modal and exited like a CLI
+    /// invocation instead. `awman squad`'s parsed command path is non-empty
+    /// (`["squad"]`) — same as any ordinary CLI subcommand — even though the
+    /// invocation can resolve to the Squad TUI. `main` must not feed that raw
+    /// path to `Engines::detect`'s CLI/TUI proxy for a `TuiSquad` launch: it
+    /// has to collapse to the same empty path a bare `awman` uses, exactly
+    /// like `LaunchMode::TuiSquad.is_tui()` (asserted above) requires.
+    #[test]
+    fn bare_squad_has_a_non_empty_path_despite_resolving_to_the_tui() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd.try_get_matches_from(["awman", "squad"]).unwrap();
+        assert!(
+            m.subcommand_name().is_some(),
+            "`awman squad` has a subcommand, same as any CLI invocation"
+        );
+        let path = command_path_from_matches(&m);
+        assert_eq!(
+            path,
+            vec!["squad"],
+            "the raw parsed path must not be used directly as the CLI/TUI \
+             detection proxy for this invocation"
         );
     }
 

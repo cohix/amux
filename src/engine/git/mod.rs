@@ -4,7 +4,8 @@
 //! methods are the only public surface. Implements Layer 0's
 //! `GitRootResolver` trait so `Session::open` can use it.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::data::error::DataError;
@@ -53,6 +54,44 @@ fn run_git_logged(
 pub struct GitVersion {
     pub major: u32,
     pub minor: u32,
+}
+
+/// How a file changed relative to `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFileChangeType {
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// A single changed file with its per-file line counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFileEntry {
+    pub path: String,
+    pub change: GitFileChangeType,
+    pub added: u32,
+    pub removed: u32,
+    /// `git diff --numstat` reports `-\t-\tpath` for binary files. We surface
+    /// these as `+0 -0` with a `(binary)` suffix rather than dropping them.
+    pub binary: bool,
+}
+
+/// The full diff snapshot returned by [`GitEngine::diff_summary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDiffSummary {
+    pub branch: Option<String>,
+    pub files: Vec<GitFileEntry>,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// One parsed `git diff --numstat` row. `added`/`removed` are `None` for
+/// binary files (git prints `-` in those columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumstatEntry {
+    pub path: String,
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -133,6 +172,64 @@ impl GitEngine {
             .filter(|l| !l.trim().is_empty())
             .map(|l| l.to_string())
             .collect())
+    }
+
+    /// Return the branch, changed files, and line counts for `root`.
+    ///
+    /// Porcelain status remains the source of truth for the file set, while
+    /// numstat supplies tracked-file counts. Untracked files are counted from
+    /// the working tree, and a repository without commits reports every
+    /// status entry as Added with zero counts, matching the sidebar's former
+    /// behavior exactly.
+    pub fn diff_summary(&self, root: &Path) -> Result<GitDiffSummary, EngineError> {
+        let porcelain_out = run_git_summary(&["status", "--porcelain"], root)?;
+        let porcelain = parse_porcelain_status(&porcelain_out);
+
+        // Empty output means detached HEAD; surface it as None so callers can
+        // choose their own presentation fallback.
+        let branch = run_git_summary(&["branch", "--show-current"], root)
+            .ok()
+            .map(|out| out.trim().to_string())
+            .filter(|name| !name.is_empty());
+
+        // numstat fails when there are no commits (no HEAD). Fall back to an
+        // empty list + "no commits" flag so we still render the file set.
+        let (numstat, has_commits) = match run_git_summary(&["diff", "--numstat", "HEAD"], root) {
+            Ok(out) => (parse_numstat(&out), true),
+            Err(numstat_error) => {
+                if run_git_summary(&["rev-parse", "--verify", "HEAD"], root).is_ok() {
+                    return Err(numstat_error);
+                }
+                (Vec::new(), false)
+            }
+        };
+
+        // No-commits fallback: treat every file as Added with 0 line counts.
+        if !has_commits {
+            let porcelain: Vec<(String, GitFileChangeType)> = porcelain
+                .into_iter()
+                .map(|(path, _)| (path, GitFileChangeType::Added))
+                .collect();
+            let mut summary = build_summary(&porcelain, &[], &HashMap::new());
+            summary.branch = branch;
+            return Ok(summary);
+        }
+
+        // Count lines for untracked files (`??`) not covered by numstat.
+        let mut untracked_lines = HashMap::new();
+        for (path, change) in &porcelain {
+            if *change == GitFileChangeType::Added && !numstat.iter().any(|n| &n.path == path) {
+                let count = match repo_relative_file_path(root, path) {
+                    Some(file_path) => count_file_lines(&file_path),
+                    None => 0,
+                };
+                untracked_lines.insert(path.clone(), count);
+            }
+        }
+
+        let mut summary = build_summary(&porcelain, &numstat, &untracked_lines);
+        summary.branch = branch;
+        Ok(summary)
     }
 
     /// `~/.awman/worktrees/<repo-name>/<NNNN>/` for a work-item.
@@ -738,6 +835,170 @@ impl GitEngine {
     }
 }
 
+/// Parse `git status --porcelain` output into `(path, change)` pairs.
+pub fn parse_porcelain_status(stdout: &str) -> Vec<(String, GitFileChangeType)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        // Porcelain v1 lines are `XY<space>PATH`: two status columns, a
+        // separator space, then the path. Anything shorter is malformed.
+        if line.len() < 4 {
+            continue;
+        }
+        let code = &line[..2];
+        let rest = &line[3..];
+        let path = rename_target(rest);
+        let change = if code == "??" {
+            GitFileChangeType::Added
+        } else if code.contains('D') {
+            GitFileChangeType::Deleted
+        } else {
+            GitFileChangeType::Modified
+        };
+        out.push((path, change));
+    }
+    out
+}
+
+/// Resolve a porcelain rename entry (`old -> new`) to its destination path.
+fn rename_target(rest: &str) -> String {
+    match rest.rfind(" -> ") {
+        Some(idx) => rest[idx + 4..].to_string(),
+        None => rest.to_string(),
+    }
+}
+
+/// Parse `git diff --numstat HEAD` output into per-file entries.
+pub fn parse_numstat(stdout: &str) -> Vec<NumstatEntry> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let added = if a == "-" { None } else { a.parse().ok() };
+        let removed = if d == "-" { None } else { d.parse().ok() };
+        out.push(NumstatEntry {
+            path: resolve_numstat_path(p),
+            added,
+            removed,
+        });
+    }
+    out
+}
+
+/// Resolve a numstat rename path. Handles the two git forms:
+/// `prefix{old => new}suffix` and the bare `old => new`.
+fn resolve_numstat_path(raw: &str) -> String {
+    if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}')) {
+        if open < close {
+            let prefix = &raw[..open];
+            let inner = &raw[open + 1..close];
+            let suffix = &raw[close + 1..];
+            let new_part = inner
+                .split("=>")
+                .nth(1)
+                .map(str::trim)
+                .unwrap_or_else(|| inner.trim());
+            return format!("{prefix}{new_part}{suffix}");
+        }
+    }
+    if raw.contains("=>") {
+        if let Some(new_part) = raw.split("=>").nth(1) {
+            return new_part.trim().to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// Combine porcelain change-types, numstat line counts, and pre-counted
+/// untracked-file line totals into a [`GitDiffSummary`].
+pub fn build_summary(
+    porcelain: &[(String, GitFileChangeType)],
+    numstat: &[NumstatEntry],
+    untracked_lines: &HashMap<String, u32>,
+) -> GitDiffSummary {
+    let mut files = Vec::new();
+    let mut added = 0u32;
+    let mut removed = 0u32;
+
+    for (path, change) in porcelain {
+        let (file_added, file_removed, binary) =
+            if let Some(entry) = numstat.iter().find(|n| &n.path == path) {
+                match (entry.added, entry.removed) {
+                    (Some(a), Some(r)) => (a, r, false),
+                    // A `-` in either column means git treated it as binary.
+                    _ => (0, 0, true),
+                }
+            } else if let Some(&count) = untracked_lines.get(path) {
+                (count, 0, false)
+            } else {
+                (0, 0, false)
+            };
+
+        added = added.saturating_add(file_added);
+        removed = removed.saturating_add(file_removed);
+        files.push(GitFileEntry {
+            path: path.clone(),
+            change: *change,
+            added: file_added,
+            removed: file_removed,
+            binary,
+        });
+    }
+
+    GitDiffSummary {
+        branch: None,
+        files,
+        added,
+        removed,
+    }
+}
+
+/// Run a git command with explicit args in `root`.
+fn run_git_summary(args: &[&str], root: &Path) -> Result<String, EngineError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", args.join(" "))))?;
+    if !output.status.success() {
+        return Err(EngineError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn repo_relative_file_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = Path::new(rel);
+    if rel.is_absolute() {
+        return None;
+    }
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+/// Count the lines in an untracked file. Missing/unreadable files count as 0.
+fn count_file_lines(path: &Path) -> u32 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return 0,
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).lines().count() as u32,
+        Err(_) => 0,
+    }
+}
+
 impl GitRootResolver for GitEngine {
     fn resolve(&self, working_dir: &Path) -> Result<PathBuf, DataError> {
         match self.resolve_root(working_dir) {
@@ -1074,5 +1335,149 @@ mod tests {
             matches!(err, EngineError::Git(_)),
             "must be EngineError::Git; got {err:?}"
         );
+    }
+
+    #[test]
+    fn porcelain_parser_preserves_sidebar_mappings() {
+        assert_eq!(
+            parse_porcelain_status(
+                "?? newfile.rs\nD  deleted.rs\n D gone.rs\nM  staged.rs\n M changed.rs\nR  old.rs -> new.rs\nM\n"
+            ),
+            vec![
+                ("newfile.rs".into(), GitFileChangeType::Added),
+                ("deleted.rs".into(), GitFileChangeType::Deleted),
+                ("gone.rs".into(), GitFileChangeType::Deleted),
+                ("staged.rs".into(), GitFileChangeType::Modified),
+                ("changed.rs".into(), GitFileChangeType::Modified),
+                ("new.rs".into(), GitFileChangeType::Modified),
+            ]
+        );
+    }
+
+    #[test]
+    fn numstat_parser_handles_counts_binary_and_renames() {
+        assert_eq!(
+            parse_numstat(
+                "5\t2\tsrc/foo.rs\n-\t-\timg.png\n3\t1\t{old.rs => new.rs}\n1\t0\tsrc/{old => new}/file.rs\n2\t2\told.rs => other.rs\ngarbage\n"
+            ),
+            vec![
+                NumstatEntry {
+                    path: "src/foo.rs".into(),
+                    added: Some(5),
+                    removed: Some(2)
+                },
+                NumstatEntry {
+                    path: "img.png".into(),
+                    added: None,
+                    removed: None
+                },
+                NumstatEntry {
+                    path: "new.rs".into(),
+                    added: Some(3),
+                    removed: Some(1)
+                },
+                NumstatEntry {
+                    path: "src/new/file.rs".into(),
+                    added: Some(1),
+                    removed: Some(0)
+                },
+                NumstatEntry {
+                    path: "other.rs".into(),
+                    added: Some(2),
+                    removed: Some(2)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_summary_combines_tracked_binary_and_untracked_counts() {
+        let porcelain = vec![
+            ("src/foo.rs".into(), GitFileChangeType::Modified),
+            ("img.png".into(), GitFileChangeType::Added),
+            ("new.txt".into(), GitFileChangeType::Added),
+        ];
+        let numstat = vec![
+            NumstatEntry {
+                path: "src/foo.rs".into(),
+                added: Some(5),
+                removed: Some(2),
+            },
+            NumstatEntry {
+                path: "img.png".into(),
+                added: None,
+                removed: None,
+            },
+        ];
+        let mut untracked = HashMap::new();
+        untracked.insert("new.txt".into(), 10);
+        let summary = build_summary(&porcelain, &numstat, &untracked);
+
+        assert_eq!(summary.added, 15);
+        assert_eq!(summary.removed, 2);
+        assert_eq!(summary.files[0].change, GitFileChangeType::Modified);
+        assert_eq!((summary.files[0].added, summary.files[0].removed), (5, 2));
+        assert!(summary.files[1].binary);
+        assert_eq!((summary.files[2].added, summary.files[2].removed), (10, 0));
+    }
+
+    #[test]
+    fn diff_summary_counts_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        let summary = GitEngine::new().diff_summary(tmp.path()).unwrap();
+        let new_file = summary
+            .files
+            .iter()
+            .find(|file| file.path == "new.txt")
+            .expect("untracked file should be included");
+        assert_eq!(new_file.change, GitFileChangeType::Added);
+        assert_eq!(new_file.added, 2);
+        assert_eq!(new_file.removed, 0);
+        assert_eq!(summary.added, 2);
+    }
+
+    #[test]
+    fn diff_summary_empty_repo_marks_everything_added_with_zero_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        let summary = GitEngine::new().diff_summary(tmp.path()).unwrap();
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "new.txt");
+        assert_eq!(summary.files[0].change, GitFileChangeType::Added);
+        assert_eq!((summary.added, summary.removed), (0, 0));
+        assert_eq!((summary.files[0].added, summary.files[0].removed), (0, 0));
+    }
+
+    #[test]
+    fn untracked_path_validation_rejects_escape_paths() {
+        let root = Path::new("/repo");
+        assert!(repo_relative_file_path(root, "/tmp/outside").is_none());
+        assert!(repo_relative_file_path(root, "../outside").is_none());
+        assert!(repo_relative_file_path(root, "src/../../outside").is_none());
+        assert_eq!(
+            repo_relative_file_path(root, "src/main.rs").unwrap(),
+            PathBuf::from("/repo/src/main.rs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_line_count_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "one\ntwo\n").unwrap();
+        let link = tmp.path().join("outside-link");
+        symlink(outside.path(), &link).unwrap();
+        assert_eq!(count_file_lines(&link), 0);
     }
 }

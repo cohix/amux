@@ -3,6 +3,11 @@ INSTALL_PATH ?= /usr/local/bin
 # Honour CARGO_TARGET_DIR if set in the environment. Falls back to the cargo
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+# Keep test fixtures out of the shared host /tmp. Long-running or concurrent
+# test jobs can exhaust /tmp's directory-link limit before any test body runs.
+# Do not use the workspace/target directory here: local Git remotes in the
+# smoke tests need the native filesystem's atomic object writes.
+AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
 .PHONY: all build install test test-fast test-full clean release architecture-lint pre-push
 
@@ -15,7 +20,10 @@ install: build
 	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
 
 test:
-	cargo test --quiet
+	@mkdir -p "$(AWMAN_TEST_TMPROOT)"
+	@awman_test_tmpdir="$$(mktemp -d "$(AWMAN_TEST_TMPROOT)/test-run.XXXXXX")"; \
+		trap 'rm -rf "$$awman_test_tmpdir"' EXIT; \
+		TMPDIR="$$awman_test_tmpdir" cargo test --quiet
 
 test-fast:
 	cargo test --quiet -- --skip docker --skip real_git --skip real_network

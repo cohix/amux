@@ -87,10 +87,6 @@ pub fn step_status_label(status: &StepStatus) -> String {
     status.label()
 }
 
-pub fn step_status_glyph(status: &StepStatus) -> &'static str {
-    status.glyph()
-}
-
 pub fn render_summary_box(title: &str, rows: &[(&str, &StepStatus)]) -> String {
     crate::data::step_status::render_summary_box(title, rows)
 }
@@ -114,15 +110,6 @@ mod tests {
             step_status_label(&StepStatus::Failed("out of disk".into())),
             "failed: out of disk"
         );
-    }
-
-    #[test]
-    fn step_status_glyph_all_variants() {
-        assert_eq!(step_status_glyph(&StepStatus::Pending), "-");
-        assert_eq!(step_status_glyph(&StepStatus::Running), "…");
-        assert_eq!(step_status_glyph(&StepStatus::Done), "✓");
-        assert_eq!(step_status_glyph(&StepStatus::Skipped), "–");
-        assert_eq!(step_status_glyph(&StepStatus::Failed("".into())), "✗");
     }
 
     #[test]

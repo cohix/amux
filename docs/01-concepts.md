@@ -83,7 +83,7 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman config show\|get\|set` | Inspect and edit config | [07](07-configuration.md) |
 | `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
 | `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
-| `awman squad …` | Scheduled, unattended task automation | [12](12-squad.md) |
+| `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |
 | `awman clean` | Reclaim stopped containers, stale workflow data, dangling images | [13](13-cleaning-up.md) |
 
 `awman status` marks ordinary containers as `session`. Containers launched by

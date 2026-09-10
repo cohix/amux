@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
 use crate::data::fs::daemon_guard::{AcquireError, DaemonGuard, DaemonKind};
@@ -16,6 +16,13 @@ use crate::data::fs::daemon_process::{
 };
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::auth::TlsMaterial;
+
+pub mod event_bus;
+pub mod queue_worker;
+pub mod runtime;
+pub mod session_setup;
+
+pub use runtime::{ApiServerRuntime, ApiSessionLifecycle, AuthMode, CloseOutcome, SetupReadiness};
 
 /// Build the API daemon's process handle from its paths.
 fn api_daemon(api_paths: &crate::data::fs::ApiPaths) -> DaemonProcess {
@@ -109,7 +116,8 @@ pub enum ApiServerOutcome {
 /// Methods Layer 3 must provide to the api start command.
 #[async_trait]
 pub trait ApiServerStartCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_until_shutdown(&mut self, config: ApiServeConfig) -> Result<(), CommandError>;
+    async fn serve_until_shutdown(&mut self, runtime: ApiServerRuntime)
+        -> Result<(), CommandError>;
 }
 
 pub trait ApiServerKillCommandFrontend: UserMessageSink + Send + Sync {}
@@ -120,7 +128,8 @@ pub trait ApiServerStatusCommandFrontend: UserMessageSink + Send + Sync {}
 /// `serve_until_shutdown` so the dispatched frontend can boot the server.
 #[async_trait]
 pub trait ApiServerCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_until_shutdown(&mut self, config: ApiServeConfig) -> Result<(), CommandError>;
+    async fn serve_until_shutdown(&mut self, runtime: ApiServerRuntime)
+        -> Result<(), CommandError>;
 }
 
 pub struct ApiServerCommand {
@@ -131,6 +140,27 @@ pub struct ApiServerCommand {
 impl ApiServerCommand {
     pub fn new(sub: ApiServerSubcommand, engines: Engines) -> Self {
         Self { sub, engines }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The four
+    /// `api` leaves share one entry point, selected by the caller's canonical
+    /// path; `--port` takes its `9876` from the catalogue.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "start" => ApiServerSubcommand::Start(ApiServerStartFlags {
+                port: ctx.flags.require_u16("port")?,
+                workdirs: ctx.flags.strs("workdirs").to_vec(),
+                background: ctx.flags.bool("background"),
+                refresh_key: ctx.flags.bool("refresh-key"),
+                dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
+                dangerously_skip_tls: ctx.flags.bool("dangerously-skip-tls"),
+            }),
+            "kill" => ApiServerSubcommand::Kill(ApiServerKillFlags {}),
+            "logs" => ApiServerSubcommand::Logs(ApiServerLogsFlags {}),
+            "status" => ApiServerSubcommand::Status(ApiServerStatusFlags {}),
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone()))
     }
 
     pub fn subcommand(&self) -> &ApiServerSubcommand {
@@ -375,7 +405,8 @@ async fn run_start(
         tls_material,
     };
 
-    let serve_result = frontend.serve_until_shutdown(config).await;
+    let runtime = ApiServerRuntime::bootstrap(config, engines.clone())?;
+    let serve_result = frontend.serve_until_shutdown(runtime).await;
 
     // Always clean up PID + meta files.
     let _ = daemon.release_pidfile();
@@ -583,37 +614,10 @@ mod tests {
     }
 
     use crate::command::dispatch::Engines;
-    use crate::data::fs::api_paths::ApiPaths;
-    use crate::data::fs::auth_paths::AuthPathResolver;
     use crate::data::message::{UserMessage, UserMessageSink};
-    use crate::engine::auth::AuthEngine;
-    use std::sync::Arc;
 
     fn make_engines(tmp: &std::path::Path) -> Engines {
-        let api_paths = ApiPaths::at_root(tmp);
-        let auth_paths = AuthPathResolver::at_home(tmp);
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            auth_paths.clone(),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, api_paths));
-        let workflow_state_store =
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp));
-        Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
-        }
+        Engines::for_tests(tmp)
     }
 
     struct NullFrontend {
@@ -629,7 +633,7 @@ mod tests {
     impl ApiServerCommandFrontend for NullFrontend {
         async fn serve_until_shutdown(
             &mut self,
-            _config: ApiServeConfig,
+            _runtime: ApiServerRuntime,
         ) -> Result<(), crate::command::error::CommandError> {
             Ok(())
         }
@@ -759,9 +763,9 @@ mod tests {
         impl ApiServerCommandFrontend for CaptureFrontend {
             async fn serve_until_shutdown(
                 &mut self,
-                config: ApiServeConfig,
+                runtime: ApiServerRuntime,
             ) -> Result<(), crate::command::error::CommandError> {
-                self.tls_was_present = Some(config.tls_material.is_some());
+                self.tls_was_present = Some(runtime.tls_material().is_some());
                 // Capture the persisted scheme BEFORE run_start's post-serve
                 // cleanup removes the meta file.
                 self.persisted_scheme = api_daemon(&self.api_paths)

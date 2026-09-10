@@ -24,14 +24,15 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
-use crate::command::commands::api_server::ApiServeConfig;
-use crate::command::commands::api_server::ApiServerCommandFrontend;
+use crate::command::commands::api_server::{ApiServerCommandFrontend, ApiServerRuntime};
 use crate::command::commands::auth::AuthCommandFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -50,7 +51,6 @@ use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::acp::{AcpFrontend, PermissionDecision, PermissionRequest, SessionUpdate};
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::InitFrontend;
@@ -61,7 +61,7 @@ use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -91,10 +91,39 @@ pub struct ApiDispatchFrontend {
     done_emitted: std::sync::atomic::AtomicBool,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
+    /// What the countdown currently being ticked will do when it expires
+    /// (WI-0115 §3). An API consumer reading "auto-advancing" through a
+    /// failure retry would draw the wrong conclusion about its run.
+    countdown_kind: CountdownKind,
 }
 
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for ApiDispatchFrontend {}
+
+impl crate::command::commands::squad::attach::SquadAttachFrontend for ApiDispatchFrontend {
+    fn ask_pick_candidate(
+        &mut self,
+        _candidates: &[crate::command::commands::squad::attach::SquadContainer],
+    ) -> Result<Option<usize>, CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_attached(
+        &mut self,
+        _step: &str,
+        _instance: Box<dyn crate::engine::agent_runtime::AgentInstance>,
+    ) -> Result<(), CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_exited(&mut self, _step: &str) {}
+}
 
 impl ApiDispatchFrontend {
     /// Construct a new frontend from the HTTP request's subcommand + args.
@@ -130,6 +159,7 @@ impl ApiDispatchFrontend {
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             last_sink_message_time: None,
+            countdown_kind: CountdownKind::StuckStep,
         }
     }
 
@@ -444,8 +474,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
 }
@@ -453,8 +481,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
 /// Standalone container frontend that emits events to the EventBus.
 struct ApiContainerSink {
     event_bus: EventBusSender,
-    line_buffer_stdout: String,
-    line_buffer_stderr: String,
 }
 
 impl UserMessageSink for ApiContainerSink {
@@ -628,21 +654,26 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             .map(|t| t.elapsed() >= YOLO_SINK_THROTTLE_INTERVAL)
             .unwrap_or(true);
         if should_emit {
+            let what = match self.countdown_kind {
+                CountdownKind::StuckStep => "auto-advancing",
+                CountdownKind::FailureRetry => "retrying after failure",
+            };
             self.event_bus.emit(EventPayload::StatusMessage {
                 phase: "yolo_countdown".to_string(),
-                message: format!(
-                    "Step '{}': auto-advancing in {}s",
-                    step_name,
-                    remaining.as_secs()
-                ),
+                message: format!("Step '{}': {what} in {}s", step_name, remaining.as_secs()),
             });
             self.last_sink_message_time = Some(std::time::Instant::now());
         }
         Ok(YoloTickOutcome::Continue)
     }
 
+    fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
+        self.countdown_kind = kind;
+    }
+
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
         self.last_sink_message_time = None;
+        self.countdown_kind = CountdownKind::default();
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -721,13 +752,9 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         Ok(true)
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &WorkflowStep,
-        _exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
-    }
+    // `supports_interactive_recovery` keeps its `false` default: an API run has
+    // no user to ask, so a failed step takes the engine's countdown-and-retry
+    // path (WI-0115 §3).
 
     fn on_setup_step_started(&mut self, description: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -958,8 +985,6 @@ impl InitFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &InitSummary) {}
@@ -992,8 +1017,6 @@ impl ReadyFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &ReadySummary) {}
@@ -1032,7 +1055,10 @@ impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFronte
 
 #[async_trait]
 impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(&mut self, _config: ApiServeConfig) -> Result<(), CommandError> {
+    async fn serve_until_shutdown(
+        &mut self,
+        _runtime: ApiServerRuntime,
+    ) -> Result<(), CommandError> {
         Err(CommandError::Other(
             "Cannot start a nested API server from within API dispatch".into(),
         ))
@@ -1077,14 +1103,28 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
             ),
         });
     }
-    fn ask_workflow_resume_or_fresh(
+    /// No interactive prompt, so keep the API default of preserving work:
+    /// resume at the step the previous run stopped on.
+    fn ask_workflow_resume(
         &mut self,
-        _workflow_name: &str,
-        _completed_steps: usize,
-        _total_steps: usize,
-    ) -> Result<bool, CommandError> {
-        // API mode has no interactive prompt; resume by default.
-        Ok(true)
+        prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        Ok(prompt.resume_from_stop_point())
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "workflow".to_string(),
+            message: format!(
+                "cannot resume the previous dynamic workflow for work item {work_item:04}: \
+                 {reason}"
+            ),
+        });
+        Ok(())
     }
 }
 
@@ -1321,6 +1361,67 @@ mod tests {
             }
         }
         count
+    }
+
+    /// Collect the `yolo_countdown` status messages emitted so far.
+    fn countdown_messages(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if let EventPayload::StatusMessage { phase, message } = &evt.payload {
+                if phase == "yolo_countdown" {
+                    out.push(message.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// WI-0115 §3: a failure retry and a stuck-step advance share one reporting
+    /// channel, but they mean opposite things. An API consumer told a failing
+    /// run is "auto-advancing" would conclude the workflow is making progress.
+    #[tokio::test]
+    async fn a_failure_retry_countdown_is_not_reported_as_auto_advancing() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        fe.yolo_countdown_started("build", CountdownKind::FailureRetry);
+        fe.yolo_countdown_tick(
+            "build",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("retrying after failure"),
+            "a retry must say so: {}",
+            messages[0]
+        );
+
+        // And the kind resets, so the next stuck-step countdown reads normally.
+        fe.yolo_countdown_finished("build");
+        fe.yolo_countdown_tick(
+            "test",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("auto-advancing"),
+            "a stuck-step countdown must keep its own wording: {}",
+            messages[0]
+        );
     }
 
     /// Ten rapid ticks must produce exactly one `yolo_countdown` status message

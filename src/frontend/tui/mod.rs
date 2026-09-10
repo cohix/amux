@@ -13,8 +13,6 @@ pub fn is_tui_active() -> bool {
     TUI_ACTIVE.load(Ordering::Relaxed)
 }
 
-use tokio::sync::RwLock;
-
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::data::session_manager::SessionManager;
@@ -39,34 +37,24 @@ pub mod pty;
 mod region_scroll;
 pub mod render;
 pub mod squad_attach;
+pub mod squad_indicator;
 pub mod squad_poll;
 pub mod tabs;
 pub mod text_edit;
 pub mod user_message;
 pub mod workflow_view;
 
-pub use per_command::remote::{
-    RemoteApiWorkflowSource, RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
-};
-
 #[cfg(test)]
 mod tests;
 
-use app::App;
+use app::{App, SquadTabStart};
 use dialogs::Dialog;
 use tabs::Tab;
 
-/// What the TUI opens with. `Normal` carries the session `main.rs` already
-/// resolved from the working directory; `Squad` opens the singleton squad tab and
-/// no directory-bound tab at all.
-///
-/// The shape is pinned by the WI 0102 contract (§1). `Normal(Session)` is
-/// intentionally unboxed — the enum is constructed once and consumed
-/// immediately in [`run`], so the size difference between variants never
-/// materialises as a real cost.
-#[allow(clippy::large_enum_variant)]
+/// What the TUI opens with. The normal tab is built from `ctx.session`; squad
+/// opens the singleton squad tab and no directory-bound tab at all.
 pub enum InitialTab {
-    Normal(crate::data::session::Session),
+    Normal,
     Squad,
 }
 
@@ -77,7 +65,7 @@ pub enum InitialTab {
 /// global config names a runtime awman doesn't recognize. In that case the
 /// TUI presents only a fatal modal (Enter quits) — no startup command runs.
 ///
-/// `initial_tab` selects the opening tab: `Normal(session)` is today's
+/// `initial_tab` selects the opening tab: `Normal` uses `ctx.session`,
 /// behaviour, including the `ready` / `status --watch` startup auto-spawn;
 /// `Squad` opens the singleton squad tab (§2.2) with no auto-spawn.
 pub async fn run(
@@ -87,19 +75,23 @@ pub async fn run(
     initial_tab: InitialTab,
 ) -> ExitCode {
     let catalogue = CommandCatalogue::get();
-    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+    let session_manager = Arc::new(SessionManager::in_memory());
     let runtime_handle = tokio::runtime::Handle::current();
 
     // Build the App and decide whether the normal startup auto-spawn runs — it
     // does only for a directory-bound tab, never for the squad tab.
     let (mut app, run_startup_spawn) = match initial_tab {
-        InitialTab::Normal(session) => {
-            let tab = Tab::new(session);
+        InitialTab::Normal => {
+            let session = ctx.session.read().await.clone();
+            session_manager
+                .create(session.clone())
+                .expect("startup session id must be unique");
+            let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
             let app = App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
             (app, true)
         }
         InitialTab::Squad => match App::build_squad_tab(&ctx.engines, &runtime_handle) {
-            Ok(build) => {
+            Ok(SquadTabStart::Ready(build)) => {
                 let key_setup = build.key_setup;
                 let mut app = App::new(
                     catalogue,
@@ -111,23 +103,37 @@ pub async fn run(
                 app.squad_gateway = Some(build.gateway);
                 // First run: the bearer key was minted a moment ago and lives
                 // only in memory. Show it before the event loop starts.
-                if let Some(body) = key_setup {
+                if let Some(key_setup) = key_setup {
                     app.active_dialog = Some(Dialog::Notice {
                         title: "squad authentication".to_string(),
-                        body,
+                        body: key_setup.body,
+                        copy_key: Some(key_setup.key),
+                        copy_zshrc_snippet: Some(key_setup.zshrc_snippet),
                     });
                 }
                 (app, false)
             }
-            Err(message) => {
+            // The daemon is up, but this process holds no key for it. Open on
+            // the working directory rather than on a squad tab that would only
+            // ever render a 401, and put the one recovery in front of the user;
+            // accepting it builds the squad tab through the ordinary path.
+            Ok(SquadTabStart::KeyMissing) => {
+                let session = ctx.session.read().await.clone();
+                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
+                let mut app =
+                    App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
+                app.active_dialog = Some(Dialog::SquadKeyMissing);
+                (app, false)
+            }
+            Err(error) => {
                 // `main.rs` calls `ensure_running` before routing here, so this
                 // should not happen; degrade to a normal tab on the cwd session
                 // and surface the specific error rather than failing to open.
                 let session = ctx.session.read().await.clone();
-                let tab = Tab::new(session);
+                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
                 let mut app =
                     App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
-                app.status_bar.text = message;
+                app.status_bar.text = error.to_string();
                 (app, false)
             }
         },
@@ -180,7 +186,22 @@ pub async fn run(
         }
     }
 
-    match event_loop::run_event_loop(&mut app) {
+    // WI 0112: the bottom-row squad indicator probes the daemon for the
+    // life of the event loop, on every tab, whether or not a squad tab ever
+    // opens. Started here — never in `App::new` — so unit-test apps stay
+    // free of filesystem side effects.
+    let indicator_cancel = tokio_util::sync::CancellationToken::new();
+    let indicator_handle = {
+        let _guard = app.runtime_handle.enter();
+        squad_indicator::SquadIndicatorPoller::new(app.squad_indicator.clone())
+            .start(indicator_cancel.clone())
+    };
+
+    let result = event_loop::run_event_loop(&mut app);
+    indicator_cancel.cancel();
+    indicator_handle.abort();
+
+    match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("awman: TUI error: {e}");

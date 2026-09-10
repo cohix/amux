@@ -12,12 +12,11 @@ use tokio::sync::broadcast;
 use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::EngineRequest;
@@ -51,7 +50,12 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// Engine tells frontend: yolo countdown just started for this step.
     /// Frontend should show the countdown dialog (active tab) or flash
     /// the tab header yellow/purple (background tab).
-    fn yolo_countdown_started(&mut self, _step_name: &str) {}
+    ///
+    /// `kind` says what expiry will do — advance past a stuck container, or
+    /// retry a step that failed (WI-0115 §3) — so a frontend that narrates the
+    /// countdown in words can narrate the right ones. Frontends that only show
+    /// a clock can ignore it.
+    fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {}
 
     /// Engine tells frontend: yolo countdown finished (expired, cancelled,
     /// or step recovered). Frontend dismisses dialog / resets tab style.
@@ -90,16 +94,27 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// when the engine killed it without waiting for the real code.
     fn report_container_exited(&mut self, _exit_code: i32) {}
 
+    // === Capabilities ===
+
+    /// Whether a human is on the other side of this frontend and can be asked
+    /// what to do when a step fails.
+    ///
+    /// `true` puts the engine on the interactive recovery path: it opens the
+    /// Workflow Control Board with the failure attached and waits for a
+    /// restart / back / next / abort decision. `false` — the squad daemon, the
+    /// API server, a `--non-interactive` CLI run — puts it on the unattended
+    /// path: one yolo countdown, one automatic retry, then the workflow fails
+    /// (WI-0115 §3).
+    ///
+    /// Defaults to `false`: a frontend that has not opted in must never be
+    /// blocked on a question nobody can answer.
+    fn supports_interactive_recovery(&self) -> bool {
+        false
+    }
+
     // === User decisions (blocking) ===
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
-
-    /// Called after a step transitions to Failed.
-    fn user_choose_after_step_failure(
-        &mut self,
-        step: &WorkflowStep,
-        exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError>;
 
     // === Channel setup ===
 

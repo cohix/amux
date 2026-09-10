@@ -47,8 +47,23 @@ evaluated, and reading them is a legitimate way to tell what has changed since
 your last run.
 
 Only when the task is triggered, make sure a valid workflow is present at
-`/awman/context/workflow/workflow.toml`. You may **either** write a new one
-**or** reuse the one already there from a previous run — both are valid. The
-presence of that file is no longer how you report a trigger; your verdict file
-is. When the task is not triggered, leave whatever is already there alone.
+`/awman/context/workflow/workflow.toml`. The presence of that file is not how
+you report a trigger; your verdict file is. When the task is not triggered,
+leave whatever is already there alone.
+
+### Treat a previous run's `workflow.toml` as a stale draft
+
+It was written for the state of the world at *that* run, not this one. Never
+reuse it just because it is there and it parses. Read it in full and check it
+against what you have just observed in `{{repo_mount_path}}`:
+
+- Delete steps whose work is already done or whose condition no longer holds.
+- Verify every path, branch, command, and identifier it references still exists.
+- Add steps for work this run's trigger requires that it does not cover.
+- Confirm the agents and models it names are still in the list above.
+
+Then edit it to match current reality and write it back. Leaving it unchanged is
+acceptable only after that review — say so in your verdict `reason` when you do.
+If it is far from what this run needs, discard it and write a new one rather
+than patching a poor fit.
 {{developer_guidance}}
