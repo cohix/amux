@@ -324,9 +324,13 @@ fn awman_named_test_process() -> Child {
     let mut attempt = 0;
     let mut child = loop {
         let spawned = Command::new(&helper)
+            // libtest names integration tests by module path, so `--exact` must
+            // carry the `daemon_primitives::` prefix. The bare name matched
+            // nothing: the helper ran zero tests and exited at once, leaving a
+            // zombie whose command name macOS `ps` no longer reports as awman.
             .args([
                 "--exact",
-                "daemon_guard_helper_process_stays_alive",
+                "daemon_primitives::daemon_guard_helper_process_stays_alive",
                 "--nocapture",
             ])
             .env("AWMAN_GUARD_HELPER", "1")
